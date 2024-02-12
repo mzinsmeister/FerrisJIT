@@ -1,23 +1,23 @@
-use goblin::elf::Elf;
-use inkwell::attributes::{Attribute, AttributeLoc};
+
+
 use inkwell::builder::Builder;
-use inkwell::comdat::Comdat;
+
 use inkwell::context::Context;
-use inkwell::execution_engine::{ExecutionEngine, JitFunction};
+
 use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::{Linkage, Module};
-use inkwell::passes::{PassBuilderOptions, PassManager};
+use inkwell::passes::{PassBuilderOptions};
 use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
-use inkwell::values::{AsValueRef, UnnamedAddress};
+
 use inkwell::{AddressSpace, OptimizationLevel};
 use libc::uintptr_t;
 
-use std::arch::asm;
-use std::borrow::Borrow;
+
+
 use std::error::Error;
-use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
-use std::mem::take;
+
+
+
 use std::path::Path;
 
 struct Stencil {
@@ -68,7 +68,7 @@ fn get_stencil(name: &str, elf: &[u8]) -> Stencil {
                 offset = section.sh_offset as usize;
                 let size = section.sh_size as usize;
                 // print code as hex bytes
-                for i in 0..size {
+                for _i in 0..size {
                     //print!("{:02x} ", res.as_slice()[offset + i]);
                     code = Some(&elf[offset..offset + size]);
                 }
@@ -133,7 +133,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_ghc_wrapper(&self) -> Stencil {
-        let i64_type = self.context.i64_type();
+        let _i64_type = self.context.i64_type();
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
         let void_type = self.context.void_type();
