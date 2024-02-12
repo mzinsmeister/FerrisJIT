@@ -44,15 +44,8 @@ pub extern "C" fn call_ghc_c_func(f: fn_type, arg: *mut u8) {
             "push r13",
             "push r14",
             "push r15",
-        );
-        asm!(
             "mov r13, {arg}",
             "call {func}",
-            func = in(reg) f,
-            arg = in(reg) arg,
-        );
-    // %r estore all %r egisters from the stack
-        asm!(
             "pop r15",
             "pop r14",
             "pop r13",
@@ -60,6 +53,8 @@ pub extern "C" fn call_ghc_c_func(f: fn_type, arg: *mut u8) {
             "pop rsp",
             "pop rbp",
             "pop rbx",
+            func = in(reg) f,
+            arg = in(reg) arg,
         );
     }
 }
@@ -275,7 +270,9 @@ impl<'ctx> CodeGen<'ctx> {
 
         // call the function with the stack pointer in RAX
         // This should work, however it requires inline asm and it requires us to use 
-        // 
+        // a "root stencil" that unpacks all of our arguments from our custom stack into
+        // the registers that the other stencils expect but that is only done once per 
+        // call so it should be fine
         call_ghc_c_func(f, stack_space);
         // get the result from the stack;
 
