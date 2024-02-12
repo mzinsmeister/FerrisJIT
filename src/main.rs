@@ -6,7 +6,7 @@ use inkwell::context::Context;
 
 use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::{Linkage, Module};
-use inkwell::passes::{PassBuilderOptions};
+use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
 use inkwell::{AddressSpace, OptimizationLevel};
@@ -35,7 +35,7 @@ fn get_stencil(name: &str, elf: &[u8]) -> Stencil {
 
     println!("---------------------------");
 
-    // Print relocation record for "PH1" symbol
+    // Print relocation record for "PH" symbols
 
     let reltab = gobj.shdr_relocs;
     let strtab = gobj.strtab;
@@ -48,7 +48,7 @@ fn get_stencil(name: &str, elf: &[u8]) -> Stencil {
             let sym = symtab.get(reloc.r_sym).unwrap();
             let name = &strtab.get_at(sym.st_name);
             if let Some(name) = name {
-                if name.starts_with("PH") || name == &"sum" {
+                if name.starts_with("PH") {
                     println!("Relocation: {:?}: {:#?}", name, reloc);
                     relocs.push((name.to_string(), reloc));
                 }
@@ -128,7 +128,9 @@ impl<'ctx> CodeGen<'ctx> {
             .run_passes(passes.join(",").as_str(), &target_machine, PassBuilderOptions::create())
             .unwrap();
 
-        target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
+        // For debugging purposes the stencil functions can be dumped to a file and then
+        // be inspected for example by llvm-objdump --disassemble sum.o 
+        //target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
         target_machine.write_to_memory_buffer(&self.module, FileType::Object).unwrap()
     }
 
