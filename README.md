@@ -6,4 +6,8 @@ As a first step i will try to generate a few simple addition stencils and patch 
 
 ## Current state
 
-What currently works is generating a simple function using inkwell (adding a constant to a 64 bit integer passed as a function argument), reading the ELF file using goblin, patching in a simple constant for the addition and executing that. What's still missing is the actual part of patching together multiple stencils (and even having multiple stencils). This also means i still have to figure out how to do the tail call, stack and register stuff.
+Currently i can generate functions with an arbitrary number of constant additions to a single value. The value is currently passed to the function through a stack pointer which also holds the result after execution.
+
+## Next steps
+
+Next steps would be automatic stencil generation for all kinds of different data types with and without operands in registers and for control flow constructs (if, if/else, loops). After that i will try to create CodeGen Primitives and use those to generate stencils, generate full llvm ir or generate copy-patched code. This should then also allow to use some kind of AST or internal IR to do this generation.
