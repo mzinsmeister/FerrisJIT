@@ -9,11 +9,14 @@ use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
+use inkwell::types::{AnyType, IntType};
+use inkwell::values::IntValue;
 use inkwell::{AddressSpace, OptimizationLevel};
 use libc::uintptr_t;
 
 
 
+use std::collections::BTreeMap;
 use std::error::Error;
 
 
@@ -121,7 +124,7 @@ impl<'ctx> CodeGen<'ctx> {
             "gvn",
             "simplifycfg",
             "loop-simplify",
-            "mem2reg",
+            "mem2reg"
         ];
 
         self.module
@@ -135,7 +138,6 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn compile_ghc_wrapper(&self) -> Stencil {
-        let _i64_type = self.context.i64_type();
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
         let void_type = self.context.void_type();
@@ -275,14 +277,138 @@ impl<'ctx> CodeGen<'ctx> {
         get_stencil("Unpack-Stack-Value", elf.as_slice())
     }
 
-    fn compile_sum(&self) -> Stencil {
-        let i64_type = self.context.i64_type();
+    fn compile_all_int_arith() -> BTreeMap<String, Stencil> {
+        fn int_add<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_int_add(x, y, "add").unwrap()
+        }
+        fn int_sub<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_int_sub(x, y, "sub").unwrap()
+        }
+        fn int_mul<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_int_mul(x, y, "mul").unwrap()
+        }
+        fn int_div<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_int_signed_div(x, y, "div").unwrap()
+        }
+        fn int_rem<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_int_signed_rem(x, y, "rem").unwrap()
+        }
+        fn int_and<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_and(x, y, "and").unwrap()
+        }
+        fn int_or<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_or(x, y, "or").unwrap()
+        }
+        fn int_xor<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_xor(x, y, "xor").unwrap()
+        }
+        fn int_shl<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_left_shift(x, y, "shl").unwrap()
+        }
+        fn int_lshr<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_right_shift(x, y, false, "lshr").unwrap()
+        }
+        fn int_ashr<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+            builder.build_right_shift(x, y, true, "ashr").unwrap()
+        }
+        let context = Context::create();
+        let ops: Vec<(&str, for<'a> fn(&'a Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![("add", int_add), ("sub", int_sub), ("mul", int_mul), ("div", int_div), ("rem", int_rem), ("and", int_and), ("or", int_or), ("xor", int_xor), ("shl", int_shl), ("lshr", int_lshr), ("ashr", int_ashr)];
+        let types = vec![context.i8_type(), context.i16_type(), context.i32_type(), context.i64_type()];
+
+        let mut stencils = BTreeMap::new();
+
+        for (name, op) in ops {
+            for ty in types.iter() {
+                let module = context.create_module("stencil");
+                let codegen = CodeGen {
+                    context: &context,
+                    module,
+                    builder: context.create_builder()
+                };
+
+                let context_const = Context::create();
+                let module_const = context.create_module("stencil-const");
+                let codegen_const = CodeGen {
+                    context: &context_const,
+                    module: module_const,
+                    builder: context_const.create_builder()
+                };
+
+
+                let stencil: Stencil = codegen.compile_int_arith(name, *ty, op);
+                let const_stencil = codegen_const.compile_const_int_arith(name, *ty, op);
+                stencils.insert(stencil.name.clone(), stencil);
+                stencils.insert(const_stencil.name.clone(), const_stencil);
+            }
+        }
+
+        stencils
+    }
+
+    fn compile_int_arith(&self, name: &str, op_type: IntType<'ctx>, perform_op: for<'a> fn(&'a Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>) -> Stencil {
+        let base_type = op_type;
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
 
         let i8_array_type = i8_type.array_type(1048576);
-        let fn_type = i64_type.fn_type(&[i8_ptr_type.into(), i64_type.into()], false);
-        let function = self.module.add_function("sum_const", fn_type, None);
+        let fn_type = base_type.fn_type(&[i8_ptr_type.into(), base_type.into(), base_type.into()], false);
+        let tail_fn_type = base_type.fn_type(&[i8_ptr_type.into(), base_type.into()], false);
+        let function = self.module.add_function("stencil", fn_type, None);
+        let basic_block = self.context.append_basic_block(function, "entry");
+
+        let tailcallfun = self.module.add_function("tailcall", tail_fn_type, Some(Linkage::External));
+        tailcallfun.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+
+        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+
+        Target::initialize_native(&InitializationConfig::default()).unwrap();
+
+        self.builder.position_at_end(basic_block);
+
+        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
+        global.set_linkage(Linkage::External);
+        global.set_alignment(1);
+    
+        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
+
+        let x = function.get_nth_param(1).unwrap().into_int_value();
+        let y = function.get_nth_param(2).unwrap().into_int_value();
+
+        // Bitcast the integer to a double
+
+        let sum = perform_op(&self.builder, x, y);
+        
+        // Write sum2 onto the stack
+
+        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), sum.into()], "tailcall").unwrap();
+
+        tc.set_tail_call(true);
+        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+
+        self.builder.build_return(None).unwrap();
+        
+        // Print out the LLVM IR
+        println!("{}", self.module.print_to_string().to_string());
+
+        let elf = self.compile();
+    
+        let mut stencil = get_stencil(&format!("{}_{}", base_type.print_to_string().to_string(), name), elf.as_slice());
+
+        // remove the last 12 bytes from the code
+
+        stencil.code.truncate(stencil.code.len() - 12);
+
+        stencil
+    }
+
+    fn compile_const_int_arith(&self, name: &str, op_type: IntType<'ctx>, perform_op: for<'a> fn(&'a Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>) -> Stencil {
+        let base_type = op_type;
+        let i8_type = self.context.i8_type();
+        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
+
+        let i8_array_type = i8_type.array_type(1048576);
+        let fn_type = base_type.fn_type(&[i8_ptr_type.into(), base_type.into()], false);
+        let function = self.module.add_function("stencil", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
 
         let tailcallfun = self.module.add_function("tailcall", fn_type, Some(Linkage::External));
@@ -300,20 +426,18 @@ impl<'ctx> CodeGen<'ctx> {
     
         let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
         // Cast the pointer to an integer
-        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), i64_type, "ptrtoint").unwrap();
+        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), base_type, "ptrtoint").unwrap();
 
-        // Bitcast the integer to a double
-        let int_as_type = self.builder.build_bitcast(ptr_as_int, i64_type, "bitcast").unwrap().into_int_value();
+        // Bitcast the integer to an integer
+        let int_as_type = self.builder.build_bitcast(ptr_as_int, base_type, "bitcast").unwrap().into_int_value();
 
         let x = function.get_nth_param(1).unwrap().into_int_value();
 
         // Bitcast the integer to a double
 
-        let sum = self.builder.build_int_add(x, int_as_type, "sum").unwrap();
+        let result = perform_op(&self.builder, int_as_type, x);
         
-        // Write sum2 onto the stack
-
-        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), sum.into()], "tailcall").unwrap();
+        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), result.into()], "tailcall").unwrap();
 
         tc.set_tail_call(true);
         tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
@@ -325,7 +449,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         let elf = self.compile();
     
-        let mut stencil = get_stencil("sum_const", elf.as_slice());
+        let mut stencil = get_stencil(&format!("{}_{}_const",  base_type.print_to_string().to_string(), name), elf.as_slice());
 
         // remove the last 12 bytes from the code
 
@@ -333,7 +457,6 @@ impl<'ctx> CodeGen<'ctx> {
 
         stencil
     }
-
 
 
 }
@@ -380,7 +503,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         builder: context.create_builder()
     };
 
-    let sum_stencil = codegen.compile_sum();
+    let int_arith_stencils = CodeGen::compile_all_int_arith();
+
+    let sum_stencil = int_arith_stencils.get("i64_add_const").unwrap();
+
+    let mult_stencil = int_arith_stencils.get("i64_mul_const").unwrap();
 
     // Patch the code with a value
 
@@ -388,21 +515,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut sum1_code = sum_stencil.code.clone();
 
-    let mut sum2_code = sum_stencil.code.clone();
+
+    let mut mult1_code = mult_stencil.code.clone();
 
     let holes_values = vec![100000000000u64.to_ne_bytes()];
     for (&ofs, val) in sum_stencil.holes.iter().zip(holes_values.iter()) {
         sum1_code[ofs..ofs + 8].copy_from_slice(val);
     }
 
-    let holes_values = vec![20u64.to_ne_bytes()];
+    let holes_values = vec![2u64.to_ne_bytes()];
     for (&ofs, val) in sum_stencil.holes.iter().zip(holes_values.iter()) {
-        sum2_code[ofs..ofs + 8].copy_from_slice(val);
+        mult1_code[ofs..ofs + 8].copy_from_slice(val);
     }
 
     // append the sum codes to the code
     code.extend_from_slice(&sum1_code);
-    code.extend_from_slice(&sum2_code);
+    code.extend_from_slice(&mult1_code);
 
     //Add the put stack code
 
@@ -497,7 +625,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     println!("Result: {}", result);
-    assert_eq!(result, 100000000025);
+    assert_eq!(result, 200000000010);
 
     // unmap the memory region
     unsafe {
