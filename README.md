@@ -6,7 +6,11 @@ As a first step i will try to generate a few simple addition stencils and patch 
 
 ## Current state
 
-Currently i can generate functions with an arbitrary number of constant additions to a single value. The value is currently passed to the function through a stack pointer which also holds the result after execution.
+Automatic stencil generation for integer-types and integer-operations should be working. 
+
+Basic expressions with arbitrary integer arithmetic should almost work. The only thing still missing is a stencil
+for taking two values from the stack and calling another stencil with them. For now arbitrary constant operations
+are working however. The hardcoded example currently does a hardcoded addition of 10 followed by a multiplication by 2. What's still missing is a stencil for shifting a value from first register to second operand and some other "glue"-stencils like that.
 
 ## Next steps
 
