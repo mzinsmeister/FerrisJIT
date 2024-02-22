@@ -182,9 +182,9 @@ fn fold_all_constants(fun: &BuiltIn, args: &[Expr]) -> Vec<Expr> {
 
 impl CodeGen {
     fn new(args: usize) -> Self {
-        Self {
+        Self {  
             code: Vec::new(),
-            stack_size: args,
+            stack_size: args * 8,
         }
     }
 
@@ -251,6 +251,12 @@ impl CodeGen {
         self.copy_and_patch(stencil, holes_values);
     }
 
+    fn generate_ret(&mut self) {
+        let stencil = STENCILS.get("ret").unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
     fn generate_op(&mut self, fun: &BuiltIn) {
         match fun {
             BuiltIn::Plus => {
@@ -278,7 +284,7 @@ impl CodeGen {
 
         match first_variable {
             Expr::Constant(Atom::Variable(n)) => {
-                self.generate_take_stack(*n);
+                self.generate_take_stack(n * 8);
             },
             Expr::Application(fun2, args2) => {
                 self.generate_code_application(&fun2, &args2);
@@ -289,7 +295,7 @@ impl CodeGen {
         for arg in args.iter().skip(1) {
             match arg {
                 Expr::Constant(Atom::Variable(n)) => {
-                    self.generate_take_2_stack(n);
+                    self.generate_take_2_stack(n * 8);
                     self.generate_i64_add();
                 },
                 Expr::Constant(Atom::Num(n)) => {
@@ -299,7 +305,7 @@ impl CodeGen {
                     // Save the current result to the stack 
                     // TODO: this stack allocation is a hack and wasteful
                     let stack_top = self.stack_size;
-                    self.stack_size += 1;
+                    self.stack_size += 8;
                     self.generate_put_stack(stack_top);
                     self.generate_code_application(&fun2, &args2);
                     self.generate_take_2_stack(stack_top);
@@ -338,6 +344,7 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, u64> {
 
     // Put the result back on the stack and return
     cg.generate_put_stack(0);
+    cg.generate_ret();
 
     Ok(GeneratedCode::new(cg.stack_size * 8, ghc_stencil, &cg.code))
 }

@@ -140,7 +140,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         // For debugging purposes the stencil functions can be dumped to a file and then
         // be inspected for example by llvm-objdump --disassemble sum.o 
-        //target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
+        target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
         target_machine.write_to_memory_buffer(&self.module, FileType::Object).unwrap()
     }
 
@@ -161,47 +161,16 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
 
         // Add tail call
-        let tc = self.builder.build_call(fun, &[stackptr.into()], "tailcall").unwrap();
+        let call = self.builder.build_call(fun, &[stackptr.into()], "call").unwrap();
 
-        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+        call.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
 
         self.builder.build_return(None).unwrap();
 
         // Print out the LLVM IR
         //println!("{}", self.module.print_to_string().to_string());
 
-        Target::initialize_all(&InitializationConfig::default());
-        let target_triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&target_triple).unwrap();
-        let target_machine = target
-            .create_target_machine(
-                &target_triple,
-                "generic",
-                "",
-                OptimizationLevel::None,
-                RelocMode::Static,
-                CodeModel::Large,
-            )
-            .unwrap();
-
-
-        let passes: &[&str] = &[
-            "instcombine",
-            "reassociate",
-            "gvn",
-            "simplifycfg",
-            "loop-simplify",
-            "mem2reg"
-        ];
-
-        self.module
-            .run_passes(passes.join(",").as_str(), &target_machine, PassBuilderOptions::create())
-            .unwrap();
-
-        // For debugging purposes the stencil functions can be dumped to a file and then
-        // be inspected for example by llvm-objdump --disassemble sum.o 
-        //target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("ghcc-converter.o", self.module.get_name().to_str().unwrap()))).unwrap();
-        let elf = target_machine.write_to_memory_buffer(&self.module, FileType::Object).unwrap();
+        let elf = self.compile(true);
     
         get_stencil("__GHC_CC-CONVERTER__", elf.as_slice(), false, true)
     }
@@ -210,6 +179,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
+
+        self.module.set_name("i64_take");
 
         let i8_array_type = i8_type.array_type(1048576);
         let void_type = self.context.void_type();
@@ -239,7 +210,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
 
         // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_ptr_type, stackptr, &[offset], "valueptr").unwrap() };
+        let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
 
         // Load argument from stack
         let x = self.builder.build_load(i64_type, valueptr, "x").unwrap().into_int_value();
@@ -262,6 +233,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
+
+        self.module.set_name("i64_take1");
 
         let i8_array_type = i8_type.array_type(1048576);
         let void_type = self.context.void_type();
@@ -290,7 +263,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
 
         // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_ptr_type, stackptr, &[offset], "valueptr").unwrap() };
+        let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
 
         // Load argument from stack
         let x = self.builder.build_load(i64_type, valueptr, "x").unwrap().into_int_value();
@@ -313,6 +286,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
+
+        self.module.set_name("i64_take2");
 
         let i8_array_type = i8_type.array_type(1048576);
         let void_type = self.context.void_type();
@@ -343,7 +318,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
 
         // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_ptr_type, stackptr, &[offset], "valueptr").unwrap() };
+        let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
 
         // Load argument from stack
         let y = self.builder.build_load(i64_type, valueptr, "x").unwrap().into_int_value();
@@ -417,9 +392,10 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let function = self.module.add_function("put_stack", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
 
-        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+        // We still pass the parameter. Doesn't hurt!
+        let tailcallfun = self.module.add_function("tailcall", fn_type, Some(Linkage::External));
 
-        Target::initialize_native(&InitializationConfig::default()).unwrap();
+        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
 
         self.builder.position_at_end(basic_block);
 
@@ -438,18 +414,26 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
 
         // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_ptr_type, stackptr, &[offset], "valueptr").unwrap() };
+        let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
 
-        // Load argument from stack
+        // Cast the pointer to an i64 pointer
+        let valueptr = self.builder.build_bitcast(valueptr, i64_type.ptr_type(AddressSpace::default()), "valueptr2").unwrap().into_pointer_value();
+
+        // Put argument onto the stack
         self.builder.build_store(valueptr, x).unwrap();
 
         // Add tail call
-        // TODO: This is a hack, need a return stencil!
+        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), x.into()], "tailcall").unwrap();
+
+        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+
+        tc.set_tail_call(true);
+
         self.builder.build_return(None).unwrap();
         
         let elf = self.compile(true);
     
-        get_stencil("i64_put-stack", elf.as_slice(), false, true)
+        get_stencil("i64_put-stack", elf.as_slice(), true, true)
     }
 
     fn compile_all_int_arith() -> BTreeMap<String, Stencil> {
@@ -540,8 +524,6 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
 
-        Target::initialize_native(&InitializationConfig::default()).unwrap();
-
         self.builder.position_at_end(basic_block);
 
         let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
@@ -587,8 +569,6 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
 
-        Target::initialize_native(&InitializationConfig::default()).unwrap();
-
         self.builder.position_at_end(basic_block);
 
         let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
@@ -619,44 +599,15 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
 
     pub fn compile_ret_stencil(&self) -> Stencil {
-        let i64_type = self.context.i64_type();
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
-
-        let i8_array_type = i8_type.array_type(1048576);
         let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into()], false);
+        let fn_type = void_type.fn_type(&[], false);
         let function = self.module.add_function("ret", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
 
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
 
-        Target::initialize_native(&InitializationConfig::default()).unwrap();
-
         self.builder.position_at_end(basic_block);
 
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
-        global.set_linkage(Linkage::External);
-        global.set_alignment(1);
-
-        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
-
-        let x = function.get_nth_param(1).unwrap().into_int_value();
-
-        // Cast the pointer to an integer
-        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), i64_type, "ptrtoint").unwrap();
-
-        // Bitcast the integer to a double
-        let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
-
-        // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_ptr_type, stackptr, &[offset], "valueptr").unwrap() };
-
-        // Load argument from stack
-        self.builder.build_store(valueptr, x).unwrap();
-
-        // Add tail call
-        // TODO: This is a hack, need a return stencil!
         self.builder.build_return(None).unwrap();
                 
         let elf = self.compile(false);
@@ -702,7 +653,7 @@ pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
     stencil_library.insert(take_stencil.name.clone(), take_stencil);
 
     let context = Context::create();
-    let module = context.create_module("take2");
+    let module = context.create_module("take1");
     let codegen = StencilCodeGen {
         context: &context,
         module,

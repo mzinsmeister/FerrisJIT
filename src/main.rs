@@ -1,7 +1,7 @@
 mod expr;
 mod codegen;
 
-use std::error::Error;
+use std::{error::Error, hint::black_box};
 
 use codegen::{generate_code, GeneratedCode, STENCILS};
 use expr::{parse_expr_from_str, Expr};
@@ -51,6 +51,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("No data to process");
         return Ok(());
     }
+
+    // Dummy access to initialize stencils
+    black_box(STENCILS.get("dummy"));
 
     // REPL for evaluating expressions on the data
 
