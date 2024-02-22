@@ -6,11 +6,25 @@ As a first step i will try to generate a few simple addition stencils and patch 
 
 ## Current state
 
-Automatic stencil generation for integer-types and integer-operations should be working. 
+Automatic stencil generation for integer-types and integer-operations should be working. Expression evaluation in basic cases works but there's still quite a few bugs.
 
 Basic expressions with arbitrary integer arithmetic should almost work. The only thing still missing is a stencil
 for taking two values from the stack and calling another stencil with them. For now arbitrary constant operations
 are working however. The hardcoded example currently does a hardcoded addition of 10 followed by a multiplication by 2. What's still missing is a stencil for shifting a value from first register to second operand and some other "glue"-stencils like that.
+
+## Useage
+
+To run the example, just run `cargo run`. Optionally a "-c" flag with a path to a csv file can be passed to run the example with the given csv file as input. If no file is given, the example will be run on a hardcoded sequential 10 element array. Then you can enter expressions in lisp-like syntax and the result will be printed. For example:
+
+Constant result:
+```
+(+ 10 (* 2 3))
+```
+
+Variable result (variables are just named $0, $1, ... corresponding to the column in the csv):
+```
+(+ 10 $0)
+```
 
 ## Next steps
 

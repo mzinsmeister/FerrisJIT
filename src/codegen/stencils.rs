@@ -96,13 +96,13 @@ fn get_stencil(name: &str, elf: &[u8], cut_jmp: bool, large: bool) -> Stencil {
     }
 }
 
-struct CodeGen<'ctx> {
+struct StencilCodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
 }
 
-impl<'ctx> CodeGen<'ctx> {
+impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile(&self, large: bool) -> MemoryBuffer {
 
@@ -214,7 +214,7 @@ impl<'ctx> CodeGen<'ctx> {
         let i8_array_type = i8_type.array_type(1048576);
         let void_type = self.context.void_type();
         let fn_type = void_type.fn_type(&[i8_ptr_type.into()], false);
-        let function = self.module.add_function("i64-take_stack", fn_type, None);
+        let function = self.module.add_function("i64_take-stack", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
 
         let tailcalltype = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into()], false);
@@ -446,13 +446,14 @@ impl<'ctx> CodeGen<'ctx> {
         // Add tail call
         // TODO: This is a hack, need a return stencil!
         self.builder.build_return(None).unwrap();
-                
+        
         let elf = self.compile(true);
     
         get_stencil("i64_put-stack", elf.as_slice(), false, true)
     }
 
     fn compile_all_int_arith() -> BTreeMap<String, Stencil> {
+        // TODO: We need reverse operations for non commutative operations
         fn int_add<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
             builder.build_int_add(x, y, "add").unwrap()
         }
@@ -495,7 +496,7 @@ impl<'ctx> CodeGen<'ctx> {
         for (name, op) in ops {
             for ty in types.iter() {
                 let module = context.create_module("stencil");
-                let codegen = CodeGen {
+                let codegen = StencilCodeGen {
                     context: &context,
                     module,
                     builder: context.create_builder()
@@ -503,7 +504,7 @@ impl<'ctx> CodeGen<'ctx> {
 
                 let context_const = Context::create();
                 let module_const = context.create_module("stencil-const");
-                let codegen_const = CodeGen {
+                let codegen_const = StencilCodeGen {
                     context: &context_const,
                     module: module_const,
                     builder: context_const.create_builder()
@@ -556,8 +557,6 @@ impl<'ctx> CodeGen<'ctx> {
 
         let sum = perform_op(&self.builder, x, y);
         
-        // Write sum2 onto the stack
-
         let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), sum.into()], "tailcall").unwrap();
 
         tc.set_tail_call(true);
@@ -600,14 +599,9 @@ impl<'ctx> CodeGen<'ctx> {
         // Cast the pointer to an integer
         let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), base_type, "ptrtoint").unwrap();
 
-        // Bitcast the integer to an integer
-        let int_as_type = self.builder.build_bitcast(ptr_as_int, base_type, "bitcast").unwrap().into_int_value();
-
         let x = function.get_nth_param(1).unwrap().into_int_value();
 
-        // Bitcast the integer to a double
-
-        let result = perform_op(&self.builder, int_as_type, x);
+        let result = perform_op(&self.builder, ptr_as_int, x);
         
         let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), result.into()], "tailcall").unwrap();
 
@@ -622,6 +616,53 @@ impl<'ctx> CodeGen<'ctx> {
     
         get_stencil(&name, elf.as_slice(), true, large)
     }
+
+
+    pub fn compile_ret_stencil(&self) -> Stencil {
+        let i64_type = self.context.i64_type();
+        let i8_type = self.context.i8_type();
+        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
+
+        let i8_array_type = i8_type.array_type(1048576);
+        let void_type = self.context.void_type();
+        let fn_type = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into()], false);
+        let function = self.module.add_function("ret", fn_type, None);
+        let basic_block = self.context.append_basic_block(function, "entry");
+
+        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+
+        Target::initialize_native(&InitializationConfig::default()).unwrap();
+
+        self.builder.position_at_end(basic_block);
+
+        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
+        global.set_linkage(Linkage::External);
+        global.set_alignment(1);
+
+        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
+
+        let x = function.get_nth_param(1).unwrap().into_int_value();
+
+        // Cast the pointer to an integer
+        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), i64_type, "ptrtoint").unwrap();
+
+        // Bitcast the integer to a double
+        let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
+
+        // Get the value pointer
+        let valueptr = unsafe { self.builder.build_gep(i8_ptr_type, stackptr, &[offset], "valueptr").unwrap() };
+
+        // Load argument from stack
+        self.builder.build_store(valueptr, x).unwrap();
+
+        // Add tail call
+        // TODO: This is a hack, need a return stencil!
+        self.builder.build_return(None).unwrap();
+                
+        let elf = self.compile(false);
+    
+        get_stencil("ret", elf.as_slice(), false, false)    
+    }
 }
 
 pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
@@ -629,7 +670,7 @@ pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
 
     let context = Context::create();
     let module = context.create_module("put");
-    let codegen = CodeGen {
+    let codegen = StencilCodeGen {
         context: &context,
         module,
         builder: context.create_builder()
@@ -639,7 +680,7 @@ pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
     stencil_library.insert(put_stencil.name.clone(), put_stencil);
     let context = Context::create();
     let module = context.create_module("ghccc-conv");
-    let codegen = CodeGen {
+    let codegen = StencilCodeGen {
         context: &context,
         module,
         builder: context.create_builder()
@@ -650,7 +691,7 @@ pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
 
     let context = Context::create();
     let module = context.create_module("take");
-    let codegen = CodeGen {
+    let codegen = StencilCodeGen {
         context: &context,
         module,
         builder: context.create_builder()
@@ -662,7 +703,7 @@ pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
 
     let context = Context::create();
     let module = context.create_module("take2");
-    let codegen = CodeGen {
+    let codegen = StencilCodeGen {
         context: &context,
         module,
         builder: context.create_builder()
@@ -675,7 +716,7 @@ pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
 
     let context = Context::create();
     let module = context.create_module("take2");
-    let codegen = CodeGen {
+    let codegen = StencilCodeGen {
         context: &context,
         module,
         builder: context.create_builder()
@@ -688,7 +729,7 @@ pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
     
     let context = Context::create();
     let module = context.create_module("duplex");
-    let codegen = CodeGen {
+    let codegen = StencilCodeGen {
         context: &context,
         module,
         builder: context.create_builder()
@@ -701,21 +742,32 @@ pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
 
     let context = Context::create();
     let module = context.create_module("put");
-    let codegen = CodeGen {
+    let codegen = StencilCodeGen {
         context: &context,
         module,
         builder: context.create_builder()
     };
 
+
     let put_stencil = codegen.compile_put_stack();
     stencil_library.insert(put_stencil.name.clone(), put_stencil);
 
+    let context = Context::create();
+    let module = context.create_module("ret");
+    let codegen = StencilCodeGen {
+        context: &context,
+        module,
+        builder: context.create_builder()
+    };
 
-    let mut int_arith_stencils = CodeGen::compile_all_int_arith();
+    let ret_stencil = codegen.compile_ret_stencil();
+    stencil_library.insert(ret_stencil.name.clone(), ret_stencil);
+
+
+    let mut int_arith_stencils = StencilCodeGen::compile_all_int_arith();
 
     stencil_library.append(&mut int_arith_stencils);
 
     stencil_library
 }
-
 
