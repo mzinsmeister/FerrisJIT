@@ -32,7 +32,7 @@ To run the example, just run `cargo run`. Optionally a `-c` flag with a path to 
 cargo run -- -c test.csv
 ```
 
-If no file is given, the example will be run on a hardcoded sequential element array. Then you can enter expressions in lisp-like syntax. By default you will be in interactive mode and the result per input-line will just be printed. You can also pass `-b` as a flag to be in benchmark mode. Make sure to run with `--release` in this case. This will then print out the timings for compiled vs interpreted (when using generated input the input size will be 10,000,000 in this case, otherwise 10). For example:
+If no file is given, the example will be run on a hardcoded sequential element array. Then you can enter expressions in lisp-like syntax. By default you will be in interactive mode and the result per input-line will just be printed. You can also pass `-b` as a flag to be in benchmark mode. Make sure to run with `--release` in this case. This will then print out the timings for compiled vs interpreted (when using generated input the input size will be 1,000,000 in this case, otherwise 10). For example:
 
 Constant result:
 ```lisp
@@ -55,16 +55,35 @@ These are initial results from my Laptop:
 
 ```lisp
 >> (+ 2 $0)
-Interpreted: 232.118723ms
-Compiled: 43.866889ms
+Codegen+Compile: 31.758µs
+Interpreted: 47.706618ms
+Compiled: 4.925191ms
 >> (+ 2 (* 2 $0 (+ $0 (* 3 $0))))
-Interpreted: 795.58322ms
-Compiled: 49.456688ms
+Codegen+Compile: 22.414µs
+Interpreted: 164.626266ms
+Compiled: 5.782982ms
 ```
+
+### Very long examples
+
+I'm pretty sure the majority of the time is actually not even the evaluation but just writing the input into the stack and the function calls, e.g. for the ghc-calling-convention wrapper. My experiments showed that just the two function calls (to the ghc-cc wrapper and the generated function) cost 2/3s of the time for a simple expression like `(+ 2 $0)`. Once we have control flow constructs we can just put a pointer to the input onto the stack and loop through it inside the generated code. 
+
+For now we can just use very large expressions to get a better idea of the relative performance. Large expressions can be generated with the gen_expr.py (enter a number for complexity as first argument). 
+
+For example (complexity 1000):
+
+```lisp
+>> (* (* (+ (+ (* (+ (* (* (+ 7 5) (+ 6 $0)) (* $0 (* (* (+ (+ (* (+ $0 10) (* (* $0 (+ 1 (* 5 $0))) (* (+ (+ (+ $0 8) $0) $0) 10))) $0) (+ (* (* $0 8) $0) $0)) (* (+ $0 4) (* (+ 6 5) 8))) (* (* $0 7) $0)))) (+ (* (* (+ (* (* (* $0 $0) 6) 3) (+ (+ $0 7) (* (+ (* 9 $0) $0) $0))) (* (* 2 3) $0)) (+ (* (+ (+ $0 $0) 1) (+ (+ (+ 6 (* (* 1 $0) $0)) (+ $0 4)) (+ 4 7))) (* (+ (* 9 10) 6) (+ (+ $0 $0) (* (* $0 (+ 2 7)) 1))))) (* (* (* (* (+ 3 $0) (* (* 10 (* (+ (+ 10 6) $0) (+ (* $0 $0) 3))) (* (+ (+ (* 8 5) 2) (+ 6 $0)) 2))) (+ (+ (+ $0 (+ (* $0 $0) (* (+ 5 9) 4))) 7) (+ $0 1))) (+ (+ (+ (* (* (* $0 6) (* 10 2)) (+ $0 4)) (* (+ (* (* $0 (* $0 8)) $0) (+ 2 (* (* (+ 9 6) (+ 7 $0)) (* 9 (+ $0 (+ (* $0 4) 6)))))) $0)) (* (* 4 $0) $0)) (+ (+ (* (+ $0 9) 3) $0) (+ 7 $0)))) (* (* (+ (+ 9 $0) (+ (+ (+ 9 $0) $0) (+ (* (+ 3 1) (* (+ $0 $0) 10)) 6))) (* (+ (* (* 6 9) 10) $0) 2)) (* (* (+ (+ (+ 1 5) (* (+ $0 (+ $0 4)) 2)) (* (* (+ (+ (* 7 $0) (* $0 (+ (+ $0 $0) (+ (+ 7 (* $0 $0)) $0)))) (* (+ $0 (+ $0 9)) 3)) (+ (+ (* $0 $0) $0) $0)) (* (+ (+ $0 (* (* $0 $0) 6)) $0) 10))) (* (+ (+ (+ 3 2) 8) (+ (+ (+ (+ (* $0 8) (+ $0 $0)) (+ 7 10)) (+ (+ (* (* 6 $0) $0) $0) 9)) (+ (+ 6 (* (* 4 7) $0)) (* 1 $0)))) (+ 8 (* $0 1)))) (+ (+ (* (* (* $0 5) $0) $0) (* (* 4 5) (* $0 9))) (+ (* (* (+ 6 9) 2) (* (+ 2 4) (* $0 2))) 5))))))) (* (* (* (* (+ (* 1 3) 3) 4) (+ (+ $0 $0) (* $0 1))) (* (* (* (* (* (+ 9 9) 3) $0) (* (+ 9 $0) (* $0 (+ $0 8)))) (+ (+ (+ $0 7) 9) (* $0 $0))) (* (+ (* $0 9) 2) (+ (+ $0 3) 8)))) (+ (* $0 (+ 10 10)) 4))) (* (+ (* (+ (+ (* (* $0 (* (* (* $0 $0) (+ 6 $0)) (* (* 6 $0) $0))) (+ 4 7)) (+ 7 (* $0 6))) (* (* (* (+ $0 9) 8) 1) $0)) (+ (* 5 1) (+ $0 5))) (+ (+ $0 4) (+ $0 (* (+ (+ $0 1) $0) $0)))) (* (* (+ (+ (+ $0 $0) $0) (* (* (+ $0 2) (+ (+ (+ (+ 1 8) 2) $0) (+ $0 1))) (* 10 3))) (+ (+ (* (* (+ (+ $0 $0) $0) (* $0 3)) (+ 7 (+ 8 (* $0 $0)))) (* (+ (* 1 8) (+ $0 (+ (+ (* $0 8) 4) $0))) (* $0 4))) (+ (* 10 (* $0 $0)) 4))) (* (+ (* (* (* $0 2) $0) (+ (+ (+ (+ $0 $0) $0) (* $0 $0)) (+ 1 (* (* $0 3) (+ $0 10))))) (* (+ (* 1 10) (* (+ $0 $0) (* (* (+ 1 (* 9 5)) 7) (* (* (+ 6 4) $0) $0)))) (* (* $0 3) (+ $0 3)))) (+ $0 $0))))) (+ (+ (* (* $0 9) $0) (* (* (* $0 3) (+ 4 4)) $0)) (+ (+ (+ $0 8) (+ (* 5 $0) (+ $0 $0))) (* (* (* (+ 4 3) (+ (+ 5 8) $0)) (* (+ $0 $0) (+ (* (+ 8 $0) $0) (* (* $0 3) (+ (* 4 8) (+ 3 (+ (+ $0 3) (+ 5 1)))))))) (* 4 $0))))) (* (* (+ (+ (+ (+ (+ $0 $0) (+ (* $0 $0) 9)) (+ (+ (+ 5 1) 8) $0)) (* (* (+ (* 7 10) (+ 9 $0)) $0) (* 5 (* (* $0 9) 7)))) (+ (+ 1 5) (+ $0 8))) (+ $0 10)) (* (+ 3 (+ (* (+ $0 (+ (+ (* 1 $0) 2) 7)) (* (* (* 1 $0) (* (* (* (+ 5 $0) (+ (* 5 $0) (* 3 $0))) (* 10 (* 4 $0))) $0)) (+ (+ (* (+ (+ 5 (+ $0 $0)) 4) 1) (* 10 8)) (+ (+ 5 (+ 7 $0)) (* (+ (+ (* $0 $0) (* 9 (+ (+ $0 4) 5))) $0) 9))))) (* (+ (+ 7 (+ (+ $0 10) (+ $0 $0))) (+ (* (* (+ (+ (* 5 6) $0) (+ (* 8 $0) 1)) $0) (+ (* (+ (+ (* 8 4) $0) 5) $0) 10)) (+ 4 (* 10 (* 3 $0))))) (* (+ 3 $0) 10)))) (+ (+ 9 1) (* (+ (+ $0 $0) (* (+ $0 (+ (+ $0 $0) $0)) 7)) (+ 1 (+ 7 $0))))))) (+ (+ (+ (* $0 (+ $0 $0)) (+ (* $0 $0) (* (* (+ (+ 6 10) 1) $0) (* (* 7 $0) 7)))) (* (+ (* $0 (* 4 10)) (* $0 (* 5 9))) (* (* (+ $0 6) (+ $0 (+ 1 (+ $0 $0)))) (* (* (* $0 (+ 8 3)) 2) (* $0 3))))) (+ (+ (* (+ (* (* (+ (+ $0 5) 10) 8) $0) (* (+ (* $0 (* $0 3)) (+ 10 $0)) (* (* (+ (* (+ $0 5) $0) 4) 2) (* (+ (+ (+ 8 $0) $0) 4) 1)))) (* (+ 5 (+ (+ (* $0 9) (+ $0 $0)) (+ $0 10))) $0)) (* (* (* (+ (* 10 (* 2 2)) (* 6 3)) (* (+ 8 6) 7)) 5) (* (* (+ (+ (+ $0 (* $0 $0)) (* $0 (+ (* (+ $0 10) $0) (* (* (+ 2 5) (* (* (* 5 4) 1) 6)) $0)))) (* (+ (+ 3 (+ (* (+ (+ 3 5) $0) 7) $0)) $0) (+ (* (* 3 3) $0) (+ (* 6 (* $0 $0)) $0)))) (+ (+ (+ $0 7) (+ $0 $0)) 7)) (+ (* (* 8 $0) $0) (* (* (+ (+ $0 $0) $0) (* $0 $0)) (* (+ 5 1) 8)))))) (* (* (+ (+ 6 2) (* $0 (* (+ (* 10 $0) $0) $0))) (+ (* (* 6 (+ (+ 1 $0) (* $0 (* (+ (* 1 $0) 2) 7)))) (* (* (+ (* (* (+ (* $0 10) $0) $0) 3) (* (+ 7 3) (* 10 9))) 3) $0)) (* (+ (+ (* $0 4) (* (* $0 8) (+ (+ (* 4 10) 5) $0))) (* (+ $0 7) (* (+ (* (+ 7 9) (+ $0 (+ $0 4))) (* (* (* $0 (+ $0 8)) (* (+ $0 $0) 3)) 2)) (* (+ (* $0 (* 9 $0)) 7) $0)))) $0))) (* (* (* (* (+ (* (+ 3 1) $0) (* 9 4)) 10) 4) 9) (+ (+ (+ $0 9) $0) 4))))))
+Codegen+Compile: 124.344µs
+Interpreted: 17.771290849s
+Compiled: 268.977018ms
+```
+
 
 If you want to test against a hardcoded Rust expression you can just hack that expression into the main.rs file at the line where it says 
 ```                            
 //--- INSERT YOUR HARDCODED EXPRESSION EVALUATION HERE ---
 ```
 and uncomment the commented-out lines around it.
+
 

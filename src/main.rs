@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         println!("No csv file specified, using default dummy data");
         if args.benchmark {
-            (0..10_000_000u64).map(|n| vec![n]).collect()
+            (0..1_000_000u64).map(|n| vec![n]).collect()
         } else {
             (0..10).map(|n| vec![n]).collect()
         }
@@ -61,7 +61,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Dummy access to initialize stencils
+    let compile_start = std::time::Instant::now();
     black_box(STENCILS.len());
+    let compile_elapsed = compile_start.elapsed();
+    println!("Stencil initialization: {:?}", compile_elapsed);
 
     // REPL for evaluating expressions on the data
 
@@ -81,7 +84,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         continue;
                     }
                 };
+                let codegen_start = std::time::Instant::now();
                 let code = generate_code(&expr, test_data[0].len());
+                let codegen_elapsed = codegen_start.elapsed();
+                println!("Codegen+Compile: {:?}", codegen_elapsed);
                 match code {
                     Ok(code) => {
                         if args.benchmark {
