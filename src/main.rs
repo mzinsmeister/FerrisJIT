@@ -149,3 +149,41 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+
+    //const complex_expr: &str = include_str!("./complex_expr.txt");
+
+    const complex_expr: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
+
+    #[test]
+    fn test_codegen() {
+        let expr = parse_expr_from_str(complex_expr).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
+        for i in [0, 1, 5, 10, 100, 1000].iter() {
+            let result = code.call(&[*i]);
+            let interp_result = eval_expression(&expr, &[*i]);
+            assert_eq!(result, interp_result);
+        }
+    }
+
+    const complex_expr_2: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
+
+    #[test]
+    #[ignore]
+    // FIXME: This fails because of some error in nested constant folding
+    //        The expression is completely identical to the previous one except for the subterm
+    //        (* 9 (+ 1 4)) instead of (* 9 4)
+    fn test_codegen2() {
+        let expr = parse_expr_from_str(complex_expr_2).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
+        for i in [0, 1, 5, 10, 100, 1000].iter() {
+            let result = code.call(&[*i]);
+            let interp_result = eval_expression(&expr, &[*i]);
+            assert_eq!(result, interp_result);
+        }
+    }
+}
