@@ -140,7 +140,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         // For debugging purposes the stencil functions can be dumped to a file and then
         // be inspected for example by llvm-objdump --disassemble sum.o 
-        target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
+        //target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
         target_machine.write_to_memory_buffer(&self.module, FileType::Object).unwrap()
     }
 
