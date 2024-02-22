@@ -123,7 +123,8 @@ lazy_static! {
 
 struct CodeGen {
     code: Vec<u8>,
-    stack_size: usize
+    stack_ptr: usize,
+    stack_size: usize,
 }
 
 fn fold_constants(fun: &BuiltIn, l: u64, r: u64) -> u64 {
@@ -184,6 +185,7 @@ impl CodeGen {
     fn new(args: usize) -> Self {
         Self {  
             code: Vec::new(),
+            stack_ptr: args * 8,
             stack_size: args * 8,
         }
     }
@@ -303,12 +305,13 @@ impl CodeGen {
                 },
                 Expr::Application(fun2, args2) => {
                     // Save the current result to the stack 
-                    // TODO: this stack allocation is a hack and wasteful
-                    let stack_top = self.stack_size;
-                    self.stack_size += 8;
+                    let stack_top = self.stack_ptr;
+                    self.stack_ptr += 8;
+                    self.stack_size = self.stack_size.max(self.stack_ptr);
                     self.generate_put_stack(stack_top);
                     self.generate_code_application(&fun2, &args2);
                     self.generate_take_2_stack(stack_top);
+                    self.stack_ptr -= 8;
                     self.generate_op(fun);
                 },
             }
