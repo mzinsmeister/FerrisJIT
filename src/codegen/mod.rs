@@ -223,12 +223,6 @@ impl CodeGen {
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_duplex(&mut self) {
-        let stencil = STENCILS.get("duplex").unwrap();
-        let holes_values = vec![];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
     fn generate_i64_add(&mut self) {
         let stencil = STENCILS.get("i64_add").unwrap();
         let holes_values = vec![];

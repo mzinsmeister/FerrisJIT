@@ -1,20 +1,22 @@
 use inkwell::builder::Builder;
 
-use inkwell::context::{self, Context};
+use inkwell::context::Context;
 
 use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
-use inkwell::types::IntType;
-use inkwell::values::IntValue;
+use inkwell::types::{AnyType, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType};
+use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use inkwell::{AddressSpace, OptimizationLevel};
 
-
-
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::Path;
+
+// For reference (if you look into the Disassembly). 
+// Order of Registers in argument passing of the GHC-CC: R13, RBP, R12, RBX, R14, RSI, RDI, R8, R9, R15
 
 
 pub struct Stencil {
@@ -55,7 +57,6 @@ fn get_stencil(name: &str, elf: &[u8], cut_jmp: bool, large: bool) -> Stencil {
     }
     // get the binary code of the "sum" function as a byte array from the ELF file
 
-    let mut offset = 0;
     let mut code = None;
     
     // get .text section offset and size
@@ -63,7 +64,7 @@ fn get_stencil(name: &str, elf: &[u8], cut_jmp: bool, large: bool) -> Stencil {
         let name = &strtab.get_at(section.sh_name);
         if let Some(name) = name {
             if name == &".text" {
-                offset = section.sh_offset as usize;
+                let offset = section.sh_offset as usize;
                 let size = section.sh_size as usize;
                 // print code as hex bytes
                 for _i in 0..size {
@@ -100,13 +101,43 @@ struct StencilCodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
+    ph_counter: Cell<usize>,
+    large_ph: Cell<bool>
 }
 
 impl<'ctx> StencilCodeGen<'ctx> {
 
-    fn compile(&self, large: bool) -> MemoryBuffer {
+    fn new(context: &'ctx Context, name: &str) -> Self {
+        let module = context.create_module(name);
+        let builder = context.create_builder();
+        Self {
+            context,
+            module,
+            builder,
+            ph_counter: Cell::new(1),
+            large_ph: Cell::new(false)
+        }
+    }
 
-                        
+    fn init_placeholder(&self, ty: IntType<'ctx>) -> IntValue<'ctx> {
+        let i8_array_type = self.context.i8_type().array_type(1048576);
+
+        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), format!("PH{}", self.ph_counter.get()).as_str());
+        global.set_linkage(Linkage::External);
+        global.set_alignment(1);
+
+        self.ph_counter.set(self.ph_counter.get() + 1);
+
+        if ty.get_bit_width() > 4 {
+            self.large_ph.set(true);
+        }
+
+        let ptr = global.as_pointer_value();
+
+        self.builder.build_ptr_to_int(ptr, ty, "ptrtoint").unwrap()
+    }
+
+    fn compile(&self, large: bool) -> MemoryBuffer {
         // Print out the LLVM IR
         //println!("{}", self.module.print_to_string().to_string());
 
@@ -140,7 +171,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         // For debugging purposes the stencil functions can be dumped to a file and then
         // be inspected for example by llvm-objdump --disassemble sum.o 
-        //target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
+        target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
         target_machine.write_to_memory_buffer(&self.module, FileType::Object).unwrap()
     }
 
@@ -149,7 +180,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
         let void_type = self.context.void_type();
         let fn_type = void_type.fn_type(&[i8_ptr_type.into()], false);
-        let function = self.module.add_function("take_stack", fn_type, None);
+        let function = self.module.add_function("__GHC_CC-CONVERTER__", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
 
         let tailcalltype = void_type.fn_type(&[i8_ptr_type.into()], false);
@@ -175,426 +206,138 @@ impl<'ctx> StencilCodeGen<'ctx> {
         get_stencil("__GHC_CC-CONVERTER__", elf.as_slice(), false, true)
     }
 
-    fn compile_take_stack(&self) -> Stencil {
-        let i64_type = self.context.i64_type();
+    fn compile_stencil<F: Fn(&[BasicValueEnum<'ctx>], PointerValue<'ctx>) -> Vec<BasicValueEnum<'ctx>>>(&self, name: &str, args: &[BasicMetadataTypeEnum<'ctx>], operation: F) -> Stencil {
+        self.module.set_name(name);
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
 
-        self.module.set_name("i64_take");
 
-        let i8_array_type = i8_type.array_type(1048576);
         let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[i8_ptr_type.into()], false);
-        let function = self.module.add_function("i64_take-stack", fn_type, None);
+
+        let mut new_args = Vec::new();
+        new_args.push(i8_ptr_type.into());
+        for arg in args {
+            new_args.push(arg.clone());
+        }
+
+        let fn_type = void_type.fn_type(&new_args, false);
+        let function = self.module.add_function(name, fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
-
-        let tailcalltype = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into()], false);
-
-        let tailcallfun = self.module.add_function("tailcall", tailcalltype, Some(Linkage::External));
-        tailcallfun.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
 
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
 
         self.builder.position_at_end(basic_block);
 
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
-        global.set_linkage(Linkage::External);
-        global.set_alignment(1);
-
         let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
 
-        // Cast the pointer to an integer
-        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), i64_type, "ptrtoint").unwrap();
+        let params: Vec<BasicValueEnum<'_>> = function.get_param_iter().skip(1).collect();
+        
+        let res = operation(&params, stackptr);
 
-        // Bitcast the integer to a double
-        let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
+        let mut tailcall_args = Vec::new();
+        let mut tailcall_args_types = Vec::new();
 
-        // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
+        tailcall_args.push(stackptr.into());
+        tailcall_args_types.push(i8_ptr_type.into());
 
-        // Load argument from stack
-        let x = self.builder.build_load(i64_type, valueptr, "x").unwrap().into_int_value();
+        for arg in res {
+            tailcall_args.push(arg.into());
+            tailcall_args_types.push(arg.get_type().into());
+        }
 
-        // Add tail call
-        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), x.into()], "tailcall").unwrap();
+        let tailcalfun_type = void_type.fn_type(&tailcall_args_types, false);
 
+        let tailcallfun = self.module.add_function("tailcall", tailcalfun_type, Some(Linkage::External));
+
+        let tc = self.builder.build_call(tailcallfun, &tailcall_args, "tailcall").unwrap();
         tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
         tc.set_tail_call(true);
-
         self.builder.build_return(None).unwrap();
 
-        let elf = self.compile(true);
-    
-        get_stencil("i64_take-stack", elf.as_slice(), true, true)
+        let elf = self.compile(self.large_ph.get());
+
+        get_stencil(name, elf.as_slice(), true, self.large_ph.get())
+    }
+
+
+    fn compile_take_stack(&self) -> Stencil {
+        self.compile_stencil("i64_take-stack", &[], |_, stackptr| {
+            let i8_type = self.context.i8_type();
+            let offset = self.init_placeholder(self.context.i64_type());
+            let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
+            let x = self.builder.build_load(self.context.i64_type(), valueptr, "x").unwrap().into_int_value();
+            vec![x.into()]
+        })
     }
 
     fn compile_take2_first_stack(&self) -> Stencil {
         let i64_type = self.context.i64_type();
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
-
-        self.module.set_name("i64_take1");
-
-        let i8_array_type = i8_type.array_type(1048576);
-        let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into(), i64_type.into()], false);
-        let function = self.module.add_function("i64-take_first_stack", fn_type, None);
-        let basic_block = self.context.append_basic_block(function, "entry");
-
-        let tailcallfun = self.module.add_function("tailcall", fn_type, Some(Linkage::External));
-        tailcallfun.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        self.builder.position_at_end(basic_block);
-
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
-        global.set_linkage(Linkage::External);
-        global.set_alignment(1);
-
-        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
-        let y = function.get_nth_param(1).unwrap().into_int_value();
-
-        // Cast the pointer to an integer
-        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), i64_type, "ptrtoint").unwrap();
-
-        // Bitcast the integer to a double
-        let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
-
-        // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
-
-        // Load argument from stack
-        let x = self.builder.build_load(i64_type, valueptr, "x").unwrap().into_int_value();
-
-        // Add tail call
-        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), x.into(), y.into()], "tailcall").unwrap();
-
-        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        tc.set_tail_call(true);
-
-        self.builder.build_return(None).unwrap();
-
-        let elf = self.compile(true);
-    
-        get_stencil("i64_take-1-stack", elf.as_slice(), true, true)
+        self.compile_stencil("i64_take-1-stack", 
+                &[i64_type.into(), i64_type.into()], 
+                |args, stackptr| {
+            let i8_type = self.context.i8_type();
+            let offset = self.init_placeholder(self.context.i64_type());
+            let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
+            let x = self.builder.build_load(self.context.i64_type(), valueptr, "x").unwrap().into_int_value();
+            vec![x.into(), args[1]]
+        })
     }
 
     fn compile_take2_second_stack(&self) -> Stencil {
         let i64_type = self.context.i64_type();
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
+        self.compile_stencil("i64_take-2-stack",  &[i64_type.into()], |args, stackptr| {
+            let i8_type = self.context.i8_type();
+            let offset = self.init_placeholder(self.context.i64_type());
+            let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
+            let x = self.builder.build_load(self.context.i64_type(), valueptr, "x").unwrap().into_int_value();
+            vec![args[0], x.into()]
+        })
+    }
 
-        self.module.set_name("i64_take2");
-
-        let i8_array_type = i8_type.array_type(1048576);
-        let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into()], false);
-        let function = self.module.add_function("i64-take_second_stack", fn_type, None);
-        let basic_block = self.context.append_basic_block(function, "entry");
-
-        let tailcalltype = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into(), i64_type.into()], false);
-
-        let tailcallfun = self.module.add_function("tailcall", tailcalltype, Some(Linkage::External));
-        tailcallfun.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        self.builder.position_at_end(basic_block);
-
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
-        global.set_linkage(Linkage::External);
-        global.set_alignment(1);
-
-        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
-        let x = function.get_nth_param(1).unwrap().into_int_value();
-
-        // Cast the pointer to an integer
-        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), i64_type, "ptrtoint").unwrap();
-
-        // Bitcast the integer to a double
-        let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
-
-        // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
-
-        // Load argument from stack
-        let y = self.builder.build_load(i64_type, valueptr, "x").unwrap().into_int_value();
-
-        // Add tail call
-        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), x.into(), y.into()], "tailcall").unwrap();
-
-        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        tc.set_tail_call(true);
-
-        self.builder.build_return(None).unwrap();
-
-        let elf = self.compile(true);
-    
-        get_stencil("i64_take-2-stack", elf.as_slice(), true, true)
+    fn compile_take_const(&self) -> Stencil {
+        self.compile_stencil("i64_take-const", &[self.context.i64_type().into()], |_, _| {
+            let x = self.init_placeholder(self.context.i64_type());
+            vec![x.into()]
+        })
     }
 
     // Compiles a stencil that takes one argument and calls a function with two arguments
     // We could instead also just have one that moves from the first to the second and calls
     // with an undefined first value but this is more flexible and performance should be the same
     fn compile_duplex(&self) -> Stencil {
-        let i64_type = self.context.i64_type();
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
-
-        let i8_array_type = i8_type.array_type(1048576);
-        let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into()], false);
-        let function = self.module.add_function("i64-duplex", fn_type, None);
-        let basic_block = self.context.append_basic_block(function, "entry");
-
-        let tailcalltype = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into(), i64_type.into()], false);
-
-        let tailcallfun = self.module.add_function("tailcall", tailcalltype, Some(Linkage::External));
-        tailcallfun.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        self.builder.position_at_end(basic_block);
-
-        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
-        let x = function.get_nth_param(1).unwrap().into_int_value();
-
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
-        global.set_linkage(Linkage::External);
-        global.set_alignment(1);
-
-        // Add tail call
-        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), x.into(), x.into()], "tailcall").unwrap();
-
-        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        tc.set_tail_call(true);
-
-        self.builder.build_return(None).unwrap();
-
-        let elf = self.compile(false);
-    
-        get_stencil("duplex", elf.as_slice(), true, false)
+        self.compile_stencil("i64_duplex", &[self.context.i64_type().into()], |args, _| {
+            let x = args[0].into_int_value();
+            vec![x.into(), x.into()]
+        })
     }
 
     fn compile_put_stack(&self) -> Stencil {
-        let i64_type = self.context.i64_type();
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
-
-        let i8_array_type = i8_type.array_type(1048576);
-        let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[i8_ptr_type.into(), i64_type.into()], false);
-        let function = self.module.add_function("put_stack", fn_type, None);
-        let basic_block = self.context.append_basic_block(function, "entry");
-
-        // We still pass the parameter. Doesn't hurt!
-        let tailcallfun = self.module.add_function("tailcall", fn_type, Some(Linkage::External));
-
-        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        self.builder.position_at_end(basic_block);
-
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
-        global.set_linkage(Linkage::External);
-        global.set_alignment(1);
-
-        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
-
-        let x = function.get_nth_param(1).unwrap().into_int_value();
-
-        // Cast the pointer to an integer
-        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), i64_type, "ptrtoint").unwrap();
-
-        // Bitcast the integer to a double
-        let offset = self.builder.build_bitcast(ptr_as_int, i64_type, "offset").unwrap().into_int_value();
-
-        // Get the value pointer
-        let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
-
-        // Cast the pointer to an i64 pointer
-        let valueptr = self.builder.build_bitcast(valueptr, i64_type.ptr_type(AddressSpace::default()), "valueptr2").unwrap().into_pointer_value();
-
-        // Put argument onto the stack
-        self.builder.build_store(valueptr, x).unwrap();
-
-        // Add tail call
-        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), x.into()], "tailcall").unwrap();
-
-        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        tc.set_tail_call(true);
-
-        self.builder.build_return(None).unwrap();
-        
-        let elf = self.compile(true);
-    
-        get_stencil("i64_put-stack", elf.as_slice(), true, true)
+        self.compile_stencil("i64_put-stack", &[self.context.i64_type().into()], |args, stackptr| {
+            let i8_type = self.context.i8_type();
+            let x = args[0].into_int_value();
+            let offset = self.init_placeholder(self.context.i64_type());
+            let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
+            self.builder.build_store(valueptr, x).unwrap();
+            vec![x.into()]
+        })
     }
 
-    fn compile_all_int_arith() -> BTreeMap<String, Stencil> {
-        // TODO: We need reverse operations for non commutative operations
-        fn int_add<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_int_add(x, y, "add").unwrap()
-        }
-        fn int_sub<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_int_sub(x, y, "sub").unwrap()
-        }
-        fn int_mul<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_int_mul(x, y, "mul").unwrap()
-        }
-        fn int_div<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_int_signed_div(x, y, "div").unwrap()
-        }
-        fn int_rem<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_int_signed_rem(x, y, "rem").unwrap()
-        }
-        fn int_and<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_and(x, y, "and").unwrap()
-        }
-        fn int_or<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_or(x, y, "or").unwrap()
-        }
-        fn int_xor<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_xor(x, y, "xor").unwrap()
-        }
-        fn int_shl<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_left_shift(x, y, "shl").unwrap()
-        }
-        fn int_lshr<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_right_shift(x, y, false, "lshr").unwrap()
-        }
-        fn int_ashr<'ctx>(builder: &'ctx Builder, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-            builder.build_right_shift(x, y, true, "ashr").unwrap()
-        }
-        let context = Context::create();
-        let ops: Vec<(&str, for<'a> fn(&'a Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![("add", int_add), ("sub", int_sub), ("mul", int_mul), ("div", int_div), ("rem", int_rem), ("and", int_and), ("or", int_or), ("xor", int_xor), ("shl", int_shl), ("lshr", int_lshr), ("ashr", int_ashr)];
-        let types = vec![context.i8_type(), context.i16_type(), context.i32_type(), context.i64_type()];
-
-        let mut stencils = BTreeMap::new();
-
-        for (name, op) in ops {
-            for ty in types.iter() {
-                let module = context.create_module("stencil");
-                let codegen = StencilCodeGen {
-                    context: &context,
-                    module,
-                    builder: context.create_builder()
-                };
-
-                let context_const = Context::create();
-                let module_const = context.create_module("stencil-const");
-                let codegen_const = StencilCodeGen {
-                    context: &context_const,
-                    module: module_const,
-                    builder: context_const.create_builder()
-                };
-
-
-                let stencil: Stencil = codegen.compile_int_arith(name, *ty, op);
-                let const_stencil = codegen_const.compile_const_int_arith(name, *ty, op);
-                stencils.insert(stencil.name.clone(), stencil);
-                stencils.insert(const_stencil.name.clone(), const_stencil);
-            }
-        }
-
-        stencils
+    fn compile_int_arith(&self, name: &str, op_type: IntType<'ctx>, perform_op: fn(&Builder<'ctx>, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
+        self.compile_stencil(name, &[op_type.into(), op_type.into()], |args, _| {
+            let x = args[0].into_int_value();
+            let y = args[1].into_int_value();
+            let res = perform_op(&self.builder, x, y);
+            vec![res.into()]
+        })
     }
 
-    fn compile_int_arith(&self, name: &str, op_type: IntType<'ctx>, perform_op: for<'a> fn(&'a Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>) -> Stencil {
-        let base_type = op_type;
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
-
-        let name = format!("{}_{}", base_type.print_to_string().to_string(), name);
-        self.module.set_name(name.as_str());
-
-        let i8_array_type = i8_type.array_type(1048576);
-        let fn_type = base_type.fn_type(&[i8_ptr_type.into(), base_type.into(), base_type.into()], false);
-        let tail_fn_type = base_type.fn_type(&[i8_ptr_type.into(), base_type.into()], false);
-        let function = self.module.add_function("stencil", fn_type, None);
-        let basic_block = self.context.append_basic_block(function, "entry");
-
-        let tailcallfun = self.module.add_function("tailcall", tail_fn_type, Some(Linkage::External));
-        tailcallfun.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        self.builder.position_at_end(basic_block);
-
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
-        global.set_linkage(Linkage::External);
-        global.set_alignment(1);
-    
-        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
-
-        let x = function.get_nth_param(1).unwrap().into_int_value();
-        let y = function.get_nth_param(2).unwrap().into_int_value();
-
-        // Bitcast the integer to a double
-
-        let sum = perform_op(&self.builder, x, y);
-        
-        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), sum.into()], "tailcall").unwrap();
-
-        tc.set_tail_call(true);
-        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        self.builder.build_return(None).unwrap();
-
-        let elf = self.compile(false);
-    
-        get_stencil(&name, elf.as_slice(), true, false)
-    }
-
-    fn compile_const_int_arith(&self, name: &str, op_type: IntType<'ctx>, perform_op: for<'a> fn(&'a Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>) -> Stencil {
-        let base_type = op_type;
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
-
-        let name = format!("{}_{}_const", base_type.print_to_string().to_string(), name);
-        self.module.set_name(name.as_str());
-
-        let i8_array_type = i8_type.array_type(1048576);
-        let fn_type = base_type.fn_type(&[i8_ptr_type.into(), base_type.into()], false);
-        let function = self.module.add_function("stencil", fn_type, None);
-        let basic_block = self.context.append_basic_block(function, "entry");
-
-        let tailcallfun = self.module.add_function("tailcall", fn_type, Some(Linkage::External));
-        tailcallfun.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        self.builder.position_at_end(basic_block);
-
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), "PH1");
-        global.set_linkage(Linkage::External);
-        global.set_alignment(1);
-    
-        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
-        // Cast the pointer to an integer
-        let ptr_as_int = self.builder.build_ptr_to_int(global.as_pointer_value(), base_type, "ptrtoint").unwrap();
-
-        let x = function.get_nth_param(1).unwrap().into_int_value();
-
-        let result = perform_op(&self.builder, ptr_as_int, x);
-        
-        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), result.into()], "tailcall").unwrap();
-
-        tc.set_tail_call(true);
-        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
-
-        self.builder.build_return(None).unwrap();
-
-        let large = base_type.get_bit_width() > 32;
-
-        let elf = self.compile(large);
-    
-        get_stencil(&name, elf.as_slice(), true, large)
+    fn compile_const_int_arith(&self, name: &str, op_type: IntType<'ctx>, perform_op: fn(&Builder<'ctx>, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
+        self.compile_stencil(name, &[op_type.into()], |args,  _| {
+            let x = args[0].into_int_value();
+            let y = self.init_placeholder(op_type);
+            let res = perform_op(&self.builder, x, y);
+            vec![res.into()]
+        })
     }
 
 
@@ -616,106 +359,84 @@ impl<'ctx> StencilCodeGen<'ctx> {
     }
 }
 
+fn compile_all_int_arith() -> BTreeMap<String, Stencil> {
+    // TODO: We need reverse operations for non commutative operations
+    fn int_add<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_int_add(x, y, "add").unwrap()
+    }
+    fn int_sub<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_int_sub(x, y, "sub").unwrap()
+    }
+    fn int_mul<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_int_mul(x, y, "mul").unwrap()
+    }
+    fn int_div<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_int_signed_div(x, y, "div").unwrap()
+    }
+    fn int_rem<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_int_signed_rem(x, y, "rem").unwrap()
+    }
+    fn int_and<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_and(x, y, "and").unwrap()
+    }
+    fn int_or<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_or(x, y, "or").unwrap()
+    }
+    fn int_xor<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_xor(x, y, "xor").unwrap()
+    }
+    fn int_shl<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_left_shift(x, y, "shl").unwrap()
+    }
+    fn int_lshr<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_right_shift(x, y, false, "lshr").unwrap()
+    }
+    fn int_ashr<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_right_shift(x, y, true, "ashr").unwrap()
+    }
+    let context = Context::create();
+    let ops: Vec<(&str, for<'a> fn(& Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![("add", int_add), ("sub", int_sub), ("mul", int_mul), ("div", int_div), ("rem", int_rem), ("and", int_and), ("or", int_or), ("xor", int_xor), ("shl", int_shl), ("lshr", int_lshr), ("ashr", int_ashr)];
+    let types = vec![context.i8_type(), context.i16_type(), context.i32_type(), context.i64_type()];
+
+    let mut stencils = BTreeMap::new();
+
+    for (name, op) in ops {
+        for ty in types.iter() {
+            let codegen = StencilCodeGen::new(&context, "stencil");
+            let codegen_const = StencilCodeGen::new(&context, "stencil-const");
+
+            let stencil: Stencil = codegen.compile_int_arith(&format!("{}_{}", ty.print_to_string().to_string(), name), *ty, op);
+            let const_stencil = codegen_const.compile_const_int_arith(&format!("{}_{}_const", ty.print_to_string().to_string(), name), *ty, op);
+            stencils.insert(stencil.name.clone(), stencil);
+            stencils.insert(const_stencil.name.clone(), const_stencil);
+        }
+    }
+
+    stencils
+}
+
+fn compile_stencil(stencil_lib: &mut BTreeMap<String, Stencil>, name: &str, comp_fn: fn(&StencilCodeGen) -> Stencil) {
+    let context = Context::create();
+    let codegen = StencilCodeGen::new(&context, name);
+
+    let stencil = comp_fn(&codegen);
+    stencil_lib.insert(name.to_string(), stencil);
+}
+
 pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
     let mut stencil_library = BTreeMap::new();
 
-    let context = Context::create();
-    let module = context.create_module("put");
-    let codegen = StencilCodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder()
-    };
-
-    let put_stencil = codegen.compile_put_stack();
-    stencil_library.insert(put_stencil.name.clone(), put_stencil);
-    let context = Context::create();
-    let module = context.create_module("ghccc-conv");
-    let codegen = StencilCodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder()
-    };
-
-    let ghc_stencil = codegen.compile_ghc_wrapper();
-    stencil_library.insert(ghc_stencil.name.clone(), ghc_stencil);
-
-    let context = Context::create();
-    let module = context.create_module("take");
-    let codegen = StencilCodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder()
-    };
-
-    // since we take the first value on the stack we don't need to patch
-    let take_stencil = codegen.compile_take_stack();
-    stencil_library.insert(take_stencil.name.clone(), take_stencil);
-
-    let context = Context::create();
-    let module = context.create_module("take1");
-    let codegen = StencilCodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder()
-    };
-
-    let take2_first_stencil = codegen.compile_take2_first_stack();
-
-    stencil_library.insert(take2_first_stencil.name.clone(), take2_first_stencil);
+    compile_stencil(&mut stencil_library, "i64_put-stack", |c| c.compile_put_stack());
+    compile_stencil(&mut stencil_library, "i64_take-stack", |c| c.compile_take_stack());
+    compile_stencil(&mut stencil_library, "i64_take-1-stack", |c| c.compile_take2_first_stack());
+    compile_stencil(&mut stencil_library, "i64_take-2-stack", |c| c.compile_take2_second_stack());
+    compile_stencil(&mut stencil_library, "i64_take-const", |c| c.compile_take_const());
+    compile_stencil(&mut stencil_library, "i64_duplex", |c| c.compile_duplex());
+    compile_stencil(&mut stencil_library, "ret", |c| c.compile_ret_stencil());
+    compile_stencil(&mut stencil_library, "__GHC_CC-CONVERTER__", |c| c.compile_ghc_wrapper());
 
 
-    let context = Context::create();
-    let module = context.create_module("take2");
-    let codegen = StencilCodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder()
-    };
-    
-    let take2_second_stencil = codegen.compile_take2_second_stack();
-
-    stencil_library.insert(take2_second_stencil.name.clone(), take2_second_stencil);
-
-    
-    let context = Context::create();
-    let module = context.create_module("duplex");
-    let codegen = StencilCodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder()
-    };
-
-    let duplex_stencil = codegen.compile_duplex();
-
-    stencil_library.insert(duplex_stencil.name.clone(), duplex_stencil);
-
-
-    let context = Context::create();
-    let module = context.create_module("put");
-    let codegen = StencilCodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder()
-    };
-
-
-    let put_stencil = codegen.compile_put_stack();
-    stencil_library.insert(put_stencil.name.clone(), put_stencil);
-
-    let context = Context::create();
-    let module = context.create_module("ret");
-    let codegen = StencilCodeGen {
-        context: &context,
-        module,
-        builder: context.create_builder()
-    };
-
-    let ret_stencil = codegen.compile_ret_stencil();
-    stencil_library.insert(ret_stencil.name.clone(), ret_stencil);
-
-
-    let mut int_arith_stencils = StencilCodeGen::compile_all_int_arith();
+    let mut int_arith_stencils = compile_all_int_arith();
 
     stencil_library.append(&mut int_arith_stencils);
 
