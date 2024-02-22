@@ -6,26 +6,53 @@ As a first step i will try to generate a few simple addition stencils and patch 
 
 ## Current state
 
-Automatic stencil generation for integer-types and integer-operations should be working. Expression evaluation in basic cases works but there's still quite a few bugs.
+Automatic stencil generation for integer-types and integer-operations should be working. Expression evaluation in basic cases works but there might still be bugs. Register utilization/caching could definitely still be improved but it works for now.
 
-Basic expressions with arbitrary integer arithmetic should almost work. The only thing still missing is a stencil
-for taking two values from the stack and calling another stencil with them. For now arbitrary constant operations
-are working however. The hardcoded example currently does a hardcoded addition of 10 followed by a multiplication by 2. What's still missing is a stencil for shifting a value from first register to second operand and some other "glue"-stencils like that.
+## Next steps
+
+Next steps would be control flow constructs and beeing able to generate llvm ir for the entire expressions using the same code that generates the stencils.
 
 ## Useage
 
-To run the example, just run `cargo run`. Optionally a "-c" flag with a path to a csv file can be passed to run the example with the given csv file as input. If no file is given, the example will be run on a hardcoded sequential 10 element array. Then you can enter expressions in lisp-like syntax and the result will be printed. For example:
+To run the example, just run `cargo run`. Optionally a `-c` flag with a path to a csv file can be passed to run the example with the given csv file as input. 
+
+```bash
+cargo run -- -c test.csv
+```
+
+If no file is given, the example will be run on a hardcoded sequential element array. Then you can enter expressions in lisp-like syntax. By default you will be in interactive mode and the result per input-line will just be printed. You can also pass `-b` as a flag to be in benchmark mode. Make sure to run with `--release` in this case. This will then print out the timings for compiled vs interpreted (when using generated input the input size will be 10,000,000 in this case, otherwise 10). For example:
 
 Constant result:
-```
+```lisp
 (+ 10 (* 2 3))
 ```
 
 Variable result (variables are just named $0, $1, ... corresponding to the column in the csv):
-```
+```lisp
 (+ 10 $0)
 ```
 
-## Next steps
+Expressions can also be nested arbitrarily.
+```lisp
+(+ (+ 10 2) (* 2 (+ 3 4)))
+```
 
-Next steps would be automatic stencil generation for all kinds of different data types with and without operands in registers and for control flow constructs (if, if/else, loops). After that i will try to create CodeGen Primitives and use those to generate stencils, generate full llvm ir or generate copy-patched code. This should then also allow to use some kind of AST or internal IR to do this generation.
+## Example Results
+
+These are initial results from my Laptop:
+
+```lisp
+>> (+ 2 $0)
+Interpreted: 232.118723ms
+Compiled: 43.866889ms
+>> (+ 2 (* 2 $0 (+ $0 (* 3 $0))))
+Interpreted: 795.58322ms
+Compiled: 49.456688ms
+```
+
+If you want to test against a hardcoded Rust expression you can just hack that expression into the main.rs file at the line where it says 
+```                            
+//--- INSERT YOUR HARDCODED EXPRESSION EVALUATION HERE ---
+```
+and uncomment the commented-out lines around it.
+

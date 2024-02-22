@@ -269,12 +269,12 @@ fn get_num_from_expr(e: Expr, vars: &[&u64]) -> Option<u64> {
 /// This function tries to reduce the AST.
 /// This has to return an Expression rather than an Atom because quoted s_expressions
 /// can't be reduced
-pub fn eval_expression(e: Expr, vars: &[&u64]) -> u64 {
+pub fn eval_expression(e: &Expr, vars: &[u64]) -> u64 {
   match e {
     // Constants and quoted s-expressions are our base-case
     Expr::Constant(c) /*| Expr::Quote(_)*/ => match c {
-      Atom::Num(n) => n,
-      Atom::Variable(i) => *vars[i],
+      Atom::Num(n) => *n,
+      Atom::Variable(i) => vars[*i],
       _ => unreachable!("Unexpected constant"),
     }
     // we then recursively `eval_expression` in the context of our special forms
@@ -352,8 +352,8 @@ pub fn parse_expr_from_str(src: &str) -> Result<Expr, String> {
 }
 /// And we add one more top-level function to tie everything together, letting
 /// us call eval on a string directly
-pub fn eval_from_str(src: &str, vars: &[&u64]) -> Result<u64, String> {
+pub fn eval_from_str(src: &str, vars: &[u64]) -> Result<u64, String> {
   parse_expr(src)
     .map_err(|e: nom::Err<VerboseError<&str>>| format!("{:#?}", e))
-    .and_then(|(_, exp)| Ok(eval_expression(exp, vars)))
+    .and_then(|(_, exp)| Ok(eval_expression(&exp, vars)))
 }

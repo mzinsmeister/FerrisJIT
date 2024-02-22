@@ -11,12 +11,17 @@ use clap::Parser;
 use csv::Reader;
 use rustyline::{error::ReadlineError, history::MemHistory, Config, DefaultEditor, Editor};
 
+use crate::expr::eval_expression;
+
 /// Search for a pattern in a file and display the lines that contain it.
 #[derive(Parser)]
 struct Cli {
     /// The path to the file to read
     #[arg(short, long)]
     csv: Option<std::path::PathBuf>,
+    /// Whether to run in benchmark mode
+    #[arg(short, long)]
+    benchmark: bool,
 }
 
 
@@ -42,9 +47,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
             .collect()
     } else {
-        //(0..10_000_000u64).map(|n| vec![n]).collect()
         println!("No csv file specified, using default dummy data");
-        (0..10).map(|n| vec![n]).collect()
+        if args.benchmark {
+            (0..10_000_000u64).map(|n| vec![n]).collect()
+        } else {
+            (0..10).map(|n| vec![n]).collect()
+        }
     };
 
     if test_data.len() == 0 {
@@ -53,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Dummy access to initialize stencils
-    black_box(STENCILS.get("dummy"));
+    black_box(STENCILS.len());
 
     // REPL for evaluating expressions on the data
 
@@ -76,13 +84,41 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let code = generate_code(&expr, test_data[0].len());
                 match code {
                     Ok(code) => {
-                        for line in test_data.iter() {
-                            // Write argument to the stack
-        
-                            let result = code.call(line);
-                    
-                            println!("Result: {}", result);
-                        }
+                        if args.benchmark {
+                            let start_time = std::time::Instant::now();
+                            for line in test_data.iter() {
+                                code.call(line);
+                            }
+                            
+                            let elapsed = start_time.elapsed();
+    
+                            
+                            let start_interp = std::time::Instant::now();
+
+                            for line in test_data.iter() {
+    
+                                let interp_result = eval_expression(&expr, line);
+
+                                black_box(interp_result);
+    
+                            }
+                            let elapsed_interp = start_interp.elapsed();
+
+                            //let start_hardcoded = std::time::Instant::now();
+                            //--- INSERT YOUR HARDCODED EXPRESSION EVALUATION HERE ---
+                            //let elapsed_hardcoded = start_hardcoded.elapsed();
+                            //println!("Hardcoded: {:?}", elapsed_hardcoded);
+                            
+                            println!("Interpreted: {:?}", elapsed_interp);
+                            println!("Compiled: {:?}", elapsed);
+
+
+                        } else {
+                            for line in test_data.iter() {
+                                let result = code.call(line);
+                                println!("Result: {}", result);
+                            }
+                        }     
                     },
                     Err(c) => {
                         println!("Result (const): {}", c);
