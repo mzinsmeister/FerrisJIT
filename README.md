@@ -12,7 +12,19 @@ Automatic stencil generation for integer-types and integer-operations should be 
 
 Next steps would be control flow constructs and beeing able to generate llvm ir for the entire expressions using the same code that generates the stencils.
 
-## Useage
+## Try it!
+
+### Setup
+
+To run this example you need to be running on a Linux machine (i think so at least) and have llvm-17 installed. To install llvm-17 on Ubuntu you can run:
+
+```bash
+wget https://apt.llvm.org/llvm.sh
+chmod +x llvm.sh
+sudo ./llvm.sh 17
+```
+
+### Useage
 
 To run the example, just run `cargo run`. Optionally a `-c` flag with a path to a csv file can be passed to run the example with the given csv file as input. 
 
