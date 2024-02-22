@@ -150,8 +150,8 @@ fn fold_all_constants(fun: &BuiltIn, args: &[Expr]) -> Vec<Expr> {
             Expr::Constant(Atom::Variable(n)) => {
                 result.push(Expr::Constant(Atom::Variable(*n)));
             },
-            Expr::Application(fun, s) => {
-                let folded_s = fold_all_constants(fun, s);
+            Expr::Application(fun2, s) => {
+                let folded_s = fold_all_constants(fun2, s);
                 if folded_s.len() == 1 {
                     match folded_s[0] {
                         Expr::Constant(Atom::Num(n)) => {
@@ -167,7 +167,7 @@ fn fold_all_constants(fun: &BuiltIn, args: &[Expr]) -> Vec<Expr> {
                         _ => unreachable!()
                     }
                 } else {
-                    result.push(Expr::Application(*fun, folded_s));
+                    result.push(Expr::Application(*fun2, folded_s));
                 }
             },
         }
@@ -296,7 +296,7 @@ impl CodeGen {
             match arg {
                 Expr::Constant(Atom::Variable(n)) => {
                     self.generate_take_2_stack(n * 8);
-                    self.generate_i64_add();
+                    self.generate_op(fun);
                 },
                 Expr::Constant(Atom::Num(n)) => {
                     self.generate_op_const(fun, *n);

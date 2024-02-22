@@ -160,7 +160,7 @@ mod test {
     const complex_expr: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
 
     #[test]
-    fn test_codegen() {
+    fn test_codegen1() {
         let expr = parse_expr_from_str(complex_expr).unwrap();
         let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
@@ -173,11 +173,20 @@ mod test {
     const complex_expr_2: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
 
     #[test]
-    #[ignore]
-    // FIXME: This fails because of some error in nested constant folding
-    //        The expression is completely identical to the previous one except for the subterm
-    //        (* 9 (+ 1 4)) instead of (* 9 4)
     fn test_codegen2() {
+        let expr = parse_expr_from_str(complex_expr_2).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
+        for i in [0, 1, 5, 10, 100, 1000].iter() {
+            let result = code.call(&[*i]);
+            let interp_result = eval_expression(&expr, &[*i]);
+            assert_eq!(result, interp_result);
+        }
+    }
+
+    const very_complex_expr_1: &str = include_str!("complex_expr.txt");
+
+    #[test]
+    fn test_codegen3_very_complex() {
         let expr = parse_expr_from_str(complex_expr_2).unwrap();
         let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
