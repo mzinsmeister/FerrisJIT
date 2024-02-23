@@ -24,7 +24,7 @@ chmod +x llvm.sh
 sudo ./llvm.sh 17
 ```
 
-### Useage
+### Usage
 
 To run the example, just run `cargo run`. Optionally a `-c` flag with a path to a csv file can be passed to run the example with the given csv file as input. 
 
