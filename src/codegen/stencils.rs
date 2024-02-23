@@ -7,33 +7,153 @@ use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
-use inkwell::types::{AnyType, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType};
+use inkwell::types::{BasicMetadataTypeEnum, IntType};
 use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 use inkwell::{AddressSpace, OptimizationLevel};
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
 use std::path::Path;
+
+use super::ir::DataType;
 
 // For reference (if you look into the Disassembly). 
 // Order of Registers in argument passing of the GHC-CC: R13, RBP, R12, RBX, R14, RSI, RDI, R8, R9, R15
 
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
+pub enum StencilOperation {
 
+    // Arithmetic operations
+    Add,
+    AddConst,
+    Sub,
+    SubConst,
+    Mul,
+    MulConst,
+    SDiv,
+    SDivConst,
+    SRem,
+    SRemConst,
+    UDiv,
+    UDivConst,
+    URem,
+    URemConst,
+    And,
+    AndConst,
+    Or,
+    OrConst,
+    Xor,
+    XorConst,
+    Shl,
+    ShlConst,
+    LShr,
+    LShrConst,
+    AShr,
+    AShrConst,
+
+    // These are the technical ones
+    Take,
+    Take1,
+    Take2,
+    TakeConst,
+    Ret,
+    Duplex,
+    Put,
+
+    // This is a special one that is used to wrap the generated GHC-CC code
+    GhcWrapper
+}
+
+impl Display for StencilOperation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StencilOperation::Add => write!(f, "add"),
+            StencilOperation::AddConst => write!(f, "add-const"),
+            StencilOperation::Sub => write!(f, "sub"),
+            StencilOperation::SubConst => write!(f, "sub-const"),
+            StencilOperation::Mul => write!(f, "mul"),
+            StencilOperation::MulConst => write!(f, "mul-const"),
+            StencilOperation::SDiv => write!(f, "sdiv"),
+            StencilOperation::SDivConst => write!(f, "sdiv-const"),
+            StencilOperation::SRem => write!(f, "srem"),
+            StencilOperation::SRemConst => write!(f, "srem-const"),
+            StencilOperation::UDiv => write!(f, "udiv"),
+            StencilOperation::UDivConst => write!(f, "udiv-const"),
+            StencilOperation::URem => write!(f, "urem"),
+            StencilOperation::URemConst => write!(f, "urem-const"),
+            StencilOperation::And => write!(f, "and"),
+            StencilOperation::AndConst => write!(f, "and-const"),
+            StencilOperation::Or => write!(f, "or"),
+            StencilOperation::OrConst => write!(f, "or-const"),
+            StencilOperation::Xor => write!(f, "xor"),
+            StencilOperation::XorConst => write!(f, "xor-const"),
+            StencilOperation::Shl => write!(f, "shl"),
+            StencilOperation::ShlConst => write!(f, "shl-const"),
+            StencilOperation::LShr => write!(f, "shr"),
+            StencilOperation::LShrConst => write!(f, "shr-const"),
+            StencilOperation::AShr => write!(f, "ashr"),
+            StencilOperation::AShrConst => write!(f, "ashr-const"),
+            StencilOperation::Take => write!(f, "take"),
+            StencilOperation::TakeConst => write!(f, "take-const"),
+            StencilOperation::Take1 => write!(f, "take1"),
+            StencilOperation::Take2 => write!(f, "take2"),
+            StencilOperation::Ret => write!(f, "ret"),
+            StencilOperation::Duplex => write!(f, "duplex"),
+            StencilOperation::Put => write!(f, "put"),
+            StencilOperation::GhcWrapper => write!(f, "__GHC_CC-CONVERTER__")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+pub struct StencilType {
+    pub operation: StencilOperation,
+    pub data_type: Option<DataType>
+}
+
+impl StencilType {
+    pub fn new(operation: StencilOperation, data_type: Option<DataType>) -> Self {
+        Self {
+            operation,
+            data_type
+        }
+    }
+}
+
+impl Display for StencilType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if let Some(ty) = &self.data_type {
+            write!(f, "{}_{}", ty, self.operation)
+        } else {
+            write!(f, "{}", self.operation)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Stencil {
-    pub name: String,
+    pub s_type: StencilType,
     pub code: Vec<u8>,
     pub holes: Vec<usize>,
     pub large: bool
 }
 
-fn get_stencil(name: &str, elf: &[u8], cut_jmp: bool, large: bool) -> Stencil {
+impl Display for Stencil {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.s_type)
+    }
+
+}
+
+fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> Stencil {
     let gobj = goblin::elf::Elf::parse(elf).unwrap();
 
     //println!("---------------------------");
 
     //println!("{:#?}", gobj);
 
-    //println!("---------------------------");
+    //println!("-----------------------------");
 
     // Print relocation record for "PH" symbols
 
@@ -91,7 +211,7 @@ fn get_stencil(name: &str, elf: &[u8], cut_jmp: bool, large: bool) -> Stencil {
 
     Stencil {
         code,
-        name: name.to_string(),
+        s_type,
         holes: holes,
         large: large
     }
@@ -107,8 +227,8 @@ struct StencilCodeGen<'ctx> {
 
 impl<'ctx> StencilCodeGen<'ctx> {
 
-    fn new(context: &'ctx Context, name: &str) -> Self {
-        let module = context.create_module(name);
+    fn new(context: &'ctx Context) -> Self {
+        let module = context.create_module("stencil");
         let builder = context.create_builder();
         Self {
             context,
@@ -171,7 +291,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         // For debugging purposes the stencil functions can be dumped to a file and then
         // be inspected for example by llvm-objdump --disassemble sum.o 
-        target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
+        //target_machine.write_to_file(&self.module, FileType::Object, Path::new(&format!("{}.o", self.module.get_name().to_str().unwrap()))).unwrap();
         target_machine.write_to_memory_buffer(&self.module, FileType::Object).unwrap()
     }
 
@@ -203,14 +323,13 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         let elf = self.compile(true);
     
-        get_stencil("__GHC_CC-CONVERTER__", elf.as_slice(), false, true)
+        get_stencil(StencilType::new(StencilOperation::GhcWrapper, None), elf.as_slice(), false, true)
     }
 
-    fn compile_stencil<F: Fn(&[BasicValueEnum<'ctx>], PointerValue<'ctx>) -> Vec<BasicValueEnum<'ctx>>>(&self, name: &str, args: &[BasicMetadataTypeEnum<'ctx>], operation: F) -> Stencil {
-        self.module.set_name(name);
+    fn compile_stencil<F: Fn(&[BasicValueEnum<'ctx>], PointerValue<'ctx>) -> Vec<BasicValueEnum<'ctx>>>(&self, s_type: StencilType, args: &[BasicMetadataTypeEnum<'ctx>], operation: F) -> Stencil {
+        self.module.set_name(&format!("{}", s_type));
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
-
 
         let void_type = self.context.void_type();
 
@@ -221,7 +340,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         }
 
         let fn_type = void_type.fn_type(&new_args, false);
-        let function = self.module.add_function(name, fn_type, None);
+        let function = self.module.add_function(&format!("{}", s_type), fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
 
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
@@ -255,13 +374,14 @@ impl<'ctx> StencilCodeGen<'ctx> {
         self.builder.build_return(None).unwrap();
 
         let elf = self.compile(self.large_ph.get());
-
-        get_stencil(name, elf.as_slice(), true, self.large_ph.get())
+        
+        get_stencil(s_type, elf.as_slice(), true, self.large_ph.get())
     }
 
 
     fn compile_take_stack(&self) -> Stencil {
-        self.compile_stencil("i64_take-stack", &[], |_, stackptr| {
+        let s_type = StencilType::new(StencilOperation::Take, Some(DataType::I64));
+        self.compile_stencil(s_type, &[], |_, stackptr| {
             let i8_type = self.context.i8_type();
             let offset = self.init_placeholder(self.context.i64_type());
             let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
@@ -270,11 +390,10 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
-    fn compile_take2_first_stack(&self) -> Stencil {
+    fn compile_take_first_stack(&self) -> Stencil {
         let i64_type = self.context.i64_type();
-        self.compile_stencil("i64_take-1-stack", 
-                &[i64_type.into(), i64_type.into()], 
-                |args, stackptr| {
+        let s_type = StencilType::new(StencilOperation::Take1, Some(DataType::I64));
+        self.compile_stencil(s_type, &[i64_type.into(), i64_type.into()], |args, stackptr| {
             let i8_type = self.context.i8_type();
             let offset = self.init_placeholder(self.context.i64_type());
             let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
@@ -283,9 +402,10 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
-    fn compile_take2_second_stack(&self) -> Stencil {
+    fn compile_take_second_stack(&self) -> Stencil {
         let i64_type = self.context.i64_type();
-        self.compile_stencil("i64_take-2-stack",  &[i64_type.into()], |args, stackptr| {
+        let s_type = StencilType::new(StencilOperation::Take2, Some(DataType::I64));
+        self.compile_stencil(s_type,  &[i64_type.into()], |args, stackptr| {
             let i8_type = self.context.i8_type();
             let offset = self.init_placeholder(self.context.i64_type());
             let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
@@ -295,7 +415,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
     }
 
     fn compile_take_const(&self) -> Stencil {
-        self.compile_stencil("i64_take-const", &[self.context.i64_type().into()], |_, _| {
+        let s_type = StencilType::new(StencilOperation::TakeConst, Some(DataType::I64));
+        self.compile_stencil(s_type, &[self.context.i64_type().into()], |_, _| {
             let x = self.init_placeholder(self.context.i64_type());
             vec![x.into()]
         })
@@ -305,14 +426,16 @@ impl<'ctx> StencilCodeGen<'ctx> {
     // We could instead also just have one that moves from the first to the second and calls
     // with an undefined first value but this is more flexible and performance should be the same
     fn compile_duplex(&self) -> Stencil {
-        self.compile_stencil("i64_duplex", &[self.context.i64_type().into()], |args, _| {
+        let s_type = StencilType::new(StencilOperation::Duplex, Some(DataType::I64));
+        self.compile_stencil(s_type, &[self.context.i64_type().into()], |args, _| {
             let x = args[0].into_int_value();
             vec![x.into(), x.into()]
         })
     }
 
     fn compile_put_stack(&self) -> Stencil {
-        self.compile_stencil("i64_put-stack", &[self.context.i64_type().into()], |args, stackptr| {
+        let s_type = StencilType::new(StencilOperation::Put, Some(DataType::I64));
+        self.compile_stencil(s_type, &[self.context.i64_type().into()], |args, stackptr| {
             let i8_type = self.context.i8_type();
             let x = args[0].into_int_value();
             let offset = self.init_placeholder(self.context.i64_type());
@@ -322,8 +445,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
-    fn compile_int_arith(&self, name: &str, op_type: IntType<'ctx>, perform_op: fn(&Builder<'ctx>, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
-        self.compile_stencil(name, &[op_type.into(), op_type.into()], |args, _| {
+    fn compile_int_arith(&self, s_type:StencilType, op_type: IntType<'ctx>, perform_op: fn(&Builder<'ctx>, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
+        self.compile_stencil(s_type, &[op_type.into(), op_type.into()], |args, _| {
             let x = args[0].into_int_value();
             let y = args[1].into_int_value();
             let res = perform_op(&self.builder, x, y);
@@ -331,8 +454,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
-    fn compile_const_int_arith(&self, name: &str, op_type: IntType<'ctx>, perform_op: fn(&Builder<'ctx>, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
-        self.compile_stencil(name, &[op_type.into()], |args,  _| {
+    fn compile_const_int_arith(&self, s_type:StencilType, op_type: IntType<'ctx>, perform_op: fn(&Builder<'ctx>, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
+        self.compile_stencil(s_type, &[op_type.into()], |args,  _| {
             let x = args[0].into_int_value();
             let y = self.init_placeholder(op_type);
             let res = perform_op(&self.builder, x, y);
@@ -355,12 +478,14 @@ impl<'ctx> StencilCodeGen<'ctx> {
                 
         let elf = self.compile(false);
     
-        get_stencil("ret", elf.as_slice(), false, false)    
+        let s_type = StencilType::new(StencilOperation::Ret, None);
+        get_stencil(s_type, elf.as_slice(), false, false)    
     }
 }
 
-fn compile_all_int_arith() -> BTreeMap<String, Stencil> {
-    // TODO: We need reverse operations for non commutative operations
+fn compile_all_int_arith() -> BTreeMap<StencilType, Stencil> {
+    // TODO: This should be some kind of operations in a codegen layer that should
+    //       should then be able to be reused for stencil generation
     fn int_add<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
         builder.build_int_add(x, y, "add").unwrap()
     }
@@ -370,11 +495,17 @@ fn compile_all_int_arith() -> BTreeMap<String, Stencil> {
     fn int_mul<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
         builder.build_int_mul(x, y, "mul").unwrap()
     }
-    fn int_div<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+    fn int_sdiv<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
         builder.build_int_signed_div(x, y, "div").unwrap()
     }
-    fn int_rem<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+    fn int_srem<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
         builder.build_int_signed_rem(x, y, "rem").unwrap()
+    }
+    fn int_udiv<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_int_unsigned_div(x, y, "div").unwrap()
+    }
+    fn int_urem<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_int_unsigned_rem(x, y, "rem").unwrap()
     }
     fn int_and<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
         builder.build_and(x, y, "and").unwrap()
@@ -395,45 +526,62 @@ fn compile_all_int_arith() -> BTreeMap<String, Stencil> {
         builder.build_right_shift(x, y, true, "ashr").unwrap()
     }
     let context = Context::create();
-    let ops: Vec<(&str, for<'a> fn(& Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![("add", int_add), ("sub", int_sub), ("mul", int_mul), ("div", int_div), ("rem", int_rem), ("and", int_and), ("or", int_or), ("xor", int_xor), ("shl", int_shl), ("lshr", int_lshr), ("ashr", int_ashr)];
+    let ops: Vec<(StencilOperation, StencilOperation, for<'a> fn(& Builder<'a>, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![
+        (StencilOperation::Add, StencilOperation::AddConst, int_add),  
+        (StencilOperation::Sub, StencilOperation::SubConst, int_sub),
+        (StencilOperation::Mul, StencilOperation::MulConst, int_mul), 
+        (StencilOperation::SDiv, StencilOperation::SDivConst, int_sdiv), 
+        (StencilOperation::SRem, StencilOperation::SRemConst, int_srem), 
+        (StencilOperation::UDiv, StencilOperation::UDivConst, int_udiv), 
+        (StencilOperation::URem, StencilOperation::URemConst, int_urem), 
+        (StencilOperation::And, StencilOperation::AndConst, int_and), 
+        (StencilOperation::Or, StencilOperation::OrConst, int_or), 
+        (StencilOperation::Xor, StencilOperation::XorConst, int_xor), 
+        (StencilOperation::Shl, StencilOperation::ShlConst, int_shl), 
+        (StencilOperation::LShr, StencilOperation::LShrConst, int_lshr), 
+        (StencilOperation::AShr, StencilOperation::AShrConst, int_ashr)
+    ];
     let types = vec![context.i8_type(), context.i16_type(), context.i32_type(), context.i64_type()];
 
     let mut stencils = BTreeMap::new();
 
-    for (name, op) in ops {
+    for (op_type, const_op_type, op) in ops {
         for ty in types.iter() {
-            let codegen = StencilCodeGen::new(&context, "stencil");
-            let codegen_const = StencilCodeGen::new(&context, "stencil-const");
+            let codegen = StencilCodeGen::new(&context);
+            let codegen_const = StencilCodeGen::new(&context);
 
-            let stencil: Stencil = codegen.compile_int_arith(&format!("{}_{}", ty.print_to_string().to_string(), name), *ty, op);
-            let const_stencil = codegen_const.compile_const_int_arith(&format!("{}_{}_const", ty.print_to_string().to_string(), name), *ty, op);
-            stencils.insert(stencil.name.clone(), stencil);
-            stencils.insert(const_stencil.name.clone(), const_stencil);
+            let ir_type = DataType::try_from(*ty).unwrap();
+            let stencil_type = StencilType::new(op_type, Some(ir_type.clone()));
+            let stencil: Stencil = codegen.compile_int_arith(stencil_type.clone(), *ty, op);
+            let const_stencil_type = StencilType::new(const_op_type, Some(ir_type));
+            let const_stencil = codegen_const.compile_const_int_arith(const_stencil_type.clone(), *ty, op);
+            stencils.insert(stencil_type, stencil);
+            stencils.insert(const_stencil_type, const_stencil);
         }
     }
 
     stencils
 }
 
-fn compile_stencil(stencil_lib: &mut BTreeMap<String, Stencil>, name: &str, comp_fn: fn(&StencilCodeGen) -> Stencil) {
+fn compile_stencil(stencil_lib: &mut BTreeMap<StencilType, Stencil>, comp_fn: fn(&StencilCodeGen) -> Stencil) {
     let context = Context::create();
-    let codegen = StencilCodeGen::new(&context, name);
+    let codegen = StencilCodeGen::new(&context);
 
     let stencil = comp_fn(&codegen);
-    stencil_lib.insert(name.to_string(), stencil);
+    stencil_lib.insert(stencil.s_type.clone(), stencil);
 }
 
-pub fn compile_all_stencils() -> BTreeMap<String, Stencil> {
+pub fn compile_all_stencils() -> BTreeMap<StencilType, Stencil> {
     let mut stencil_library = BTreeMap::new();
 
-    compile_stencil(&mut stencil_library, "i64_put-stack", |c| c.compile_put_stack());
-    compile_stencil(&mut stencil_library, "i64_take-stack", |c| c.compile_take_stack());
-    compile_stencil(&mut stencil_library, "i64_take-1-stack", |c| c.compile_take2_first_stack());
-    compile_stencil(&mut stencil_library, "i64_take-2-stack", |c| c.compile_take2_second_stack());
-    compile_stencil(&mut stencil_library, "i64_take-const", |c| c.compile_take_const());
-    compile_stencil(&mut stencil_library, "i64_duplex", |c| c.compile_duplex());
-    compile_stencil(&mut stencil_library, "ret", |c| c.compile_ret_stencil());
-    compile_stencil(&mut stencil_library, "__GHC_CC-CONVERTER__", |c| c.compile_ghc_wrapper());
+    compile_stencil(&mut stencil_library, |c| c.compile_put_stack());
+    compile_stencil(&mut stencil_library,  |c| c.compile_take_stack());
+    compile_stencil(&mut stencil_library, |c| c.compile_take_first_stack());
+    compile_stencil(&mut stencil_library,  |c| c.compile_take_second_stack());
+    compile_stencil(&mut stencil_library, |c| c.compile_take_const());
+    compile_stencil(&mut stencil_library, |c| c.compile_duplex());
+    compile_stencil(&mut stencil_library, |c| c.compile_ret_stencil());
+    compile_stencil(&mut stencil_library, |c| c.compile_ghc_wrapper());
 
 
     let mut int_arith_stencils = compile_all_int_arith();

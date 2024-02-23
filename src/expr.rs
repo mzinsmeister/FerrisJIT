@@ -22,10 +22,10 @@ use nom::{
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum BuiltIn {
   Plus,
-  //Minus,
+  Minus,
   Times,
-  /*Divide,
-  Equal,
+  Divide,
+  /*Equal,
   Not,*/
 }
 
@@ -34,7 +34,7 @@ pub enum BuiltIn {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Atom {
-  Num(u64),
+  Num(i64),
   Variable(usize),
   //Boolean(bool),
 }
@@ -68,7 +68,7 @@ fn parse_builtin_op<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'
   // one_of matches one of the characters we give it
   // TODO: When reactivating "-/=" uncomment this and remove the next line
   //let (i, t) = one_of("+-*/=")(i)?;
-  let (i, t) = one_of("+*")(i)?;
+  let (i, t) = one_of("+-*/")(i)?;
 
   // because we are matching single character tokens, we can do the matching logic
   // on the returned value
@@ -76,10 +76,10 @@ fn parse_builtin_op<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'
     i,
     match t {
       '+' => BuiltIn::Plus,
-      //'-' => BuiltIn::Minus,
+      '-' => BuiltIn::Minus,
       '*' => BuiltIn::Times,
-      /*'/' => BuiltIn::Divide,
-      '=' => BuiltIn::Equal,*/
+      '/' => BuiltIn::Divide,
+      //'=' => BuiltIn::Equal,
       _ => unreachable!(),
     },
   ))
@@ -119,10 +119,16 @@ fn parse_builtin<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'a s
 
 /// Next up is number parsing. We're keeping it simple here by accepting any number (> 1)
 /// of digits but ending the program if it doesn't fit into an i32.
-fn parse_num<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
+fn parse_num(i: &str) -> IResult<&str, Atom, VerboseError<&str>> {
+  alt((
     map_res(digit1, |digit_str: &str| {
-      digit_str.parse::<u64>().map(Atom::Num)
-    })(i)
+      digit_str.parse::<i64>().map(Atom::Num)
+    }),
+    map(preceded(tag("-"), digit1), |digit_str: &str| {
+      Atom::Num(-digit_str.parse::<i64>().unwrap())
+    }),
+  ))
+  .parse(i)
 }
 
 /// Now we take all these simple parsers and connect them.
@@ -250,7 +256,7 @@ fn parse_expr<'a>(i: &'a str) -> IResult<&'a str, Expr, VerboseError<&'a str>> {
 /// and give us something back
 
 /// To start we define a couple of helper functions
-fn get_num_from_expr(e: Expr, vars: &[&u64]) -> Option<u64> {
+fn get_num_from_expr(e: Expr, vars: &[&i64]) -> Option<i64> {
   match e {
     Expr::Constant(Atom::Num(n)) => Some(n),
     Expr::Constant(Atom::Variable(i)) => Some(*vars[i]),
@@ -269,13 +275,12 @@ fn get_num_from_expr(e: Expr, vars: &[&u64]) -> Option<u64> {
 /// This function tries to reduce the AST.
 /// This has to return an Expression rather than an Atom because quoted s_expressions
 /// can't be reduced
-pub fn eval_expression(e: &Expr, vars: &[u64]) -> u64 {
+pub fn eval_expression(e: &Expr, vars: &[i64]) -> i64 {
   match e {
     // Constants and quoted s-expressions are our base-case
     Expr::Constant(c) /*| Expr::Quote(_)*/ => match c {
       Atom::Num(n) => *n,
-      Atom::Variable(i) => vars[*i],
-      _ => unreachable!("Unexpected constant"),
+      Atom::Variable(i) => vars[*i]
     }
     // we then recursively `eval_expression` in the context of our special forms
     // and built-in operators
@@ -299,10 +304,12 @@ pub fn eval_expression(e: &Expr, vars: &[u64]) -> u64 {
       let reduced_tail = tail
         .into_iter()
         .map(|expr| eval_expression(expr, vars))
-        .collect::<Vec<u64>>();
+        .collect::<Vec<i64>>();
       match op {
         BuiltIn::Plus => reduced_tail.iter().sum(),
         BuiltIn::Times => reduced_tail.iter().product(),
+        BuiltIn::Minus => reduced_tail.iter().skip(1).fold(reduced_tail[0], |a, f| a - f),
+        BuiltIn::Divide => reduced_tail.iter().skip(1).fold(reduced_tail[0], |a, f| a / f),
         /*BuiltIn::Equal => Atom::Boolean(
           reduced_tail
             .iter()
@@ -315,31 +322,7 @@ pub fn eval_expression(e: &Expr, vars: &[u64]) -> u64 {
           } else {
             Atom::Boolean(!get_bool_from_expr(reduced_tail.first().cloned().unwrap())?)
           }
-        }
-        BuiltIn::Minus => Atom::Num(if let Some(first_elem) = reduced_tail.first().cloned() {
-          let fe = get_num_from_expr(first_elem)?;
-          reduced_tail
-            .into_iter()
-            .map(get_num_from_expr)
-            .collect::<Option<Vec<i32>>>()?
-            .into_iter()
-            .skip(1)
-            .fold(fe, |a, b| a - b)
-        } else {
-          Default::default()
-        }),
-        BuiltIn::Divide => Atom::Num(if let Some(first_elem) = reduced_tail.first().cloned() {
-          let fe = get_num_from_expr(first_elem)?;
-          reduced_tail
-            .into_iter()
-            .map(get_num_from_expr)
-            .collect::<Option<Vec<i32>>>()?
-            .into_iter()
-            .skip(1)
-            .fold(fe, |a, b| a / b)
-        } else {
-          Default::default()
-        }),*/
+        },*/
       }
     }
   }
@@ -347,12 +330,15 @@ pub fn eval_expression(e: &Expr, vars: &[u64]) -> u64 {
 
 pub fn parse_expr_from_str(src: &str) -> Result<Expr, String> {
   parse_expr(src)
-    .map_err(|e: nom::Err<VerboseError<&str>>| format!("{:#?}", e))
+    .map_err(|e: nom::Err<VerboseError<&str>>| match e {
+      nom::Err::Error(e) | nom::Err::Failure(e) => nom::error::convert_error(src, e),
+      nom::Err::Incomplete(_) => "Incomplete input".to_string(),
+    })
     .map(|(_, exp)| exp)
 }
 /// And we add one more top-level function to tie everything together, letting
 /// us call eval on a string directly
-pub fn eval_from_str(src: &str, vars: &[u64]) -> Result<u64, String> {
+pub fn eval_from_str(src: &str, vars: &[i64]) -> Result<i64, String> {
   parse_expr(src)
     .map_err(|e: nom::Err<VerboseError<&str>>| format!("{:#?}", e))
     .and_then(|(_, exp)| Ok(eval_expression(&exp, vars)))

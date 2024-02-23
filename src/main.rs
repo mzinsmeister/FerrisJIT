@@ -3,13 +3,13 @@ mod codegen;
 
 use std::{error::Error, hint::black_box};
 
-use codegen::{generate_code, GeneratedCode, STENCILS};
-use expr::{parse_expr_from_str, Expr};
+use codegen::{generate_code, STENCILS};
+use expr::parse_expr_from_str;
 
 
 use clap::Parser;
 use csv::Reader;
-use rustyline::{error::ReadlineError, history::MemHistory, Config, DefaultEditor, Editor};
+use rustyline::{error::ReadlineError, history::MemHistory, Config, Editor};
 
 use crate::expr::eval_expression;
 
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // If the user specified a csv (no header, comma separated) file we will read the data from there
     // otherwise we will generate a sequential range of numbers 0..10_000_000
 
-    let test_data: Vec<Vec<u64>> = if let Some(csv_path) = args.csv {
+    let test_data: Vec<Vec<i64>> = if let Some(csv_path) = args.csv {
         println!("Reading data from csv file: {:?}", csv_path);
         let mut rdr = Reader::from_path(csv_path)?;
         rdr.records()
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let record = record.unwrap();
                 let mut vec = Vec::new();
                 for field in record.iter() {
-                    vec.push(field.parse::<u64>().unwrap());
+                    vec.push(field.parse::<i64>().unwrap());
                 }
                 vec
             })
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         println!("No csv file specified, using default dummy data");
         if args.benchmark {
-            (0..1_000_000u64).map(|n| vec![n]).collect()
+            (0..1_000_000i64).map(|n| vec![n]).collect()
         } else {
             (0..10).map(|n| vec![n]).collect()
         }
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let expr = match expr {
                     Ok(expr) => expr,
                     Err(e) => {
-                        println!("Error: {:?}", e);
+                        println!("Parse-Error: {}", e);
                         continue;
                     }
                 };
@@ -157,11 +157,11 @@ mod test {
 
     //const complex_expr: &str = include_str!("./complex_expr.txt");
 
-    const complex_expr: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
+    const COMPLEX_EXPR: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
 
     #[test]
     fn test_codegen1() {
-        let expr = parse_expr_from_str(complex_expr).unwrap();
+        let expr = parse_expr_from_str(COMPLEX_EXPR).unwrap();
         let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call(&[*i]);
@@ -170,11 +170,11 @@ mod test {
         }
     }
 
-    const complex_expr_2: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
+    const COMPLEX_EXPR_2: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
 
     #[test]
     fn test_codegen2() {
-        let expr = parse_expr_from_str(complex_expr_2).unwrap();
+        let expr = parse_expr_from_str(COMPLEX_EXPR_2).unwrap();
         let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call(&[*i]);
@@ -183,11 +183,11 @@ mod test {
         }
     }
 
-    const very_complex_expr_1: &str = include_str!("complex_expr.txt");
+    const VERY_COMPLEX_EXPR_1: &str = include_str!("complex_expr.txt");
 
     #[test]
     fn test_codegen3_very_complex() {
-        let expr = parse_expr_from_str(very_complex_expr_1).unwrap();
+        let expr = parse_expr_from_str(VERY_COMPLEX_EXPR_1).unwrap();
         let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5].iter() {
             let result = code.call(&[*i]);
