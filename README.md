@@ -32,7 +32,19 @@ To run the example, just run `cargo run`. Optionally a `-c` flag with a path to 
 cargo run -- -c test.csv
 ```
 
-If no file is given, the example will be run on a hardcoded sequential element array. Then you can enter expressions in lisp-like syntax. By default you will be in interactive mode and the result per input-line will just be printed. You can also pass `-b` as a flag to be in benchmark mode. Make sure to run with `--release` in this case. This will then print out the timings for compiled vs interpreted (when using generated input the input size will be 1,000,000 in this case, otherwise 10). For example:
+If no file is given, the example will be run on a hardcoded sequential element array. Then you can enter expressions in lisp-like syntax. By default you will be in interactive mode and the result per input-line will just be printed. You can also pass `-b` as a flag to be in benchmark mode. Make sure to run with `--release` in this case. This will then print out the timings for compiled vs interpreted (when using generated input the input size will be 1,000,000 in this case, otherwise 10). 
+
+#### Currently Supported Expressions
+
+All constants and variables must be 64 bit signed integers.
+
+Arithmetic Operations:
+* `+` Addition
+* `-` Subtraction
+* `*` Multiplication
+* `/` Division
+
+#### Examples
 
 Constant result:
 ```lisp
