@@ -2,4 +2,6 @@
 
 .vscode
 
+# Ignore dumped debugging stencil object files
+/stencils-dump
 *.o
