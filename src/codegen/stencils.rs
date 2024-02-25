@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-use super::ir::{DataType};
+use super::ir::DataType;
 
 // For reference (if you look into the Disassembly). 
 // Order of Registers in argument passing of the GHC-CC: R13, RBP, R12, RBX, R14, RSI, RDI, R8, R9, R15

@@ -201,7 +201,17 @@ fn fold_constants(fun: &BuiltIn, args: &[Expr]) -> Option<Vec<Expr>> {
             if get_type(&arg) != data_type {
                 return None;
             }
-            result.push(arg.clone());
+            match arg {
+                Expr::Application(fun2, s) => {
+                    let folded_s = fold_constants(fun2, s)?;
+                    if folded_s.len() == 1 {
+                        result.push(folded_s[0].clone());
+                    } else {
+                        result.push(Expr::Application(*fun2, folded_s));
+                    }
+                },
+                _ => result.push(arg.clone()),
+            }
         }
 
         Some(result)
@@ -326,6 +336,13 @@ impl CodeGen {
 
     fn generate_put_stack(&mut self, n: usize) {
         let s_type = StencilType::new(StencilOperation::Put, Some(DataType::I64));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![n as u64];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    fn generate_take_1_stack(&mut self, n: usize) {
+        let s_type = StencilType::new(StencilOperation::Take1, Some(DataType::I64));
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![n as u64];
         self.copy_and_patch(stencil, holes_values);
@@ -507,7 +524,12 @@ impl CodeGen {
                     self.stack_size = self.stack_size.max(self.stack_ptr);
                     self.generate_put_stack(stack_top);
                     let ret_type = self.generate_code_application(&fun2, &args2);
-                    self.generate_take_2_stack(stack_top);
+                    if is_commutative(fun) {
+                        self.generate_take_2_stack(stack_top);
+                    } else {
+                        self.generate_duplex();
+                        self.generate_take_1_stack(stack_top);
+                    }
                     self.stack_ptr -= 8;
                     self.generate_op(fun, ret_type);
                 },

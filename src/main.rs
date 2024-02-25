@@ -176,13 +176,10 @@ mod test {
 
     use super::*;
 
-    //const complex_expr: &str = include_str!("./complex_expr.txt");
-
-    const COMPLEX_EXPR: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
-
     #[test]
-    fn test_codegen1() {
-        let expr = parse_expr_from_str(COMPLEX_EXPR).unwrap();
+    fn test_codegen_1() {
+        let expr_str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
+        let expr = parse_expr_from_str(expr_str).unwrap();
         let code = generate_code::<i64>(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call(&[*i]);
@@ -195,16 +192,49 @@ mod test {
         }
     }
 
-    const COMPLEX_EXPR_2: &str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
-
     #[test]
-    fn test_codegen2() {
-        let expr = parse_expr_from_str(COMPLEX_EXPR_2).unwrap();
+    fn test_codegen_2() {
+        let expr_str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
+        let expr = parse_expr_from_str(expr_str).unwrap();
         let code = generate_code::<i64>(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
             if let Atom::Num(n) = interp_result {
+                assert_eq!(result, n);
+            } else {
+                panic!("Datatype missmatch");
+            }
+        }
+    }
+
+    #[test]
+    fn test_codegen_3() {
+        let expr_str = "(+ (+ $0 $0) (* (/ $0 2) (- (* 9 4) $0)))";
+
+        let expr = parse_expr_from_str(expr_str).unwrap();
+        let code = generate_code::<i64>(&expr, 1).unwrap();
+        for i in [0, 1, 5, 10, 100, 1000].iter() {
+            let result = code.call(&[*i]);
+            let interp_result = eval_expression(&expr, &[*i]).unwrap();
+            if let Atom::Num(n) = interp_result {
+                assert_eq!(result, n);
+            } else {
+                panic!("Datatype missmatch");
+            }
+        }
+    }
+
+
+    #[test]
+    fn test_codegen_4() {
+        let expr_str = "(= (= $0 5) (= (- (+ $0 $0) (* -2 $0)) 20)))";
+        let expr = parse_expr_from_str(expr_str).unwrap();
+        let code = generate_code::<bool>(&expr, 1).unwrap();
+        for i in [0, 1, 5, 10, 100, 1000].iter() {
+            let result = code.call(&[*i]);
+            let interp_result = eval_expression(&expr, &[*i]).unwrap();
+            if let Atom::Boolean(n) = interp_result {
                 assert_eq!(result, n);
             } else {
                 panic!("Datatype missmatch");
@@ -215,7 +245,7 @@ mod test {
     const VERY_COMPLEX_EXPR_1: &str = include_str!("complex_expr.txt");
 
     #[test]
-    fn test_codegen3_very_complex() {
+    fn test_codegen_very_complex_1() {
         let expr = parse_expr_from_str(VERY_COMPLEX_EXPR_1).unwrap();
         let code = generate_code::<i64>(&expr, 1).unwrap();
         for i in [0, 1, 5].iter() {
