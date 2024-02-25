@@ -11,12 +11,12 @@ use inkwell::types::{BasicMetadataTypeEnum, IntType};
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, OptimizationLevel};
 
-use std::borrow::Borrow;
+
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-use super::ir::{ConstValue, DataType};
+use super::ir::{DataType};
 
 // For reference (if you look into the Disassembly). 
 // Order of Registers in argument passing of the GHC-CC: R13, RBP, R12, RBX, R14, RSI, RDI, R8, R9, R15
@@ -245,6 +245,7 @@ struct StencilCodeGen<'ctx> {
     large_ph: Cell<bool>
 }
 
+#[allow(dead_code)]
 impl<'ctx> StencilCodeGen<'ctx> {
 
     fn new(context: &'ctx Context) -> Self {
@@ -583,7 +584,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     }
 
     fn compile_not(&self) -> Stencil {
-        let types = &[DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64];
+        let _types = &[DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64];
         let s_type = StencilType::new(StencilOperation::Not, Some(DataType::Bool));
         self.compile_stencil(s_type, &[self.context.bool_type().into()], |args, _| {
             let x = args[0].into_int_value();

@@ -9,11 +9,11 @@ use std::fmt::{self, Display, Formatter};
 use nom::{
   branch::alt,
   bytes::complete::tag,
-  character::complete::{alpha1, char, digit1, multispace0, multispace1, one_of},
-  combinator::{cut, map, map_res, opt},
+  character::complete::{char, digit1, multispace0, one_of},
+  combinator::{cut, map, map_res},
   error::{context, VerboseError},
   multi::many0,
-  sequence::{delimited, preceded, terminated, tuple},
+  sequence::{delimited, preceded, tuple},
   IResult, Parser,
 };
 
