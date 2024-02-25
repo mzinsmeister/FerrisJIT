@@ -2,16 +2,36 @@
 pub mod stencils;
 pub mod ir;
 mod disassemble;
+mod copy_patch;
 
-use lazy_static::lazy_static;
 
-use std::{collections::BTreeMap, fmt::Display};
+use std::{cell::RefCell, fmt::Display, hint::black_box, marker::PhantomData, ops::Deref, ptr};
 use libc::c_void;
 use stencils::Stencil;
 
-use crate::{codegen::{ir::DataType, stencils::StencilOperation}, expr::{Atom, BuiltIn, Expr}};
+use crate::{codegen::{copy_patch::STENCILS, ir::DataType}, expr::{Atom, BuiltIn, Expr}};
 
-use self::{ir::ConstValue, stencils::{compile_all_stencils, StencilType}};
+use self::{copy_patch::CopyPatchBackend, ir::ConstValue};
+
+
+
+// This is a simple example of how we can generate code that calls back into pre-compiled
+// functions using copy-and-patch
+#[allow(dead_code)]
+unsafe extern "C" fn hello_world(args: *mut u8) -> *mut u8 {
+    let u64_ptr = args as *mut u64;
+    let arg1 = u64_ptr.read_unaligned();
+    println!("Hello, world from the generated Code! {}", arg1);
+    42 as *mut u8
+}
+
+pub(crate) fn init_stencils() {
+    // Dummy access to initialize stencils
+    let compile_start = std::time::Instant::now();
+    black_box(STENCILS.len());
+    let compile_elapsed = compile_start.elapsed();
+    println!("Stencil initialization: {:?}", compile_elapsed);
+}
 
 // TODO: Once we go beyond basic arithmetic expressions we should have our own IR
 //       We should also have a way to represent/address values so that we can insert
@@ -126,16 +146,8 @@ impl<T> Drop for GeneratedCode<T> {
     }
 }
 
-lazy_static! {
-    pub static ref STENCILS: BTreeMap<StencilType, Stencil> = compile_all_stencils();
-}
-
-
-struct CodeGen {
-    code: Vec<u8>,
-    fixup_holes: Vec<usize>,
-    stack_ptr: usize,
-    stack_size: usize,
+fn get_fn_ptr(f: unsafe extern "C" fn(*mut u8) -> *mut u8) -> *const c_void {
+    f as *const c_void
 }
 
 fn fold_op(fun: &BuiltIn, l: Atom, r: Atom) -> Option<Atom> {
@@ -284,211 +296,392 @@ fn atom_to_const_value(atom: &Atom) -> ConstValue {
     }
 }
 
-// TODO: Introduce the concept of "Values" like in LLVM IR
-//       and then either do nothing if the values is in the correct
-//       register or move it there, either from the stack or from a 
-//       different register. This of course requires tracking which
-//       values are in which registers at all times
+// We try to write a nice rustic API here that is easy to use
+// and takes advantage of the borrow checker to make sure that
+// we don't do stupid shit. Therefore we will introduce wrappers
+// representing values here which will then allow us to do all the
+// register/stack moving automatically while still beeing efficient
+// and reusing values in registers as much as possible
+
+#[derive(Debug, Clone)]
+enum CGValue {
+    Variable(DataType, usize),
+    Constant(ConstValue),
+    Free(Option<usize>)
+}
+
+struct CGValueRef<'cg, RustT: Copy> {
+    i: usize,
+    cg: &'cg CodeGen,
+    _phantom: PhantomData<RustT>
+}
+
+impl<'cg, T: Copy> Drop for CGValueRef<'cg, T> {
+    fn drop(&mut self) {
+        self.cg.free_value(self);
+    }
+}
+
+impl<'cg, T: Copy> CGValueRef<'cg, T> {
+    fn new(i: usize, cg: &'cg CodeGen) -> Self {
+        CGValueRef { i, cg, _phantom: PhantomData }
+    }
+}
+
+impl<'cg, T: Copy> PartialEq for CGValueRef<'cg, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.i == other.i && ptr::eq(self.cg, other.cg)
+    }
+}
+
+impl<'cg, T: Copy> Eq for CGValueRef<'cg, T> {}
+
+impl<'cg, T: Copy> PartialOrd for CGValueRef<'cg, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if !ptr::eq(self.cg, other.cg) {
+            None
+        } else {
+            self.i.partial_cmp(&other.i)
+        }
+    }
+}
+
+impl<'cg, T: Copy> std::fmt::Debug for CGValueRef<'cg, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CGValueRef({}, {:x})", self.i, ptr::addr_of!(self.cg) as usize)
+    }
+}
+
+#[derive(Debug, PartialEq, PartialOrd, Eq)]
+struct I64Ref<'cg> (CGValueRef<'cg, i64>);
+
+impl<'cg> std::ops::Add for &I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let cg = self.0.cg;
+        let clone = I64Ref(cg.clone_value(&self.0));
+        clone + rhs
+    }
+}
+
+// this actually takes ownership of the value which means we can overwrite it
+impl<'cg> std::ops::Add<&Self> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn add(self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        let cgvref = cg.add(&self.0, &rhs.0);
+        I64Ref(cgvref)
+    }
+}
+
+impl<'cg> std::ops::AddAssign<&Self> for I64Ref<'cg> {
+    fn add_assign(&mut self, rhs: &Self) {
+        let cg = self.0.cg;
+        let cgvref = cg.add(&self.0, &rhs.0);
+        self.0 = cgvref;
+    }
+}
+
+
+#[derive(Debug, PartialEq, PartialOrd, Eq)]
+struct BoolRef<'cg> (CGValueRef<'cg, bool>);
+
+
+struct CodeGen {
+    inner: RefCell<CodeGenInner>,
+}
 
 impl CodeGen {
+
     fn new(args: usize) -> Self {
-        Self {  
-            code: Vec::new(),
+        let cg = Self {
+            inner: RefCell::new(CodeGenInner::new(args)),
+        };
+        cg        
+    }
+
+    // We make sure arguments are immutable so having multiple references to them is not a problem
+    pub fn get_arg(&self, n: usize) -> I64Ref {
+        I64Ref(CGValueRef::new(n, self))
+    }
+
+    pub fn new_i64_const(&self, n: i64) -> I64Ref {
+        let inner = &mut self.inner.borrow_mut();
+        let i = inner.values.len();
+        inner.values.push(CGValue::Constant(ConstValue::I64(n)));
+        I64Ref(CGValueRef::new(i, self))
+    }
+
+    pub fn new_bool_const(&self, b: bool) -> BoolRef {
+        let inner = &mut self.inner.borrow_mut();
+        let i = inner.values.len();
+        inner.values.push(CGValue::Constant(ConstValue::Bool(b)));
+        BoolRef(CGValueRef::new(i, self))
+    }
+
+    fn free_value<T: Copy>(&self, v: &CGValueRef<T>) {
+        self.inner.borrow_mut().free_value(v.i);
+    }
+
+    fn clone_value<T: Copy>(&self, v: &CGValueRef<T>) -> CGValueRef<T> {
+        let i = self.inner.borrow_mut().clone_value(v.i);
+        CGValueRef::new(i, self)
+    }
+
+    fn add<T: Copy>(&self, l: &CGValueRef<T>, r: &CGValueRef<T>) -> CGValueRef<T> {
+        let cg = &mut self.inner.borrow_mut();
+        let vref = cg.add(l.i, r.i);
+        CGValueRef::new(vref, self)
+    }
+
+    fn generate_code<'a, T: Copy, D: Deref<Target = CGValueRef<'a, T>>>(self, return_value: D) {
+        let cg = &mut self.inner.borrow_mut();
+        cg.generate_code::<T>(return_value.i);
+    }
+
+}
+
+/// Convenience layer around copy and patch compilation backend
+/// so that you don't have to think about registers anymore
+struct CodeGenInner {
+    args_size: usize,
+    values: Vec<CGValue>,
+    free_slots: Vec<usize>,
+    reg_state: [Option<(usize, bool)>; 2], // We save whether a register is potentially dirty
+    inner: CopyPatchBackend,
+    stack_ptr: usize, // TODO: Use actual byte sizes. For now we just use 8 bytes for everything
+    stack_size: usize
+}
+
+impl CodeGenInner {
+
+    fn new(args: usize) -> Self {
+        let values = (0..args).into_iter().map(|i| CGValue::Variable(DataType::I64, i * 8)).collect();
+        Self {
+            args_size: args,
+            values,
+            free_slots: Vec::new(),
+            reg_state: [None, None],
+            inner: CopyPatchBackend::new(args),
             stack_ptr: args * 8,
             stack_size: args * 8,
-            fixup_holes: Vec::new(),
         }
     }
 
-    fn copy_and_patch(&mut self, stencil: &Stencil, holes_values: Vec<u64>) {
-        let start_ofs = self.code.len();
-        self.code.extend_from_slice(&stencil.code);
-        let end_ofs = self.code.len();
-        let stencil_slice = &mut self.code[start_ofs..end_ofs];
-        let hole_lengths = if stencil.large { 8 } else { 4 };
-        for (&ofs, val) in stencil.holes.iter().zip(holes_values.iter()) {
-            if stencil.large {
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&val.to_ne_bytes());
-            } else {
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&(*val as u32).to_ne_bytes());
+    fn put_in_reg1(&mut self, v: usize) {
+        // Lookup which value is currently in the first scratch register
+        if let Some((i, dirty)) = self.reg_state[0] {
+            // Save it to its designated stack location
+            if dirty {
+                self.inner.generate_put_stack(i);
             }
+            self.reg_state[0] = None;
         }
-
-        for &ofs in &stencil.tail_holes {
-            if ofs + hole_lengths > stencil_slice.len() {
-                continue;
-            }
-            if stencil.large {
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&(end_ofs).to_ne_bytes());
-                self.fixup_holes.push(start_ofs + ofs);
-            } else {
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&((end_ofs - (ofs + 4)) as u32).to_ne_bytes());
-            }
+        let value = &self.values[v];
+        // Load the value into the first scratch register
+        match value {
+            CGValue::Variable(dt, ofs) => {
+                // TODO: do take stack with datatype
+                self.inner.generate_take_stack(*ofs);
+            },
+            CGValue::Constant(c) => {
+                self.inner.generate_take_const(*c);
+            },
+            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
     }
-
-    fn generate_take_stack(&mut self, n: usize) {
-        let s_type = StencilType::new(StencilOperation::Take, Some(DataType::I64));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
-        self.copy_and_patch(stencil, holes_values);
+    
+    fn put_in_reg2(&mut self, v: usize) {
+        // Lookup which value is currently in the first scratch register
+        if let Some((i, dirty)) = self.reg_state[1] {
+            // Save it to its designated stack location
+            if dirty {
+                self.inner.generate_put_stack(i);
+            }
+            self.reg_state[0] = None;
+        }
+        let value = &self.values[v];
+        // Load the value into the first scratch register
+        match value {
+            CGValue::Variable(dt, ofs) => {
+                // TODO: do take stack with datatype
+                self.inner.generate_take_stack(*ofs);
+            },
+            CGValue::Constant(c) => {
+                self.inner.generate_take_const(*c);
+            },
+            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
+        }
     }
 
-    fn generate_put_stack(&mut self, n: usize) {
-        let s_type = StencilType::new(StencilOperation::Put, Some(DataType::I64));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
-        self.copy_and_patch(stencil, holes_values);
+    fn dirty_reg1(&mut self) {
+        if let Some((i, dirty)) = &mut self.reg_state[0] {
+            *dirty = true;
+        }
     }
 
-    fn generate_take_1_stack(&mut self, n: usize) {
-        let s_type = StencilType::new(StencilOperation::Take1, Some(DataType::I64));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
-        self.copy_and_patch(stencil, holes_values);
+    fn dirty_reg2(&mut self) {
+        if let Some((i, dirty)) = &mut self.reg_state[1] {
+            *dirty = true;
+        }
     }
 
-    fn generate_take_2_stack(&mut self, n: usize) {
-        let s_type = StencilType::new(StencilOperation::Take2, Some(DataType::I64));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
-        self.copy_and_patch(stencil, holes_values);
+    fn allocate_stack(&mut self, data_type: DataType) -> usize {
+        let i = if let Some(i) = self.free_slots.pop() {
+            i
+        } else {
+            let i = self.values.len();
+            self.values.push(CGValue::Free(None));
+            i
+        };
+        let value = &mut self.values[i];
+        match value {
+            CGValue::Free(ref mut slot) => {
+                let stack_ofs = if let Some(s) = slot {
+                    *s
+                } else {
+                    let s = self.stack_ptr;
+                    self.stack_ptr += 8;
+                    self.stack_size = self.stack_size.max(self.stack_ptr);
+                    s
+                };
+                *value = CGValue::Variable(data_type, stack_ofs);
+            },
+            _ => unreachable!(),
+        }
+        i
     }
 
-    fn generate_take_const(&mut self, ir_const: ConstValue) {
-        let s_type = StencilType::new(StencilOperation::TakeConst, Some(ir_const.get_type()));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![ir_const.bitcast_to_u64()];
-        self.copy_and_patch(stencil, holes_values);
+    /// Clones the value and returns it. Use the new value first if possible.
+    fn clone_value(&mut self, v: usize) -> usize {
+        let value = self.values[v].clone();
+        match value {
+            CGValue::Variable(dt, _) => {
+                if let Some((i, dirty)) = &mut self.reg_state[0] {
+                    if *dirty {
+                        self.inner.generate_put_stack(*i);
+                        *dirty = false;
+                    }
+                    if *i == v {
+                        *i = self.values.len();
+                    }
+                } else {
+                    self.put_in_reg1(v);
+                    self.reg_state[0].unwrap().0 = self.values.len();
+                }
+                self.allocate_stack(dt)
+            },
+            CGValue::Constant(c) => {
+                // We can just copy constants 
+                // TODO: Do similar free slot handling for constants but only take Free(None)'s
+                let i = self.values.len();
+                self.values.push(CGValue::Constant(c));
+                i
+            },
+            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
+        }
     }
 
-    fn generate_add(&mut self, data_type: DataType) {
-        let s_type = StencilType::new(StencilOperation::Add, Some(data_type));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![];
-        self.copy_and_patch(stencil, holes_values);
+    fn free_value(&mut self, v: usize) {
+        if v < self.args_size {
+            panic!("Tried to free arguments");
+        }
+        let value = &self.values[v];
+        match value {
+            CGValue::Variable(_, i) => {
+                self.values[v] = CGValue::Free(Some(*i));
+                self.free_slots.push(v);
+            },
+            CGValue::Constant(_) => {
+                self.values[v] = CGValue::Free(None);
+                self.free_slots.push(v);
+            }
+            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
+        }
     }
 
-    fn generate_add_const(&mut self, n: ConstValue) {
-        let s_type = StencilType::new(StencilOperation::AddConst, Some(n.get_type()));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n.bitcast_to_u64()];
-        self.copy_and_patch(stencil, holes_values);
+    // Move/Borrow semantics actually have a meaning here
+    // If a value is moved it means that we can overwrite it
+    // We specifically don't do SSA here.
+    fn add(&mut self, l: usize, r: usize) -> usize {
+        let vl = self.values[l].clone();
+        let vr = self.values[r].clone();
+        self.put_in_reg1(l);
+        match vr {
+            CGValue::Variable(dt, _) => {
+                self.put_in_reg2(r);
+                self.inner.generate_add(dt);
+            },
+            CGValue::Constant(c) => {
+                self.inner.generate_add_const(c);
+            },
+            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
+        }
+        l
     }
 
-    fn generate_mul(&mut self, data_type: DataType) {
-        let s_type = StencilType::new(StencilOperation::Mul, Some(data_type));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
-    fn generate_mul_const(&mut self, n: ConstValue) {
-        let s_type = StencilType::new(StencilOperation::MulConst, Some(n.get_type()));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n.bitcast_to_u64()];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
-    fn generate_sub(&mut self, data_type: DataType) {
-        let s_type = StencilType::new(StencilOperation::Sub, Some(data_type));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
-    fn generate_sub_const(&mut self, n: ConstValue) {
-        let s_type = StencilType::new(StencilOperation::SubConst, Some(n.get_type()));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n.bitcast_to_u64()];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
-    fn generate_div(&mut self, data_type: DataType) {
-        let s_type = StencilType::new(StencilOperation::Div, Some(data_type));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
-    fn generate_div_const(&mut self, n: ConstValue) {
-        let s_type = StencilType::new(StencilOperation::DivConst, Some(n.get_type()));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n.bitcast_to_u64()];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
-    fn generate_eq(&mut self, data_type: DataType) {
-        let s_type = StencilType::new(StencilOperation::Eq, Some(data_type));
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
-    fn generate_duplex(&mut self) {
-        let s_type = StencilType::new(StencilOperation::Duplex, None);
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![];
-        self.copy_and_patch(stencil, holes_values);
-    }
-
-    fn generate_ret(&mut self) {
-        let s_type = StencilType::new(StencilOperation::Ret, None);
-        let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![];
-        self.copy_and_patch(stencil, holes_values);
+    fn generate_code<T>(&mut self, return_value: usize) {
+        self.put_in_reg1(return_value);
+        self.inner.generate_put_stack(0);
+        self.inner.generate_ret();
+        self.inner.generate_code::<T>(self.stack_size);
     }
 
     fn generate_atom(&mut self, atom: &Atom) {
+        let cp = &mut self.inner;
         match atom {
             Atom::Num(n) => {
-                self.generate_take_const(ConstValue::I64(*n));
+                cp.generate_take_const(ConstValue::I64(*n));
             },
             Atom::Boolean(b) => {
-                self.generate_take_const(ConstValue::Bool(*b));
+                cp.generate_take_const(ConstValue::Bool(*b));
             },
         }
     }
 
     fn generate_op(&mut self, fun: &BuiltIn, data_type: DataType) {
+        let cp = &mut self.inner;
         match fun {
             BuiltIn::Plus => {
-                self.generate_add(data_type);
+                cp.generate_add(data_type);
             },
             BuiltIn::Times => {
-                self.generate_mul(data_type);
+                cp.generate_mul(data_type);
             },
             BuiltIn::Minus => {
-                self.generate_sub(data_type);
+                cp.generate_sub(data_type);
             },
             BuiltIn::Divide => {
-                self.generate_div(data_type);
+                cp.generate_div(data_type);
             },
             BuiltIn::Equal => {
-                self.generate_eq(data_type);
+                cp.generate_eq(data_type);
             }
         }
     }
 
     fn generate_op_const(&mut self, fun: &BuiltIn, n: ConstValue) {
+        let cp = &mut self.inner;
         match fun {
             BuiltIn::Plus => {
-                self.generate_add_const(n);
+                cp.generate_add_const(n);
             },
             BuiltIn::Times => {
-                self.generate_mul_const(n);
+                cp.generate_mul_const(n);
             },
             BuiltIn::Minus => {
-                self.generate_sub_const(n);
+                cp.generate_sub_const(n);
             },
             BuiltIn::Divide => {
-                self.generate_div_const(n);
+                cp.generate_div_const(n);
             },
             BuiltIn::Equal => {
                 // TODO: This is not ideal but should do for now
-                self.generate_duplex();
-                self.generate_take_const(n);
-                self.generate_eq(n.get_type());
+                cp.generate_duplex();
+                cp.generate_take_const(n);
+                cp.generate_eq(n.get_type());
             }
         }
     }
@@ -498,10 +691,10 @@ impl CodeGen {
 
         match first_variable {
             Expr::Variable(n) => {
-                self.generate_take_stack(n * 8);
+                self.inner.generate_take_stack(n * 8);
             },
             Expr::Constant(n) => {
-                self.generate_take_const(atom_to_const_value(n));
+                self.inner.generate_take_const(atom_to_const_value(n));
             },
             Expr::Application(fun2, args2) => {
                 self.generate_code_application(&fun2, &args2);
@@ -511,7 +704,7 @@ impl CodeGen {
         for arg in args.iter().skip(1) {
             match arg {
                 Expr::Variable(n) => {
-                    self.generate_take_2_stack(n * 8);
+                    self.inner.generate_take_2_stack(n * 8);
                     self.generate_op(fun, DataType::I64);
                 },
                 Expr::Constant(n) => {
@@ -522,13 +715,13 @@ impl CodeGen {
                     let stack_top = self.stack_ptr;
                     self.stack_ptr += 8;
                     self.stack_size = self.stack_size.max(self.stack_ptr);
-                    self.generate_put_stack(stack_top);
+                    self.inner.generate_put_stack(stack_top);
                     let ret_type = self.generate_code_application(&fun2, &args2);
                     if is_commutative(fun) {
-                        self.generate_take_2_stack(stack_top);
+                        self.inner.generate_take_2_stack(stack_top);
                     } else {
-                        self.generate_duplex();
-                        self.generate_take_1_stack(stack_top);
+                        self.inner.generate_duplex();
+                        self.inner.generate_take_1_stack(stack_top);
                     }
                     self.stack_ptr -= 8;
                     self.generate_op(fun, ret_type);
@@ -545,7 +738,6 @@ impl CodeGen {
         }
     }
 }
-
 
 #[derive(Debug)]
 pub enum CodeGenError {
@@ -568,16 +760,56 @@ impl Display for CodeGenError {
 
 pub fn generate_code<T>(expr: &Expr, args: usize) -> Result<GeneratedCode<T>, CodeGenError> {
 
-    let mut cg = CodeGen::new(args);
+    let cg = CodeGen::new(args);
 
-    let ghc_stencil = STENCILS.get(&StencilType::new(StencilOperation::GhcWrapper, None)).unwrap();
+    let return_value = cg.new_i64_const(1);
 
-    match expr {
+    
+    let gc = cg.generate_code(return_value);
+
+    #[cfg(feature = "print-asm")]
+    {
+        let gc_code_slice = unsafe { std::slice::from_raw_parts(gc.code as *const u8, cg.code.len()) };
+        disassemble::disassemble(gc_code_slice);
+    }
+
+
+    Ok(gc)
+}
+
+
+//let mut cg = CopyPatchBackend::new(args);
+
+    //let ghc_stencil = STENCILS.get(&StencilType::new(StencilOperation::GhcWrapper, None)).unwrap();
+
+    // We put this here just to demonstrate the capabilities to call back into pre-compiled functions
+    // and to demonstrate ifs
+    // Uncomment this if you want to try it out:
+    //#[cfg(not(test))]
+    /*if let Expr::Application(BuiltIn::Divide, args) = expr{
+        cg.generate_take_stack(0);
+        cg.generate_rem_const(ConstValue::I64(2));
+        cg.generate_eq_const(ConstValue::I64(0));
+        cg.generate_if_else(|cg: &mut CodeGen| {
+            cg.generate_take_const(ConstValue::I64(123));
+            cg.generate_put_stack(args * 8);
+            cg.generate_get_stackptr(args * 8);
+            cg.generate_call_c_func(get_fn_ptr(hello_world));
+        }, |cg| {
+            cg.generate_take_const(ConstValue::I64(321));
+            cg.generate_put_stack(args * 8);
+            cg.generate_get_stackptr(args * 8);
+            cg.generate_call_c_func(get_fn_ptr(hello_world));
+        });
+    }*/
+
+    
+    /*match expr {
         Expr::Constant(e) => {
-            cg.generate_atom(e);
+            //cg.generate_atom(e);
         },
         Expr::Variable(n) => {
-            cg.generate_take_stack(n * 8);
+            //cg.generate_take_stack(n * 8);
         },
         Expr::Application(fun, args) => {
             let folded_args = if let Some(fa) = fold_constants(fun, args) {
@@ -594,43 +826,32 @@ pub fn generate_code<T>(expr: &Expr, args: usize) -> Result<GeneratedCode<T>, Co
                         return Err(CodeGenError::Const(n.clone()));
                     },
                     Expr::Variable(n) => {
-                        cg.generate_take_stack(n * 8);
+                        //cg.generate_take_stack(n * 8);
                     },
                     _ => {
-                        cg.generate_code_application(fun, &folded_args);
+                        //cg.generate_code_application(fun, &folded_args);
                     },
                 }
             } else {
-                cg.generate_code_application(fun, &folded_args);
+                //cg.generate_code_application(fun, &folded_args);
             }
         },
-    }
+    }*/
 
     // Put the result back on the stack and return
-    cg.generate_put_stack(0);
-    cg.generate_ret();
+    //cg.generate_put_stack(0);
+    //cg.generate_ret();
 
-    let gc = GeneratedCode::<T>::new(cg.stack_size * 8, ghc_stencil, &cg.code);
+    //let gc = GeneratedCode::<T>::new(cg.stack_size * 8, ghc_stencil, &cg.code);
 
     // Fix up the holes that need an absolute address
 
     // TODO: Find a nicer solution for this
-    for &ofs in cg.fixup_holes.iter() {
+    /*for &ofs in cg.fixup_holes.iter() {
         unsafe {
             let addr = gc.code.byte_offset(ofs as isize) as *mut u64;
             let start_offset = addr.read_unaligned();
             let new_addr = gc.code as u64 + start_offset;
             addr.write_unaligned(new_addr);           
         }
-    }
-
-    #[cfg(feature = "print-asm")]
-    {
-        let gc_code_slice = unsafe { std::slice::from_raw_parts(gc.code as *const u8, cg.code.len()) };
-        disassemble::disassemble(gc_code_slice);
-    }
-
-    Ok(gc)
-}
-
-
+    }*/

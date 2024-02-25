@@ -43,6 +43,10 @@ Arithmetic Operations:
 * `-` Subtraction
 * `*` Multiplication
 * `/` Division
+* `=` Equality (produces a boolean result)
+
+Boolean Operations:
+* `=` Equality
 
 #### Examples
 

@@ -7,7 +7,7 @@ use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
-use inkwell::types::{BasicMetadataTypeEnum, IntType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, IntType};
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, OptimizationLevel};
 
@@ -35,6 +35,8 @@ pub enum StencilOperation {
     DivConst,
     Rem,
     RemConst,
+
+    // Bit-operations
     And,
     AndConst,
     Or,
@@ -49,14 +51,21 @@ pub enum StencilOperation {
 
     // Comparison operations
     Eq,
+    EqConst,
     Ne,
+    NeConst,
     Gt,
+    GtConst,
     Ge,
+    GeConst,
     Lt,
+    LtConst,
     Le,
+    LeConst,
 
     // Control flow operations (If my plan works this should be the only one necessary)
-    Cond,
+    CondBr,
+    UncondBr,
 
     // These are the technical ones
     Take,
@@ -66,7 +75,12 @@ pub enum StencilOperation {
     Ret,
     Duplex,
     Put,
+    GetStackPtr,
+    Load,
+    Store,
 
+    // This is a special one that is used to wrap a call to a C(/Rust) function
+    CallCFunction,
     // This is a special one that is used to wrap the generated GHC-CC code
     GhcWrapper
 }
@@ -96,19 +110,30 @@ impl Display for StencilOperation {
             StencilOperation::ShrConst => write!(f, "shr-const"),
             StencilOperation::Not => write!(f, "not"),
             StencilOperation::Eq => write!(f, "eq"),
+            StencilOperation::EqConst => write!(f, "eq-const"),
             StencilOperation::Ne => write!(f, "ne"),
+            StencilOperation::NeConst => write!(f, "ne-const"),
             StencilOperation::Gt => write!(f, "ugt"),
+            StencilOperation::GtConst => write!(f, "ugt-const"),
             StencilOperation::Ge => write!(f, "uge"),
+            StencilOperation::GeConst => write!(f, "uge-const"),
             StencilOperation::Lt => write!(f, "ult"),
+            StencilOperation::LtConst => write!(f, "ult-const"),
             StencilOperation::Le => write!(f, "ule"),
-            StencilOperation::Cond => write!(f, "cond"),
+            StencilOperation::LeConst => write!(f, "ule-const"),
+            StencilOperation::CondBr => write!(f, "cond-br"),
+            StencilOperation::UncondBr => write!(f, "uncond-br"),
             StencilOperation::Take => write!(f, "take"),
             StencilOperation::TakeConst => write!(f, "take-const"),
             StencilOperation::Take1 => write!(f, "take1"),
             StencilOperation::Take2 => write!(f, "take2"),
+            StencilOperation::Load => write!(f, "load"),
+            StencilOperation::Store => write!(f, "store"),
             StencilOperation::Ret => write!(f, "ret"),
             StencilOperation::Duplex => write!(f, "duplex"),
             StencilOperation::Put => write!(f, "put"),
+            StencilOperation::GetStackPtr => write!(f, "get-stack-ptr"),
+            StencilOperation::CallCFunction => write!(f, "c-func-call"),
             StencilOperation::GhcWrapper => write!(f, "__GHC_CC-CONVERTER__")
         }
     }
@@ -153,6 +178,34 @@ impl Display for Stencil {
         write!(f, "{}", self.s_type)
     }
 
+}
+
+#[allow(dead_code)]
+impl Stencil {
+    pub fn code_without_jump(&self) -> &[u8] {
+        if self.large {
+            &self.code[..self.code.len() - 2]
+        } else {
+            &self.code[..self.code.len() - 5]
+        }
+    }
+
+    pub fn get_holes_bytelen(&self) -> usize {
+        if self.large {
+            8
+        } else {
+            4
+        }
+    }
+
+    pub fn get_tailcall_bytelen(&self) -> usize {
+        if self.large {
+            2
+        } else {
+            5
+        }
+    
+    }
 }
 
 fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> Stencil {
@@ -370,6 +423,45 @@ impl<'ctx> StencilCodeGen<'ctx> {
         get_stencil(s_type, elf.as_slice(), false, true)
     }
 
+    // We can also generate stencil variants that take 0-6 64 bit arguments for example
+    fn compile_call_c_function(&self) -> Stencil {
+        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.module.set_name(&format!("{}", StencilType::new(StencilOperation::CallCFunction, None)));
+        let void_type = self.context.void_type();
+        let fn_type = void_type.fn_type(&[uint8_ptr.into(), uint8_ptr.into()], false);
+        let function = self.module.add_function("call-c-func", fn_type, None);
+        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+        let basic_block = self.context.append_basic_block(function, "entry");
+
+        self.builder.position_at_end(basic_block);
+
+        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let arg = function.get_nth_param(1).unwrap().into_pointer_value();
+
+
+        // We go with a function that passes a single pointer as an argument
+        // We can then put our arguments somewhere in memory and pass a pointer to that
+        // We also get back a single pointer to the result
+        let c_function_type = uint8_ptr.fn_type(&[uint8_ptr.into()], false);
+        let c_function = self.module.add_function("PH-1", c_function_type, Some(Linkage::External));
+        c_function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMCCallConv as u32);
+
+        let call = self.builder.build_indirect_call(c_function_type, c_function.as_global_value().as_pointer_value(), &[arg.into()], "call").unwrap();
+        call.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMCCallConv as u32);
+
+        let return_value = call.try_as_basic_value().left().unwrap().into_pointer_value();
+        
+        let tailcall_function = self.get_tailcall_placeholder(&[uint8_ptr.into(), uint8_ptr.into()]);
+        let tc = self.builder.build_call(tailcall_function, &[stackptr.into(), return_value.into()], "tailcall").unwrap();
+        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+        tc.set_tail_call(true);      
+        self.builder.build_return(None).unwrap();
+
+        let elf = self.compile(true);
+    
+        get_stencil(StencilType::new(StencilOperation::CallCFunction, None), elf.as_slice(), true, true)
+    }
+
     fn compile_stencil<F: Fn(&[BasicValueEnum<'ctx>], PointerValue<'ctx>) -> Vec<BasicValueEnum<'ctx>>>(&self, s_type: StencilType, args: &[BasicMetadataTypeEnum<'ctx>], operation: F) -> Stencil {
         self.module.set_name(&format!("{}", s_type));
         let i8_type = self.context.i8_type();
@@ -469,6 +561,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
+
     // Compiles a stencil that takes one argument and calls a function with two arguments
     // We could instead also just have one that moves from the first to the second and calls
     // with an undefined first value but this is more flexible and performance should be the same
@@ -494,7 +587,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     // What this stencil would take is the index of the case we want. So we would need to do any
     // necessary calculations before going into this stencil.
     fn compile_cond(&self) -> Stencil {
-        let s_type: StencilType = StencilType::new(StencilOperation::Cond, None);
+        let s_type: StencilType = StencilType::new(StencilOperation::CondBr, None);
         self.module.set_name(&format!("{}", s_type));
         let void_type = self.context.void_type();
         let bool_type = self.context.bool_type();
@@ -551,6 +644,36 @@ impl<'ctx> StencilCodeGen<'ctx> {
         get_stencil(s_type, elf.as_slice(), false, false)    
     }
 
+    fn compile_get_stack_ptr(&self) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::GetStackPtr, None);
+        self.compile_stencil(s_type, &[], |_, stackptr| {
+            let offset = self.init_placeholder(self.context.i64_type());
+            let valueptr = unsafe { self.builder.build_gep(self.context.i8_type(), stackptr, &[offset], "valueptr").unwrap() };
+            vec![valueptr.into()]
+        })
+    }
+
+    fn compile_load(&self, d_type: DataType) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Take, Some(d_type.clone()));
+        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, stackptr| {
+            let valueptr = args[0].into_pointer_value();
+            let x = self.builder.build_load(d_type.get_llvm_type(self.context), valueptr, "x").unwrap();
+            vec![x.into()]
+        })
+    }
+
+    fn compile_store(&self, d_type: DataType) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Store, Some(d_type.clone()));
+        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, stackptr| {
+            let x = args[0];
+            let valueptr = args[1].into_pointer_value();
+            self.builder.build_store(valueptr, x).unwrap();
+            vec![x, valueptr.into()]
+        })
+    }
+
     fn compile_put_stack(&self) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Put, Some(DataType::I64));
         self.compile_stencil(s_type, &[self.context.i64_type().into()], |args, stackptr| {
@@ -563,7 +686,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
-    fn compile_int_arith(&self, s_type:StencilType, perform_op: fn(&Builder<'ctx>, DataType, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
+    fn compile_int_binop(&self, s_type:StencilType, perform_op: fn(&Builder<'ctx>, DataType, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
         let op_type = s_type.data_type.as_ref().unwrap().get_llvm_type(self.context).into_int_type();
         self.compile_stencil(s_type.clone(), &[op_type.into(), op_type.into()], |args, _| {
             let x = args[0].into_int_value();
@@ -573,7 +696,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
-    fn compile_const_int_arith(&self, s_type:StencilType, perform_op: fn(&Builder<'ctx>, DataType, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
+    fn compile_const_int_binop(&self, s_type:StencilType, perform_op: fn(&Builder<'ctx>, DataType, IntValue<'ctx>, IntValue<'ctx>) -> IntValue<'ctx>) -> Stencil {
         let op_type = s_type.data_type.as_ref().unwrap().get_llvm_type(self.context).into_int_type();
         self.compile_stencil(s_type.clone(), &[op_type.into()], |args,  _| {
             let x = args[0].into_int_value();
@@ -591,6 +714,31 @@ impl<'ctx> StencilCodeGen<'ctx> {
             let res = self.builder.build_not(x, "not").unwrap();
             vec![res.into()]
         })
+    }
+
+    fn compile_uncond_branch(&self) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::UncondBr, None);
+        self.module.set_name(&format!("{}", s_type));
+        let void_type = self.context.void_type();
+        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        // We pass through our stack and two argument/scratch registers to be safe
+        let fn_type = void_type.fn_type(&[uint8ptr_type.into(), uint8ptr_type.into(), uint8ptr_type.into()], false);
+        let function = self.module.add_function("ret", fn_type, None);
+        let basic_block = self.context.append_basic_block(function, "entry");
+        function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+        self.builder.position_at_end(basic_block);
+
+        let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let x = function.get_nth_param(1).unwrap().into_pointer_value();
+        let y = function.get_nth_param(2).unwrap().into_pointer_value();
+        let tailcallfun = self.get_tailcall_placeholder(&[uint8ptr_type.into(), uint8ptr_type.into(), uint8ptr_type.into()]);
+        let tc = self.builder.build_call(tailcallfun, &[stackptr.into(), x.into(), y.into()], "tailcall").unwrap();
+        tc.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+        tc.set_tail_call(true);
+        self.builder.build_return(None).unwrap();
+                
+        let elf = self.compile(false);
+        get_stencil(s_type, elf.as_slice(), false, false)    
     }
 
 
@@ -614,7 +762,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     }
 }
 
-fn compile_all_int_arith() -> BTreeMap<StencilType, Stencil> {
+fn compile_all_int_op() -> BTreeMap<StencilType, Stencil> {
     // TODO: This should be some kind of operations in a codegen layer that should
     //       should then be able to be reused for stencil generation
     fn int_add<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
@@ -659,56 +807,6 @@ fn compile_all_int_arith() -> BTreeMap<StencilType, Stencil> {
             builder.build_right_shift(x, y, false, "lshr").unwrap()
         }
     }
-    fn int_not<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_not(x, "not").unwrap()
-    }
-    let context = Context::create();
-    let ops: Vec<(StencilOperation, StencilOperation, for<'a> fn(& Builder<'a>, DataType, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![
-        (StencilOperation::Add, StencilOperation::AddConst, int_add),  
-        (StencilOperation::Sub, StencilOperation::SubConst, int_sub),
-        (StencilOperation::Mul, StencilOperation::MulConst, int_mul), 
-        (StencilOperation::Div, StencilOperation::DivConst, int_div), 
-        (StencilOperation::Rem, StencilOperation::RemConst, int_rem), 
-        (StencilOperation::And, StencilOperation::AndConst, int_and), 
-        (StencilOperation::Or, StencilOperation::OrConst, int_or), 
-        (StencilOperation::Xor, StencilOperation::XorConst, int_xor), 
-        (StencilOperation::Shl, StencilOperation::ShlConst, int_shl), 
-        (StencilOperation::Shr, StencilOperation::ShrConst, int_shr), 
-    ];
-    let types = vec![DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
-
-    let mut stencils = BTreeMap::new();
-
-    for (op_type, const_op_type, op) in ops {
-        for ty in types.iter() {
-            let codegen = StencilCodeGen::new(&context);
-            let codegen_const = StencilCodeGen::new(&context);
-            let stencil_type = StencilType::new(op_type, Some(ty.clone()));
-            let stencil: Stencil = codegen.compile_int_arith(stencil_type.clone(), op);
-            let const_stencil_type = StencilType::new(const_op_type, Some(ty.clone()));
-            let const_stencil = codegen_const.compile_const_int_arith(const_stencil_type.clone(), op);
-            stencils.insert(stencil_type, stencil);
-            stencils.insert(const_stencil_type, const_stencil);
-        }
-    }
-
-    // Compile not for all integer types
-    for ty in types.iter() {
-        let codegen = StencilCodeGen::new(&context);
-        let stencil_type = StencilType::new(StencilOperation::Not, Some(ty.clone()));
-        let stencil: Stencil = codegen.compile_stencil(stencil_type.clone(), &[ty.get_llvm_type(&context).into()], |args, _| {
-            let x = args[0].into_int_value();
-            let res = int_not(&codegen.builder, x);
-            vec![res.into()]
-        });
-        stencils.insert(stencil_type, stencil);
-    }
-
-    stencils
-}
-
-fn compile_all_cmp() -> BTreeMap<StencilType, Stencil> {
-    let context = Context::create();
     fn int_eq<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
         builder.build_int_compare(inkwell::IntPredicate::EQ, x, y, "eq").unwrap()
     }
@@ -743,48 +841,52 @@ fn compile_all_cmp() -> BTreeMap<StencilType, Stencil> {
             builder.build_int_compare(inkwell::IntPredicate::ULE, x, y, "ule").unwrap()
         }
     }
-
-    let types = vec![DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
-    let ops: Vec<(StencilOperation, for<'a> fn(& Builder<'a>, DataType, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![
-        (StencilOperation::Eq, int_eq), 
-        (StencilOperation::Not, int_ne), 
-        (StencilOperation::Gt, int_gt), 
-        (StencilOperation::Ge, int_ge), 
-        (StencilOperation::Lt, int_lt), 
-        (StencilOperation::Le, int_le), 
+    fn int_not<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>) -> IntValue<'ctx> {
+        builder.build_not(x, "not").unwrap()
+    }
+    let context = Context::create();
+    let ops: Vec<(StencilOperation, StencilOperation, for<'a> fn(& Builder<'a>, DataType, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![
+        (StencilOperation::Add, StencilOperation::AddConst, int_add),  
+        (StencilOperation::Sub, StencilOperation::SubConst, int_sub),
+        (StencilOperation::Mul, StencilOperation::MulConst, int_mul), 
+        (StencilOperation::Div, StencilOperation::DivConst, int_div), 
+        (StencilOperation::Rem, StencilOperation::RemConst, int_rem), 
+        (StencilOperation::And, StencilOperation::AndConst, int_and), 
+        (StencilOperation::Or, StencilOperation::OrConst, int_or), 
+        (StencilOperation::Xor, StencilOperation::XorConst, int_xor), 
+        (StencilOperation::Shl, StencilOperation::ShlConst, int_shl), 
+        (StencilOperation::Shr, StencilOperation::ShrConst, int_shr), 
+        (StencilOperation::Eq, StencilOperation::EqConst, int_eq), 
+        (StencilOperation::Ne, StencilOperation::NeConst, int_ne), 
+        (StencilOperation::Gt, StencilOperation::GtConst, int_gt), 
+        (StencilOperation::Ge, StencilOperation::GeConst, int_ge), 
+        (StencilOperation::Lt, StencilOperation::LtConst, int_lt), 
+        (StencilOperation::Le, StencilOperation::LeConst, int_le), 
     ];
+    let types = vec![DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
 
     let mut stencils = BTreeMap::new();
 
-    for (sop, op) in ops {
+    for (op_type, const_op_type, op) in ops {
         for ty in types.iter() {
             let codegen = StencilCodeGen::new(&context);
-            let stencil_type = StencilType::new(sop, Some(ty.clone()));
-            let llvm_type = ty.get_llvm_type(&context).into();
-            let stencil: Stencil = codegen.compile_stencil(stencil_type.clone(), &[llvm_type, llvm_type], |args, _| {
-                let x = args[0].into_int_value();
-                let y = args[1].into_int_value();
-                let res = op(&codegen.builder, ty.clone(), x, y);
-                vec![res.into()]
-            });
+            let codegen_const = StencilCodeGen::new(&context);
+            let stencil_type = StencilType::new(op_type, Some(ty.clone()));
+            let stencil: Stencil = codegen.compile_int_binop(stencil_type.clone(), op);
+            let const_stencil_type = StencilType::new(const_op_type, Some(ty.clone()));
+            let const_stencil = codegen_const.compile_const_int_binop(const_stencil_type.clone(), op);
             stencils.insert(stencil_type, stencil);
+            stencils.insert(const_stencil_type, const_stencil);
         }
     }
 
-    // Compile boolean Eq/Neq
-
-    let bool_ops: Vec<(StencilOperation, for<'a> fn(& Builder<'a>, DataType, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![
-        (StencilOperation::Eq, int_eq), 
-        (StencilOperation::Ne, int_ne), 
-    ];
-
-    for (sop, op) in bool_ops {
+    // Compile not for all integer types
+    for ty in types.iter() {
         let codegen = StencilCodeGen::new(&context);
-        let stencil_type = StencilType::new(sop, Some(DataType::Bool));
-        let stencil: Stencil = codegen.compile_stencil(stencil_type.clone(), &[context.bool_type().into(), context.bool_type().into()], |args, _| {
+        let stencil_type = StencilType::new(StencilOperation::Not, Some(ty.clone()));
+        let stencil: Stencil = codegen.compile_stencil(stencil_type.clone(), &[ty.get_llvm_type(&context).into()], |args, _| {
             let x = args[0].into_int_value();
-            let y = args[1].into_int_value();
-            let res = op(&codegen.builder, DataType::Bool, x, y);
+            let res = int_not(&codegen.builder, x);
             vec![res.into()]
         });
         stencils.insert(stencil_type, stencil);
@@ -808,7 +910,7 @@ fn compile_all_take_const(stencil_lib: &mut BTreeMap<StencilType, Stencil>) {
     let mut new_stencils = Vec::new();
     for (s_type, stencil) in result.iter() {
     if let Some(ty) = s_type.data_type.as_ref() {
-        if let Some(new_ty) = ty.flip_sign() {
+        if let Some(new_ty) = ty.flip_signed() {
             let new_s_type = StencilType::new(s_type.operation, Some(new_ty));
             new_stencils.push((new_s_type, stencil.clone()));
         }
@@ -818,6 +920,40 @@ fn compile_all_take_const(stencil_lib: &mut BTreeMap<StencilType, Stencil>) {
     result.insert(s_type, stencil);
     }
     stencil_lib.append(&mut result);
+}
+
+fn compile_all_load_store() -> BTreeMap<StencilType, Stencil>{
+    let context = Context::create();
+    let mut result = BTreeMap::new();
+    let types = &[DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::F32, DataType::F64];
+    let op = StencilOperation::Load;
+    for ty in types {
+        let s_type = StencilType::new(op, Some(ty.clone()));
+        let codegen = StencilCodeGen::new(&context);
+        let stencil = codegen.compile_load(ty.clone());
+        result.insert(s_type.clone(), stencil);
+    }
+    let op = StencilOperation::Store;
+    for ty in types {
+        let s_type = StencilType::new(op, Some(ty.clone()));
+        let codegen = StencilCodeGen::new(&context);
+        let stencil = codegen.compile_store(ty.clone());
+        result.insert(s_type.clone(), stencil);
+    }
+    // insert the unsigned stencils again for signed types
+    let mut new_stencils = Vec::new();
+    for (s_type, stencil) in result.iter() {
+        if let Some(ty) = s_type.data_type.as_ref() {
+            if let Some(new_ty) = ty.flip_signed() {
+                let new_s_type = StencilType::new(s_type.operation, Some(new_ty));
+                new_stencils.push((new_s_type, stencil.clone()));
+            }
+        }
+    }
+    for (s_type, stencil) in new_stencils {
+        result.insert(s_type, stencil);
+    }
+    result
 }
 
 fn compile_stencil(stencil_lib: &mut BTreeMap<StencilType, Stencil>, comp_fn: fn(&StencilCodeGen) -> Stencil) {
@@ -839,14 +975,17 @@ pub fn compile_all_stencils() -> BTreeMap<StencilType, Stencil> {
     compile_stencil(&mut stencil_library, |c| c.compile_ret_stencil());
     compile_stencil(&mut stencil_library, |c| c.compile_ghc_wrapper());
     compile_stencil(&mut stencil_library, |c| c.compile_cond());
-
-    let mut cmp_stencils = compile_all_cmp();
-
-    stencil_library.append(&mut cmp_stencils);
+    compile_stencil(&mut stencil_library, |c| c.compile_call_c_function());
+    compile_stencil(&mut stencil_library, |c| c.compile_get_stack_ptr());
+    compile_stencil(&mut stencil_library, |c| c.compile_uncond_branch());
 
     compile_all_take_const(&mut stencil_library);
 
-    let mut int_arith_stencils = compile_all_int_arith();
+    let mut load_store_stencils = compile_all_load_store();
+
+    stencil_library.append(&mut load_store_stencils);
+
+    let mut int_arith_stencils = compile_all_int_op();
 
     stencil_library.append(&mut int_arith_stencils);
 

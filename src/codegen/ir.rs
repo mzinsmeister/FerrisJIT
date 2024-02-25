@@ -27,57 +27,6 @@ pub enum DataType {
     Ptr(Box<DataType>),
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
-pub enum ConstValue {
-    Bool(bool),
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    F32(f32),
-    F64(f64),
-}
-
-impl ConstValue {
-    pub fn get_type(&self) -> DataType {
-        match self {
-            ConstValue::Bool(_) => DataType::Bool,
-            ConstValue::I8(_) => DataType::I8,
-            ConstValue::I16(_) => DataType::I16,
-            ConstValue::I32(_) => DataType::I32,
-            ConstValue::I64(_) => DataType::I64,
-            ConstValue::U8(_) => DataType::U8,
-            ConstValue::U16(_) => DataType::U16,
-            ConstValue::U32(_) => DataType::U32,
-            ConstValue::U64(_) => DataType::U64,
-            ConstValue::F32(_) => DataType::F32,
-            ConstValue::F64(_) => DataType::F64,
-        }
-    }
-
-    pub fn bitcast_to_u64(&self) -> u64 {
-        match self {
-            ConstValue::Bool(b) => *b as u64,
-            ConstValue::I8(i) => *i as u64,
-            ConstValue::I16(i) => *i as u64,
-            ConstValue::I32(i) => *i as u64,
-            ConstValue::I64(i) => *i as u64,
-            ConstValue::U8(u) => *u as u64,
-            ConstValue::U16(u) => *u as u64,
-            ConstValue::U32(u) => *u as u64,
-            ConstValue::U64(u) => *u,
-            ConstValue::F32(f) => f.to_bits() as u64,
-            ConstValue::F64(f) => f.to_bits(),
-        }
-    
-    }
-}
-
 impl<'a> TryFrom<IntType<'a>> for DataType {
     // TODO: Proper Error Type
     type Error = ();
@@ -114,7 +63,7 @@ impl DataType {
         }
     }
 
-    pub fn flip_sign(&self) -> Option<Self> {
+    pub fn flip_signed(&self) -> Option<Self> {
         match self {
             DataType::I8 => Some(DataType::U8),
             DataType::I16 => Some(DataType::U16),
@@ -194,5 +143,56 @@ impl Display for DataType {
             DataType::Bool => write!(f, "bool"),
             DataType::Ptr(inner) => write!(f, "{}-ptr", inner),
         }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
+pub enum ConstValue {
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+}
+
+impl ConstValue {
+    pub fn get_type(&self) -> DataType {
+        match self {
+            ConstValue::Bool(_) => DataType::Bool,
+            ConstValue::I8(_) => DataType::I8,
+            ConstValue::I16(_) => DataType::I16,
+            ConstValue::I32(_) => DataType::I32,
+            ConstValue::I64(_) => DataType::I64,
+            ConstValue::U8(_) => DataType::U8,
+            ConstValue::U16(_) => DataType::U16,
+            ConstValue::U32(_) => DataType::U32,
+            ConstValue::U64(_) => DataType::U64,
+            ConstValue::F32(_) => DataType::F32,
+            ConstValue::F64(_) => DataType::F64,
+        }
+    }
+
+    pub fn bitcast_to_u64(&self) -> u64 {
+        match self {
+            ConstValue::Bool(b) => *b as u64,
+            ConstValue::I8(i) => *i as u64,
+            ConstValue::I16(i) => *i as u64,
+            ConstValue::I32(i) => *i as u64,
+            ConstValue::I64(i) => *i as u64,
+            ConstValue::U8(u) => *u as u64,
+            ConstValue::U16(u) => *u as u64,
+            ConstValue::U32(u) => *u as u64,
+            ConstValue::U64(u) => *u,
+            ConstValue::F32(f) => f.to_bits() as u64,
+            ConstValue::F64(f) => f.to_bits(),
+        }
+    
     }
 }

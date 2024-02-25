@@ -3,7 +3,7 @@ mod codegen;
 
 use std::{error::Error, fmt::Display, hint::black_box};
 
-use codegen::{generate_code, STENCILS};
+use codegen::generate_code;
 use expr::parse_expr_from_str;
 
 
@@ -119,11 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    // Dummy access to initialize stencils
-    let compile_start = std::time::Instant::now();
-    black_box(STENCILS.len());
-    let compile_elapsed = compile_start.elapsed();
-    println!("Stencil initialization: {:?}", compile_elapsed);
+    codegen::init_stencils();
 
     // REPL for evaluating expressions on the data
 
