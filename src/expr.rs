@@ -267,6 +267,7 @@ fn parse_expr<'a>(i: &'a str) -> IResult<&'a str, Expr, VerboseError<&'a str>> {
 /// and give us something back
 
 /// To start we define a couple of helper functions
+#[allow(dead_code)]
 fn get_num_from_expr(e: Expr, vars: &[&i64]) -> Option<i64> {
   match e {
     Expr::Constant(Atom::Num(n)) => Some(n),
@@ -354,6 +355,7 @@ pub fn parse_expr_from_str(src: &str) -> Result<Expr, String> {
 }
 /// And we add one more top-level function to tie everything together, letting
 /// us call eval on a string directly
+#[allow(dead_code)]
 pub fn eval_from_str(src: &str, vars: &[i64]) -> Result<Atom, String> {
   parse_expr(src)
     .map_err(|e: nom::Err<VerboseError<&str>>| format!("{:#?}", e))
