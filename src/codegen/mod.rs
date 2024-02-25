@@ -1,27 +1,31 @@
 
 pub mod stencils;
 pub mod ir;
+mod disassemble;
 
-use goblin::mach::constants::S_16BYTE_LITERALS;
 use lazy_static::lazy_static;
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt::Display};
 use libc::c_void;
 use stencils::Stencil;
 
 use crate::{codegen::{ir::DataType, stencils::StencilOperation}, expr::{Atom, BuiltIn, Expr}};
 
-use self::stencils::{compile_all_stencils, StencilType};
+use self::{ir::ConstValue, stencils::{compile_all_stencils, StencilType}};
 
 // TODO: Once we go beyond basic arithmetic expressions we should have our own IR
+//       We should also have a way to represent/address values so that we can insert
+//       put/take instructions automatically and so that we can also map the same logic to LLVM IR
 
-pub struct GeneratedCode {
-    stack: *mut u8,
-    code: *const c_void,
-    ghcc_code: *const c_void,
+pub struct GeneratedCode<T> {
+    pub stack: *mut u8,
+    pub code: *const c_void,
+    pub code_len: usize,
+    pub ghcc_code: *const c_void,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl GeneratedCode {
+impl<T: Sized> GeneratedCode<T> {
 
     pub fn new(stack_size: usize, wrapper_stencil: &Stencil, code: &[u8]) -> Self {
 
@@ -80,11 +84,13 @@ impl GeneratedCode {
         Self {
             stack: stack_space,
             code: mmap,
+            code_len: code.len(),
             ghcc_code: ghcc_fun,
+            _phantom: std::marker::PhantomData,
         }
     }
     
-    pub fn call(&self, args: &[i64]) -> i64 {
+    pub fn call(&self, args: &[i64]) -> T {
             // cast the memory region to a function pointer
         let f: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(self.ghcc_code) };
 
@@ -104,13 +110,13 @@ impl GeneratedCode {
         // get the result from the stack;
 
         unsafe {
-            let value = std::ptr::read_unaligned(self.stack as *const i64);
-            value
+            let value = std::ptr::read_unaligned(self.stack as *const u64);
+            std::mem::transmute_copy(&value)
         }
     }
 }
 
-impl Drop for GeneratedCode {
+impl<T> Drop for GeneratedCode<T> {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.code as *mut libc::c_void, 0x1000);
@@ -124,30 +130,52 @@ lazy_static! {
     pub static ref STENCILS: BTreeMap<StencilType, Stencil> = compile_all_stencils();
 }
 
+
 struct CodeGen {
     code: Vec<u8>,
+    fixup_holes: Vec<usize>,
     stack_ptr: usize,
     stack_size: usize,
 }
 
-fn fold_op(fun: &BuiltIn, l: i64, r: i64) -> i64 {
-    match fun {
-        BuiltIn::Plus => l + r,
-        BuiltIn::Times => l * r,
-        BuiltIn::Minus => l - r,
-        BuiltIn::Divide => l / r,
+fn fold_op(fun: &BuiltIn, l: Atom, r: Atom) -> Option<Atom> {
+    match (fun, l, r) {
+        (BuiltIn::Plus, Atom::Num(l), Atom::Num(r)) => Some(Atom::Num(l + r)),
+        (BuiltIn::Times, Atom::Num(l), Atom::Num(r)) => Some(Atom::Num(l * r)),
+        (BuiltIn::Minus, Atom::Num(l), Atom::Num(r)) => Some(Atom::Num(l - r)),
+        (BuiltIn::Divide, Atom::Num(l), Atom::Num(r)) => Some(Atom::Num(l / r)),
+        (BuiltIn::Equal, Atom::Num(l), Atom::Num(r)) => Some(Atom::Boolean(l == r)),
+        (BuiltIn::Equal, Atom::Boolean(l), Atom::Boolean(r)) => Some(Atom::Boolean(l == r)),
+        _ => None,
     }
 }
 
 fn is_commutative(fun: &BuiltIn) -> bool {
     match fun {
-        BuiltIn::Plus => true,
-        BuiltIn::Times => true,
+        BuiltIn::Plus | BuiltIn::Times | BuiltIn::Equal => true,
         _ => false,
     }
 }
 
-fn fold_constants(fun: &BuiltIn, args: &[Expr]) -> Vec<Expr> {
+pub fn get_type(expr: &Expr) -> DataType {
+    match expr {
+        Expr::Constant(Atom::Num(_)) => DataType::I64,
+        Expr::Constant(Atom::Boolean(_)) => DataType::Bool,
+        Expr::Variable(_) => DataType::I64,
+        Expr::Application(fun, _) => {
+            match fun {
+                BuiltIn::Plus | BuiltIn::Minus | BuiltIn::Times | BuiltIn::Divide => {
+                    DataType::I64
+                },
+                BuiltIn::Equal => {
+                    DataType::Bool
+                }
+            }
+        },
+    }
+}
+
+fn fold_constants(fun: &BuiltIn, args: &[Expr]) -> Option<Vec<Expr>> {
     if is_commutative(fun) {
         fold_all_constants_commutative(fun, args)
     } else {
@@ -156,56 +184,66 @@ fn fold_constants(fun: &BuiltIn, args: &[Expr]) -> Vec<Expr> {
         let mut result = Vec::new();
 
         let mut args_iter = args.iter().peekable();
+
+        let data_type = get_type(&args[0]);
         
-        if let Some(Expr::Constant(Atom::Num(n))) = args_iter.peek() {
+        if let Some(Expr::Constant(n)) = args_iter.peek() {
             let mut folded_constants = *n;
             args_iter.next();
-            while let Some(Expr::Constant(Atom::Num(n))) = args_iter.peek() {
-                folded_constants = fold_op(fun, folded_constants, *n);
+            while let Some(Expr::Constant(n)) = args_iter.peek() {
+                folded_constants = fold_op(fun, folded_constants, *n)?;
                 args_iter.next();
             }
-            result.push(Expr::Constant(Atom::Num(folded_constants)));
+            result.push(Expr::Constant(folded_constants));
         }
 
         for arg in args_iter {
+            if get_type(&arg) != data_type {
+                return None;
+            }
             result.push(arg.clone());
         }
 
-        result
+        Some(result)
     }
 }
 
-fn fold_all_constants_commutative(fun: &BuiltIn, args: &[Expr]) -> Vec<Expr> {
+fn fold_all_constants_commutative(fun: &BuiltIn, args: &[Expr]) -> Option<Vec<Expr>> {
     let mut applications = Vec::new();
     let mut variables = Vec::new();
     let mut folded_constants = None;
 
+    let data_type = get_type(&args[0]);
+
     // Add all the variables to result and fold all constants into one
     for arg in args {
+        if get_type(&arg) != data_type {
+            return None;
+        }
         match arg {
-            Expr::Constant(Atom::Num(n)) => {
+            Expr::Constant(n) => {
                 if let Some(folded_constants_n) = folded_constants {
-                    folded_constants = Some(fold_op(fun, folded_constants_n, *n));
+                    folded_constants = Some(fold_op(fun, folded_constants_n, *n)?);
                 } else {
                     folded_constants = Some(*n);
                 }
             },
-            Expr::Constant(Atom::Variable(n)) => {
-                variables.push(Expr::Constant(Atom::Variable(*n)));
+            Expr::Variable(n) => {
+                variables.push(Expr::Variable(*n));
             },
             Expr::Application(fun2, s) => {
-                let folded_s = fold_constants(fun2, s);
+                let folded_s = fold_constants(fun2, s)?;
                 if folded_s.len() == 1 {
                     match folded_s[0] {
-                        Expr::Constant(Atom::Num(n)) => {
+                        Expr::Constant(n) => {
                             if let Some(folded_constants_n) = folded_constants {
-                                folded_constants = Some(fold_op(fun, folded_constants_n, n));
+                                folded_constants = Some(fold_op(fun, folded_constants_n, n)?);
                             } else {
                                 folded_constants = Some(n);
                             }
                         },
-                        Expr::Constant(Atom::Variable(n)) => {
-                            variables.push(Expr::Constant(Atom::Variable(n)));
+                        Expr::Variable(n) => {
+                            variables.push(Expr::Variable(n));
                         },
                         _ => unreachable!()
                     }
@@ -223,12 +261,18 @@ fn fold_all_constants_commutative(fun: &BuiltIn, args: &[Expr]) -> Vec<Expr> {
     result.extend(variables);
 
     if let Some(folded_constants_n) = folded_constants {
-        result.push(Expr::Constant(Atom::Num(folded_constants_n)));
+        result.push(Expr::Constant(folded_constants_n));
     }
 
-    result
+    Some(result)
 }
 
+fn atom_to_const_value(atom: &Atom) -> ConstValue {
+    match atom {
+        Atom::Num(n) => ConstValue::I64(*n),
+        Atom::Boolean(b) => ConstValue::Bool(*b),
+    }
+}
 
 // TODO: Introduce the concept of "Values" like in LLVM IR
 //       and then either do nothing if the values is in the correct
@@ -242,6 +286,7 @@ impl CodeGen {
             code: Vec::new(),
             stack_ptr: args * 8,
             stack_size: args * 8,
+            fixup_holes: Vec::new(),
         }
     }
 
@@ -256,6 +301,18 @@ impl CodeGen {
                 stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&val.to_ne_bytes());
             } else {
                 stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&(*val as u32).to_ne_bytes());
+            }
+        }
+
+        for &ofs in &stencil.tail_holes {
+            if ofs + hole_lengths > stencil_slice.len() {
+                continue;
+            }
+            if stencil.large {
+                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&(end_ofs).to_ne_bytes());
+                self.fixup_holes.push(start_ofs + ofs);
+            } else {
+                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&((end_ofs - (ofs + 4)) as u32).to_ne_bytes());
             }
         }
     }
@@ -281,66 +338,80 @@ impl CodeGen {
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_take_const(&mut self, n: i64) {
-        let s_type = StencilType::new(StencilOperation::TakeConst, Some(DataType::I64));
+    fn generate_take_const(&mut self, ir_const: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::TakeConst, Some(ir_const.get_type()));
         let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
+        let holes_values = vec![ir_const.bitcast_to_u64()];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_i64_add(&mut self) {
-        let s_type = StencilType::new(StencilOperation::Add, Some(DataType::I64));
+    fn generate_add(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Add, Some(data_type));
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_i64_add_const(&mut self, n: i64) {
-        let s_type = StencilType::new(StencilOperation::AddConst, Some(DataType::I64));
+    fn generate_add_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::AddConst, Some(n.get_type()));
         let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
+        let holes_values = vec![n.bitcast_to_u64()];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_i64_mul(&mut self) {
-        let s_type = StencilType::new(StencilOperation::Mul, Some(DataType::I64));
+    fn generate_mul(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Mul, Some(data_type));
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_i64_mul_const(&mut self, n: i64) {
-        let s_type = StencilType::new(StencilOperation::MulConst, Some(DataType::I64));
+    fn generate_mul_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::MulConst, Some(n.get_type()));
         let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
+        let holes_values = vec![n.bitcast_to_u64()];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_i64_sub(&mut self) {
-        let s_type = StencilType::new(StencilOperation::Sub, Some(DataType::I64));
+    fn generate_sub(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Sub, Some(data_type));
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_i64_sub_const(&mut self, n: i64) {
-        let s_type = StencilType::new(StencilOperation::SubConst, Some(DataType::I64));
+    fn generate_sub_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::SubConst, Some(n.get_type()));
         let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
+        let holes_values = vec![n.bitcast_to_u64()];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_i64_div(&mut self) {
-        let s_type = StencilType::new(StencilOperation::SDiv, Some(DataType::I64));
+    fn generate_div(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Div, Some(data_type));
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    fn generate_i64_div_const(&mut self, n: i64) {
-        let s_type = StencilType::new(StencilOperation::SDivConst, Some(DataType::I64));
+    fn generate_div_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::DivConst, Some(n.get_type()));
         let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![n as u64];
+        let holes_values = vec![n.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    fn generate_eq(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Eq, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    fn generate_duplex(&mut self) {
+        let s_type = StencilType::new(StencilOperation::Duplex, None);
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
         self.copy_and_patch(stencil, holes_values);
     }
 
@@ -354,58 +425,66 @@ impl CodeGen {
     fn generate_atom(&mut self, atom: &Atom) {
         match atom {
             Atom::Num(n) => {
-                self.generate_take_stack(0);
-                self.generate_put_stack(*n as usize);
+                self.generate_take_const(ConstValue::I64(*n));
             },
-            Atom::Variable(n) => {
-                self.generate_take_stack(n * 8);
+            Atom::Boolean(b) => {
+                self.generate_take_const(ConstValue::Bool(*b));
             },
         }
     }
 
-    fn generate_op(&mut self, fun: &BuiltIn) {
+    fn generate_op(&mut self, fun: &BuiltIn, data_type: DataType) {
         match fun {
             BuiltIn::Plus => {
-                self.generate_i64_add();
+                self.generate_add(data_type);
             },
             BuiltIn::Times => {
-                self.generate_i64_mul();
+                self.generate_mul(data_type);
             },
             BuiltIn::Minus => {
-                self.generate_i64_sub();
+                self.generate_sub(data_type);
             },
             BuiltIn::Divide => {
-                self.generate_i64_div();
+                self.generate_div(data_type);
             },
+            BuiltIn::Equal => {
+                self.generate_eq(data_type);
+            }
         }
     }
 
-    fn generate_op_const(&mut self, fun: &BuiltIn, n: i64) {
+    fn generate_op_const(&mut self, fun: &BuiltIn, n: ConstValue) {
         match fun {
             BuiltIn::Plus => {
-                self.generate_i64_add_const(n);
+                self.generate_add_const(n);
             },
             BuiltIn::Times => {
-                self.generate_i64_mul_const(n);
+                self.generate_mul_const(n);
             },
             BuiltIn::Minus => {
-                self.generate_i64_sub_const(n);
+                self.generate_sub_const(n);
             },
             BuiltIn::Divide => {
-                self.generate_i64_div_const(n);
+                self.generate_div_const(n);
             },
+            BuiltIn::Equal => {
+                // TODO: This is not ideal but should do for now
+                self.generate_duplex();
+                self.generate_take_const(n);
+                self.generate_eq(n.get_type());
+            }
         }
     }
 
-    fn generate_code_application(&mut self, fun: &BuiltIn, args: &[Expr]) {
+    fn generate_code_application(&mut self, fun: &BuiltIn, args: &[Expr]) -> DataType {
         let first_variable = &args[0];
 
         match first_variable {
-            Expr::Constant(Atom::Variable(n)) => {
+            Expr::Variable(n) => {
                 self.generate_take_stack(n * 8);
             },
-            Expr::Constant(Atom::Num(n)) => {
-                self.generate_take_const(*n);
+            Expr::Constant(n) => {
+                self.generate_take_const(atom_to_const_value(n));
             },
             Expr::Application(fun2, args2) => {
                 self.generate_code_application(&fun2, &args2);
@@ -414,12 +493,12 @@ impl CodeGen {
 
         for arg in args.iter().skip(1) {
             match arg {
-                Expr::Constant(Atom::Variable(n)) => {
+                Expr::Variable(n) => {
                     self.generate_take_2_stack(n * 8);
-                    self.generate_op(fun);
+                    self.generate_op(fun, DataType::I64);
                 },
-                Expr::Constant(Atom::Num(n)) => {
-                    self.generate_op_const(fun, *n);
+                Expr::Constant(n) => {
+                    self.generate_op_const(fun, atom_to_const_value(n));
                 },
                 Expr::Application(fun2, args2) => {
                     // Save the current result to the stack 
@@ -427,17 +506,45 @@ impl CodeGen {
                     self.stack_ptr += 8;
                     self.stack_size = self.stack_size.max(self.stack_ptr);
                     self.generate_put_stack(stack_top);
-                    self.generate_code_application(&fun2, &args2);
+                    let ret_type = self.generate_code_application(&fun2, &args2);
                     self.generate_take_2_stack(stack_top);
                     self.stack_ptr -= 8;
-                    self.generate_op(fun);
+                    self.generate_op(fun, ret_type);
                 },
+            }
+        }
+        match fun {
+            BuiltIn::Plus | BuiltIn::Minus | BuiltIn::Times | BuiltIn::Divide => {
+                DataType::I64
+            },
+            BuiltIn::Equal => {
+                DataType::Bool
             }
         }
     }
 }
 
-pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, i64> {
+
+#[derive(Debug)]
+pub enum CodeGenError {
+    Const(Atom),
+    TypeError
+}
+
+impl Display for CodeGenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CodeGenError::Const(n) => {
+                write!(f, "Result(const): {}", n)
+            },
+            CodeGenError::TypeError => {
+                write!(f, "Type error")
+            }
+        }
+    }
+}
+
+pub fn generate_code<T>(expr: &Expr, args: usize) -> Result<GeneratedCode<T>, CodeGenError> {
 
     let mut cg = CodeGen::new(args);
 
@@ -447,25 +554,33 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, i64> {
         Expr::Constant(e) => {
             cg.generate_atom(e);
         },
+        Expr::Variable(n) => {
+            cg.generate_take_stack(n * 8);
+        },
         Expr::Application(fun, args) => {
-            let folded_args = fold_constants(fun, args);
+            let folded_args = if let Some(fa) = fold_constants(fun, args) {
+                fa
+            } else {
+                return Err(CodeGenError::TypeError);
+            };
             if folded_args.len() == 1 {
-                match folded_args[0] {
+                match &folded_args[0] {
                     // TODO: Once we introduce operators that also do something to
                     //       a single argument, this is no longer correct like this
                     //       but constant folding will need to be imroved anyway then
-                    Expr::Constant(Atom::Num(n)) => {
-                        return Err(n);
+                    Expr::Constant(n) => {
+                        return Err(CodeGenError::Const(n.clone()));
                     },
-                    Expr::Constant(Atom::Variable(n)) => {
+                    Expr::Variable(n) => {
                         cg.generate_take_stack(n * 8);
                     },
                     _ => {
                         cg.generate_code_application(fun, &folded_args);
                     },
                 }
+            } else {
+                cg.generate_code_application(fun, &folded_args);
             }
-            cg.generate_code_application(fun, &folded_args);
         },
     }
 
@@ -473,6 +588,27 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, i64> {
     cg.generate_put_stack(0);
     cg.generate_ret();
 
-    Ok(GeneratedCode::new(cg.stack_size * 8, ghc_stencil, &cg.code))
+    let gc = GeneratedCode::<T>::new(cg.stack_size * 8, ghc_stencil, &cg.code);
+
+    // Fix up the holes that need an absolute address
+
+    // TODO: Find a nicer solution for this
+    for &ofs in cg.fixup_holes.iter() {
+        unsafe {
+            let addr = gc.code.byte_offset(ofs as isize) as *mut u64;
+            let start_offset = addr.read_unaligned();
+            let new_addr = gc.code as u64 + start_offset;
+            addr.write_unaligned(new_addr);           
+        }
+    }
+
+    #[cfg(feature = "print-asm")]
+    {
+        let gc_code_slice = unsafe { std::slice::from_raw_parts(gc.code as *const u8, cg.code.len()) };
+        disassemble::disassemble(gc_code_slice);
+    }
+
+    Ok(gc)
 }
+
 

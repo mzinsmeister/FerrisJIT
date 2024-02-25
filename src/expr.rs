@@ -4,6 +4,8 @@
 //! parser and tiny [lisp](https://en.wikipedia.org/wiki/Lisp_(programming_language)) interpreter.
 //! Lisp is a simple type of language made up of Atoms and Lists, forming easily parsable trees.
 
+use std::fmt::{self, Display, Formatter};
+
 use nom::{
   branch::alt,
   bytes::complete::tag,
@@ -25,18 +27,26 @@ pub enum BuiltIn {
   Minus,
   Times,
   Divide,
-  /*Equal,
-  Not,*/
+  Equal,
+  /*Not,*/
 }
 
 /// We now wrap this type and a few other primitives into our Atom type.
 /// Remember from before that Atoms form one half of our language.
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Atom {
   Num(i64),
-  Variable(usize),
-  //Boolean(bool),
+  Boolean(bool),
+}
+
+impl Display for Atom {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    match self {
+      Atom::Num(n) => write!(f, "{}", n),
+      Atom::Boolean(b) => write!(f, "{}", b),
+    }
+  }
 }
 
 /// The remaining half is Lists. We implement these as recursive Expressions.
@@ -52,6 +62,7 @@ pub enum Atom {
 #[derive(Debug, PartialEq, Clone)]
 pub enum Expr {
   Constant(Atom),
+  Variable(usize),
   /// (func-name arg1 arg2)
   Application(BuiltIn, Vec<Expr>),
   /*/// (if predicate do-this)
@@ -68,7 +79,7 @@ fn parse_builtin_op<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'
   // one_of matches one of the characters we give it
   // TODO: When reactivating "-/=" uncomment this and remove the next line
   //let (i, t) = one_of("+-*/=")(i)?;
-  let (i, t) = one_of("+-*/")(i)?;
+  let (i, t) = one_of("+-*/=")(i)?;
 
   // because we are matching single character tokens, we can do the matching logic
   // on the returned value
@@ -79,7 +90,7 @@ fn parse_builtin_op<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'
       '-' => BuiltIn::Minus,
       '*' => BuiltIn::Times,
       '/' => BuiltIn::Divide,
-      //'=' => BuiltIn::Equal,
+      '=' => BuiltIn::Equal,
       _ => unreachable!(),
     },
   ))
@@ -97,12 +108,12 @@ fn parse_builtin<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'a s
 }
 
 /// Our boolean values are also constant, so we can do it the same way
-/*fn parse_bool<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
+fn parse_bool<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
   alt((
     map(tag("#t"), |_| Atom::Boolean(true)),
     map(tag("#f"), |_| Atom::Boolean(false)),
   ))(i)
-}*/
+}
 
 /// The next easiest thing to parse are keywords.
 /// We introduce some error handling combinators: `context` for human readable errors
@@ -136,8 +147,7 @@ fn parse_num(i: &str) -> IResult<&str, Atom, VerboseError<&str>> {
 fn parse_atom<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
   alt((
     parse_num,
-    parse_variable,
-    //parse_bool,
+    parse_bool,
     //map(parse_builtin, Atom::BuiltIn),
     //parse_keyword,
   ))(i)
@@ -149,9 +159,9 @@ fn parse_constant<'a>(i: &'a str) -> IResult<&'a str, Expr, VerboseError<&'a str
 }
 
 /// We add variables in the format $n where n is a number
-fn parse_variable<'a>(i: &'a str) -> IResult<&'a str, Atom, VerboseError<&'a str>> {
+fn parse_variable<'a>(i: &'a str) -> IResult<&'a str, Expr, VerboseError<&'a str>> {
   map_res(preceded(tag("$"), digit1), |digit_str: &str| {
-    digit_str.parse::<usize>().map(Atom::Variable)
+    digit_str.parse::<usize>().map(Expr::Variable)
   })(i)
 }
 
@@ -243,9 +253,10 @@ fn parse_application<'a>(i: &'a str) -> IResult<&'a str, Expr, VerboseError<&'a 
 fn parse_expr<'a>(i: &'a str) -> IResult<&'a str, Expr, VerboseError<&'a str>> {
   preceded(
     multispace0,
-    alt((parse_constant, parse_application/*, parse_if, parse_quote*/)),
+    alt((parse_constant, parse_variable, parse_application/*, parse_if, parse_quote*/)),
   )(i)
 }
+
 
 /// And that's it!
 /// We can now parse our entire lisp language.
@@ -259,7 +270,7 @@ fn parse_expr<'a>(i: &'a str) -> IResult<&'a str, Expr, VerboseError<&'a str>> {
 fn get_num_from_expr(e: Expr, vars: &[&i64]) -> Option<i64> {
   match e {
     Expr::Constant(Atom::Num(n)) => Some(n),
-    Expr::Constant(Atom::Variable(i)) => Some(*vars[i]),
+    Expr::Variable(i) => Some(*vars[i]),
     _ => None
   }
 }
@@ -275,13 +286,11 @@ fn get_num_from_expr(e: Expr, vars: &[&i64]) -> Option<i64> {
 /// This function tries to reduce the AST.
 /// This has to return an Expression rather than an Atom because quoted s_expressions
 /// can't be reduced
-pub fn eval_expression(e: &Expr, vars: &[i64]) -> i64 {
+pub fn eval_expression(e: &Expr, vars: &[i64]) -> Option<Atom> {
   match e {
     // Constants and quoted s-expressions are our base-case
-    Expr::Constant(c) /*| Expr::Quote(_)*/ => match c {
-      Atom::Num(n) => *n,
-      Atom::Variable(i) => vars[*i]
-    }
+    Expr::Constant(c) /*| Expr::Quote(_)*/ => Some(c.clone()),
+    Expr::Variable(i) => Some(Atom::Num(vars[*i])),
     // we then recursively `eval_expression` in the context of our special forms
     // and built-in operators
     /*Expr::If(pred, true_branch) => {
@@ -304,19 +313,26 @@ pub fn eval_expression(e: &Expr, vars: &[i64]) -> i64 {
       let reduced_tail = tail
         .into_iter()
         .map(|expr| eval_expression(expr, vars))
-        .collect::<Vec<i64>>();
+        .collect::<Option<Vec<Atom>>>()?;
       match op {
-        BuiltIn::Plus => reduced_tail.iter().sum(),
-        BuiltIn::Times => reduced_tail.iter().product(),
-        BuiltIn::Minus => reduced_tail.iter().skip(1).fold(reduced_tail[0], |a, f| a - f),
-        BuiltIn::Divide => reduced_tail.iter().skip(1).fold(reduced_tail[0], |a, f| a / f),
-        /*BuiltIn::Equal => Atom::Boolean(
+        BuiltIn::Plus | BuiltIn::Times | BuiltIn::Divide | BuiltIn::Minus => {
+          // Check that all the tail expressions are numbers
+          let nums = reduced_tail.iter().map(|a| if let Atom::Num(n) = a { Some(*n) } else { return None }).collect::<Option<Vec<i64>>>()?;
+          match op {
+            BuiltIn::Plus => Some(Atom::Num(nums.iter().sum())),
+            BuiltIn::Times => Some(Atom::Num(nums.iter().product())),
+            BuiltIn::Minus => Some(Atom::Num(nums.iter().skip(1).fold(nums[0], |a, f| a - f))),
+            BuiltIn::Divide => Some(Atom::Num(nums.iter().skip(1).fold(nums[0], |a, f| a / f))),
+            _ => unreachable!(),
+          }
+        },
+        BuiltIn::Equal => Some(Atom::Boolean(
           reduced_tail
             .iter()
             .zip(reduced_tail.iter().skip(1))
             .all(|(a, b)| a == b),
-        ),
-        BuiltIn::Not => {
+        )),
+        /*BuiltIn::Not => {
           if reduced_tail.len() != 1 {
             return None;
           } else {
@@ -338,8 +354,8 @@ pub fn parse_expr_from_str(src: &str) -> Result<Expr, String> {
 }
 /// And we add one more top-level function to tie everything together, letting
 /// us call eval on a string directly
-pub fn eval_from_str(src: &str, vars: &[i64]) -> Result<i64, String> {
+pub fn eval_from_str(src: &str, vars: &[i64]) -> Result<Atom, String> {
   parse_expr(src)
     .map_err(|e: nom::Err<VerboseError<&str>>| format!("{:#?}", e))
-    .and_then(|(_, exp)| Ok(eval_expression(&exp, vars)))
+    .and_then(|(_, exp)| eval_expression(&exp, vars).ok_or("Eval Error".to_string()))
 }
