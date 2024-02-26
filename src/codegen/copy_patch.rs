@@ -17,11 +17,25 @@ pub struct CopyPatchBackend {
     fixup_holes: Vec<usize>,
 }
 
-// TODO: Introduce the concept of "Values" like in LLVM IR
-//       and then either do nothing if the values is in the correct
-//       register or move it there, either from the stack or from a 
-//       different register. This of course requires tracking which
-//       values are in which registers at all times
+// Example of how to generate control flow constructs
+//#[cfg(not(test))]
+/*
+    cg.generate_take_stack(0);
+    cg.generate_rem_const(ConstValue::I64(2));
+    cg.generate_eq_const(ConstValue::I64(0));
+    cg.generate_if_else(|cg: &mut CodeGen| {
+        cg.generate_take_const(ConstValue::I64(123));
+        cg.generate_put_stack(args * 8);
+        cg.generate_get_stackptr(args * 8);
+        cg.generate_call_c_func(get_fn_ptr(hello_world));
+    }, |cg| {
+        cg.generate_take_const(ConstValue::I64(321));
+        cg.generate_put_stack(args * 8);
+        cg.generate_get_stackptr(args * 8);
+        cg.generate_call_c_func(get_fn_ptr(hello_world));
+    });
+}*/
+
 #[allow(dead_code)]
 impl CopyPatchBackend {
     pub fn new(args: usize) -> Self {
@@ -42,11 +56,15 @@ impl CopyPatchBackend {
         let end_ofs = self.code.len();
         let stencil_slice = &mut self.code[start_ofs..end_ofs];
         let hole_lengths = if stencil.large { 8 } else { 4 };
-        for (&ofs, val) in stencil.holes.iter().zip(holes_values.iter()) {
+        for (&(ofs, fun), val) in stencil.holes.iter().zip(holes_values.iter()) {
             if stencil.large {
                 stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&val.to_ne_bytes());
+                if fun {
+                    self.fixup_holes.push(start_ofs + ofs);
+                }
             } else {
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&(*val as u32).to_ne_bytes());
+                let val = if fun { (end_ofs as i32 - (ofs as i32 + 4)) as u32 } else { *val as u32 };
+                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&val.to_ne_bytes());
             }
         }
 
@@ -189,6 +207,111 @@ impl CopyPatchBackend {
         self.copy_and_patch(stencil, holes_values);
     }
 
+    pub fn generate_neq(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Ne, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_neq_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::Ne, Some(n.get_type()));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![n.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_lt(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Lt, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_lt_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::LtConst, Some(n.get_type()));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![n.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_lte(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Lte, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_lte_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::LteConst, Some(n.get_type()));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![n.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_gt(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Gt, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_gt_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::GtConst, Some(n.get_type()));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![n.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_gte(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Gte, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_gte_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::GteConst, Some(n.get_type()));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![n.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_and(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::And, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_and_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::AndConst, Some(n.get_type()));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![n.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_or(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Or, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_or_const(&mut self, n: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::OrConst, Some(n.get_type()));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![n.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_not(&mut self, data_type: DataType) {
+        let s_type = StencilType::new(StencilOperation::Not, Some(data_type));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
     pub fn generate_duplex(&mut self) {
         let s_type = StencilType::new(StencilOperation::Duplex, None);
         let stencil = STENCILS.get(&s_type).unwrap();
@@ -210,7 +333,7 @@ impl CopyPatchBackend {
         self.copy_and_patch(stencil, holes_values);
     }
 
-    // TODO: Long term this should not be in the code generator but only used internally inside
+    // TODO: Long term this should not notbe in the code generator but only used internally inside
     //       the C&P specific code generator to get pointers to stack values
     pub fn generate_get_stackptr(&mut self, offset: usize) {
         let s_type = StencilType::new(StencilOperation::GetStackPtr, None);
@@ -236,13 +359,13 @@ impl CopyPatchBackend {
     pub fn generate_if<THEN: Fn(&mut Self)>(&mut self, then: THEN) {
         let cond_stencil = STENCILS.get(&StencilType::new(StencilOperation::CondBr, None)).unwrap();
         assert_eq!(cond_stencil.get_holes_bytelen(), 4);
-        let then_hole = cond_stencil.holes[0];
+        let then_hole = cond_stencil.holes[0].0;
         if then_hole + 4 >= cond_stencil.code.len() {
             let code_without_jump = cond_stencil.code_without_jump();
             let start_len = self.code.len();
             self.code.extend_from_slice(&code_without_jump);
             then(self);
-            let else_hole_ofs = start_len + cond_stencil.holes[1];
+            let else_hole_ofs = start_len + cond_stencil.holes[1].0;
             let end_ofs = self.code.len();
             let else_hole = &mut self.code[else_hole_ofs..else_hole_ofs + 4];
             else_hole.copy_from_slice(&((end_ofs - (else_hole_ofs + 4)) as u32).to_ne_bytes());
@@ -271,8 +394,8 @@ impl CopyPatchBackend {
     pub fn generate_if_else<THEN: Fn(&mut Self), ELSE: Fn(&mut Self)>(&mut self, then: THEN, else_: ELSE) {
         let cond_stencil = STENCILS.get(&StencilType::new(StencilOperation::CondBr, None)).unwrap();
         assert_eq!(cond_stencil.get_holes_bytelen(), 4);
-        let then_hole = cond_stencil.holes[0];
-        let else_hole = cond_stencil.holes[1];
+        let then_hole = cond_stencil.holes[0].0;
+        let else_hole = cond_stencil.holes[1].0;
         if then_hole + 4 >= cond_stencil.code.len()  {
             let start_len = self.code.len();
             self.code.extend_from_slice(&cond_stencil.code_without_jump());

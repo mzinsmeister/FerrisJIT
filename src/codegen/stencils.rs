@@ -56,12 +56,12 @@ pub enum StencilOperation {
     NeConst,
     Gt,
     GtConst,
-    Ge,
-    GeConst,
+    Gte,
+    GteConst,
     Lt,
     LtConst,
-    Le,
-    LeConst,
+    Lte,
+    LteConst,
 
     // Control flow operations (If my plan works this should be the only one necessary)
     CondBr,
@@ -78,7 +78,9 @@ pub enum StencilOperation {
     Put,
     GetStackPtr,
     Load,
+    LoadOfs,
     Store,
+    StoreOfs,
 
     // This is a special one that is used to wrap a call to a C(/Rust) function
     CallCFunction,
@@ -116,12 +118,12 @@ impl Display for StencilOperation {
             StencilOperation::NeConst => write!(f, "ne-const"),
             StencilOperation::Gt => write!(f, "ugt"),
             StencilOperation::GtConst => write!(f, "ugt-const"),
-            StencilOperation::Ge => write!(f, "uge"),
-            StencilOperation::GeConst => write!(f, "uge-const"),
+            StencilOperation::Gte => write!(f, "ugte"),
+            StencilOperation::GteConst => write!(f, "ugte-const"),
             StencilOperation::Lt => write!(f, "ult"),
             StencilOperation::LtConst => write!(f, "ult-const"),
-            StencilOperation::Le => write!(f, "ule"),
-            StencilOperation::LeConst => write!(f, "ule-const"),
+            StencilOperation::Lte => write!(f, "ulte"),
+            StencilOperation::LteConst => write!(f, "ulte-const"),
             StencilOperation::CondBr => write!(f, "cond-br"),
             StencilOperation::UncondBr => write!(f, "uncond-br"),
             StencilOperation::Take => write!(f, "take"),
@@ -130,7 +132,9 @@ impl Display for StencilOperation {
             StencilOperation::Take1 => write!(f, "take1"),
             StencilOperation::Take2 => write!(f, "take2"),
             StencilOperation::Load => write!(f, "load"),
+            StencilOperation::LoadOfs => write!(f, "load-ofs"),
             StencilOperation::Store => write!(f, "store"),
+            StencilOperation::StoreOfs => write!(f, "store-ofs"),
             StencilOperation::Ret => write!(f, "ret"),
             StencilOperation::Duplex => write!(f, "duplex"),
             StencilOperation::Put => write!(f, "put"),
@@ -170,7 +174,7 @@ impl Display for StencilType {
 pub struct Stencil {
     pub s_type: StencilType,
     pub code: Vec<u8>,
-    pub holes: Vec<usize>,
+    pub holes: Vec<(usize, bool)>,
     pub tail_holes: Vec<usize>,
     pub large: bool
 }
@@ -268,7 +272,7 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> S
     relocs.sort_by(|a, b| a.0.cmp(&b.0));
     tail_holes.sort();
 
-    let holes = relocs.iter().map(|(_, reloc)| reloc.r_offset as usize).collect();
+    let holes = relocs.iter().map(|(n, reloc)| (reloc.r_offset as usize, n.ends_with("F"))).collect();
 
     let mut code = code.unwrap().to_vec();
 
@@ -336,7 +340,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     fn init_fn_placeholder(&self, args: &[BasicMetadataTypeEnum<'ctx>]) -> FunctionValue {
         let void_type = self.context.void_type();
         let fn_type = void_type.fn_type(args, false);
-        let function = self.module.add_function(format!("PH{}", self.ph_counter.get()).as_str(), fn_type, Some(Linkage::External));
+        let function = self.module.add_function(format!("PH{}F", self.ph_counter.get()).as_str(), fn_type, Some(Linkage::External));
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
         self.ph_counter.set(self.ph_counter.get() + 1);
         self.large_ph.set(true);
@@ -605,6 +609,9 @@ impl<'ctx> StencilCodeGen<'ctx> {
     // 1-31 and 2^(5-10). 1024 cases is the most the C99 standard supports so that should be enough.
     // What this stencil would take is the index of the case we want. So we would need to do any
     // necessary calculations before going into this stencil.
+    //
+    // Having extra stencils for one integer comparison and a conditional branch for each of the
+    // 6 comparison operations could maybe speed up the code a bit.
     fn compile_cond(&self) -> Stencil {
         let s_type: StencilType = StencilType::new(StencilOperation::CondBr, None);
         self.module.set_name(&format!("{}", s_type));
@@ -673,10 +680,22 @@ impl<'ctx> StencilCodeGen<'ctx> {
     }
 
     fn compile_load(&self, d_type: DataType) -> Stencil {
-        let s_type = StencilType::new(StencilOperation::Take, Some(d_type.clone()));
+        let s_type = StencilType::new(StencilOperation::Load, Some(d_type.clone()));
         let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
         self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, stackptr| {
             let valueptr = args[0].into_pointer_value();
+            let x = self.builder.build_load(d_type.get_llvm_type(self.context), valueptr, "x").unwrap();
+            vec![x.into()]
+        })
+    }
+
+    fn compile_load_ofs(&self, d_type: DataType) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Take, Some(d_type.clone()));
+        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, stackptr| {
+            let offset = self.init_placeholder(self.context.i32_type());
+            let base_valueptr = args[0].into_pointer_value();
+            let valueptr = unsafe { self.builder.build_gep(self.context.i8_type(), base_valueptr, &[offset], "valueptr").unwrap() };
             let x = self.builder.build_load(d_type.get_llvm_type(self.context), valueptr, "x").unwrap();
             vec![x.into()]
         })
@@ -688,6 +707,19 @@ impl<'ctx> StencilCodeGen<'ctx> {
         self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, stackptr| {
             let x = args[0];
             let valueptr = args[1].into_pointer_value();
+            self.builder.build_store(valueptr, x).unwrap();
+            vec![x, valueptr.into()]
+        })
+    }
+
+    fn compile_store_ofs(&self, d_type: DataType) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::StoreOfs, Some(d_type.clone()));
+        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, stackptr| {
+            let x = args[0];
+            let offset = self.init_placeholder(self.context.i32_type());
+            let base_valueptr = args[1].into_pointer_value();
+            let valueptr = unsafe { self.builder.build_gep(self.context.i8_type(), base_valueptr, &[offset], "valueptr").unwrap() };
             self.builder.build_store(valueptr, x).unwrap();
             vec![x, valueptr.into()]
         })
@@ -721,16 +753,6 @@ impl<'ctx> StencilCodeGen<'ctx> {
             let x = args[0].into_int_value();
             let y = self.init_placeholder(op_type);
             let res = perform_op(&self.builder, s_type.data_type.clone().unwrap(), x, y);
-            vec![res.into()]
-        })
-    }
-
-    fn compile_not(&self) -> Stencil {
-        let _types = &[DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64];
-        let s_type = StencilType::new(StencilOperation::Not, Some(DataType::Bool));
-        self.compile_stencil(s_type, &[self.context.bool_type().into()], |args, _| {
-            let x = args[0].into_int_value();
-            let res = self.builder.build_not(x, "not").unwrap();
             vec![res.into()]
         })
     }
@@ -878,9 +900,9 @@ fn compile_all_int_op() -> BTreeMap<StencilType, Stencil> {
         (StencilOperation::Eq, StencilOperation::EqConst, int_eq), 
         (StencilOperation::Ne, StencilOperation::NeConst, int_ne), 
         (StencilOperation::Gt, StencilOperation::GtConst, int_gt), 
-        (StencilOperation::Ge, StencilOperation::GeConst, int_ge), 
+        (StencilOperation::Gte, StencilOperation::GteConst, int_ge), 
         (StencilOperation::Lt, StencilOperation::LtConst, int_lt), 
-        (StencilOperation::Le, StencilOperation::LeConst, int_le), 
+        (StencilOperation::Lte, StencilOperation::LteConst, int_le), 
     ];
     let types = vec![DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
 

@@ -249,6 +249,22 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_codegen_5() {
+        let expr_str = "(- (/ $0 2) (* -2 $0))";
+        let expr = parse_expr_from_str(expr_str).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
+        for i in [0, 1, 5, 10, 100, 1000].iter() {
+            let result = code.call::<i64>(&[*i]);
+            let interp_result = eval_expression(&expr, &[*i]).unwrap();
+            if let Atom::Num(n) = interp_result {
+                assert_eq!(result, n);
+            } else {
+                panic!("Datatype missmatch");
+            }
+        }
+    }
+
     const VERY_COMPLEX_EXPR_1: &str = include_str!("complex_expr.txt");
 
     #[test]

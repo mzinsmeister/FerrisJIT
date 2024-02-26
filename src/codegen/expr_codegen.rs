@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::expr::{Atom, BuiltIn, Expr};
 
-use super::{ir::{ConstValue, DataType}, BoolRef, CGValueRef, CodeGen, GeneratedCode, I64Ref};
+use super::{ir::{ConstValue, DataType}, BoolRef, CGEq, CGValueRef, CodeGen, GeneratedCode, I64Ref};
 
 fn fold_op(fun: &BuiltIn, l: Atom, r: Atom) -> Option<Atom> {
     match (fun, l, r) {
@@ -173,33 +173,31 @@ fn generate_atom<'cg>(cg: &'cg CodeGen, atom: &Atom) -> CGValueRef<'cg> {
     }
 }
 
-fn generate_int_op<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, left: I64Ref<'cg>, right: I64Ref<'cg>) -> I64Ref<'cg> {
+fn generate_int_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: I64Ref<'cg>, right: I64Ref<'cg>) -> CGValueRef<'cg> {
     match fun {
         BuiltIn::Plus => {
-            left + &right
+            (left + &right).into()
         },
-        _ => todo!("For the moment only adds")
-        /*BuiltIn::Times => {
-            cp.generate_mul(data_type);
+        BuiltIn::Times => {
+            (left * &right).into()
         },
         BuiltIn::Minus => {
-            cp.generate_sub(data_type);
+            (left - &right).into()
         },
         BuiltIn::Divide => {
-            cp.generate_div(data_type);
+            (left / &right).into()
         },
         BuiltIn::Equal => {
-            cp.generate_eq(data_type);
-        }*/
+            left.cg_eq(&right).into()
+        }
     }
 }
 
-fn generate_bool_op<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, left: BoolRef<'cg>, right: BoolRef<'cg>) -> BoolRef<'cg> {
+fn generate_bool_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: BoolRef<'cg>, right: BoolRef<'cg>) -> BoolRef<'cg> {
     match fun {
-        /*
         BuiltIn::Equal => {
-            left + &right
-        }*/
+            left.cg_eq(&right)
+        }
         _ => todo!("For the moment no bools")
     }
 }

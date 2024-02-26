@@ -4,19 +4,18 @@ pub mod ir;
 mod disassemble;
 mod copy_patch;
 mod expr_codegen;
+mod generated_code;
 
 
 use std::{cell::RefCell, hint::black_box, ops::Deref, ptr};
 use libc::c_void;
-use stencils::Stencil;
 
 use crate::codegen::{copy_patch::STENCILS, ir::DataType};
 
 use self::{copy_patch::CopyPatchBackend, ir::ConstValue};
 
 pub use expr_codegen::{get_type, generate_code, CodeGenError};
-
-
+pub use generated_code::GeneratedCode;
 
 // This is a simple example of how we can generate code that calls back into pre-compiled
 // functions using copy-and-patch
@@ -36,116 +35,6 @@ pub(crate) fn init_stencils() {
     println!("Stencil initialization: {:?}", compile_elapsed);
 }
 
-// TODO: Once we go beyond basic arithmetic expressions we should have our own IR
-//       We should also have a way to represent/address values so that we can insert
-//       put/take instructions automatically and so that we can also map the same logic to LLVM IR
-
-pub struct GeneratedCode {
-    pub stack: *mut u8,
-    pub code: *const c_void,
-    pub code_len: usize,
-    pub ghcc_code: *const c_void,
-}
-
-impl GeneratedCode {
-
-    pub fn new(stack_size: usize, wrapper_stencil: &Stencil, code: &[u8]) -> Self {
-
-        // mmap a memory region with read and execute permissions
-        let mmap = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                code.len(),
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-
-        let mut ghcc_code = wrapper_stencil.code.clone();
-
-        let holes_values = vec![(mmap as u64).to_ne_bytes()];
-        for (&ofs, val) in wrapper_stencil.holes.iter().zip(holes_values.iter()) {
-            ghcc_code[ofs..ofs + 8].copy_from_slice(val);
-        }
-
-        let ghcc_fun = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                ghcc_code.len(),
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-
-        // Allocate stack space for our generated code
-        // TODO: We could (and maybe should) also use the actual stack for this
-        let stack_space = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                stack_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            ) as *mut u8
-        };
-    
-        unsafe {
-            std::ptr::copy_nonoverlapping(ghcc_code.as_ptr(), ghcc_fun as *mut u8, ghcc_code.len());
-        }
-    
-        // copy the code to the memory region
-        unsafe {
-            std::ptr::copy_nonoverlapping(code.as_ptr(), mmap as *mut u8, code.len());
-        }
-
-        Self {
-            stack: stack_space,
-            code: mmap,
-            code_len: code.len(),
-            ghcc_code: ghcc_fun,
-        }
-    }
-    
-    pub fn call<T: Sized>(&self, args: &[i64]) -> T {
-            // cast the memory region to a function pointer
-        let f: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(self.ghcc_code) };
-
-        // Copy args to the stack
-        for (i, item) in args.iter().enumerate() {
-            unsafe {
-                std::ptr::write_unaligned((self.stack as *mut i64).offset(i as isize), *item);
-            }
-        }
-
-        // call the function with the stack pointer in RAX
-        // This should work, however it requires inline asm and it requires us to use 
-        // a "root stencil" that unpacks all of our arguments from our custom stack into
-        // the registers that the other stencils expect but that is only done once per 
-        // call so it should be fine
-        f(self.stack);
-        // get the result from the stack;
-
-        unsafe {
-            let value = std::ptr::read_unaligned(self.stack as *const u64);
-            std::mem::transmute_copy(&value)
-        }
-    }
-}
-
-impl Drop for GeneratedCode {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.code as *mut libc::c_void, 0x1000);
-            libc::munmap(self.ghcc_code as *mut libc::c_void, 0x1000);
-            libc::munmap(self.stack as *mut libc::c_void, 0x1000);
-        }
-    }
-}
 
 fn get_fn_ptr(f: unsafe extern "C" fn(*mut u8) -> *mut u8) -> *const c_void {
     f as *const c_void
@@ -158,6 +47,8 @@ fn get_fn_ptr(f: unsafe extern "C" fn(*mut u8) -> *mut u8) -> *const c_void {
 // representing values here which will then allow us to do all the
 // register/stack moving automatically while still beeing efficient
 // and reusing values in registers as much as possible.
+// Somewhat similar to the "Tidy Tuples" framework
+// (https://db.in.tum.de/~kersten/Tidy%20Tuples%20and%20Flying%20Start%20Fast%20Compilation%20and%20Fast%20Execution%20of%20Relational%20Queries%20in%20Umbra.pdf?lang=de)
 
 #[derive(Debug, Clone)]
 enum CGValue {
@@ -216,8 +107,89 @@ impl<'cg> std::fmt::Debug for CGValueRef<'cg> {
     }
 }
 
+trait CGEq<'o> {
+    fn cg_eq(self, other: &Self) -> BoolRef<'o>;
+
+    fn cg_neq(self, other: &Self) -> BoolRef<'o>;
+}
+
+trait CGCmp<'o> {
+    fn lt(self, other: &Self) -> BoolRef<'o>;
+
+    fn lte(self, other: &Self) -> BoolRef<'o>;
+
+    fn gt(self, other: &Self) -> BoolRef<'o>;
+
+    fn gte(self, other: &Self) -> BoolRef<'o>;
+}
+
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
 struct I64Ref<'cg> (CGValueRef<'cg>);
+
+impl<'cg> CGEq<'cg> for I64Ref<'cg> {
+    fn cg_eq(self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let cgvref = cg.eq(&self.0, &other.0);
+        if cgvref == self.0.i {
+            BoolRef(self.0)
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+
+    fn cg_neq(self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let cgvref = cg.neq(&self.0, &other.0);
+        if cgvref == self.0.i {
+            BoolRef(self.0)
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+}
+
+impl<'cg> CGCmp<'cg> for I64Ref<'cg> {
+    fn lt(self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let cgvref = cg.lt(&self.0, &other.0);
+        if cgvref == self.0.i {
+            BoolRef(self.0)
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+
+    fn lte(self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let cgvref = cg.lte(&self.0, &other.0);
+        if cgvref == self.0.i {
+            BoolRef(self.0)
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+
+    fn gt(self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let cgvref = cg.gt(&self.0, &other.0);
+        if cgvref == self.0.i {
+            BoolRef(self.0)
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+
+    fn gte(self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let cgvref = cg.gte(&self.0, &other.0);
+        if cgvref == self.0.i {
+            BoolRef(self.0)
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+
+}
 
 impl<'cg> Into<CGValueRef<'cg>> for I64Ref<'cg> {
     fn into(self) -> CGValueRef<'cg> {
@@ -239,16 +211,6 @@ impl<'cg> From<CGValueRef<'cg>> for I64Ref<'cg> {
     }
 }
 
-impl<'cg> std::ops::Add for &I64Ref<'cg> {
-    type Output = I64Ref<'cg>;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        let cg = self.0.cg;
-        let clone = I64Ref(cg.clone_value(&self.0));
-        clone + rhs
-    }
-}
-
 // this actually takes ownership of the value which means we can overwrite it
 impl<'cg> std::ops::Add<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
@@ -264,7 +226,8 @@ impl<'cg> std::ops::Add<&Self> for I64Ref<'cg> {
     }
 }
 
-impl<'cg> std::ops::AddAssign<&Self> for I64Ref<'cg> {
+// TODO: Think about what to do with the assign traits. Could probably work like this:
+/*impl<'cg> std::ops::AddAssign<&Self> for I64Ref<'cg> {
     fn add_assign(&mut self, rhs: &Self) {
         let cg = self.0.cg;
         let cgvref = cg.add(&self.0, &rhs.0);
@@ -272,11 +235,90 @@ impl<'cg> std::ops::AddAssign<&Self> for I64Ref<'cg> {
             self.0 = CGValueRef::new(cgvref, cg, self.0.data_type.clone());
         }
     }
+}*/
+
+impl<'cg> std::ops::Mul<&Self> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn mul(self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        let cgvref = cg.mul(&self.0, &rhs.0);
+        if cgvref == self.0.i {
+            self
+        } else {
+            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
+        }
+    }
 }
+
+impl<'cg> std::ops::Sub<&Self> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn sub(self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        let cgvref = cg.sub(&self.0, &rhs.0);
+        if cgvref == self.0.i {
+            self
+        } else {
+            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
+        }
+    }
+}
+
+impl<'cg> std::ops::Div<&Self> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn div(self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        let cgvref = cg.div(&self.0, &rhs.0);
+        if cgvref == self.0.i {
+            self
+        } else {
+            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
+        }
+    }
+}
+
+impl<'cg> std::ops::Rem<&Self> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn rem(self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        let cgvref = cg.rem(&self.0, &rhs.0);
+        if cgvref == self.0.i {
+            self
+        } else {
+            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
+        }
+    }
+}
+
 
 
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
 struct BoolRef<'cg> (CGValueRef<'cg>);
+
+impl<'cg> CGEq<'cg> for BoolRef<'cg> {
+    fn cg_eq(self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let cgvref = cg.eq(&self.0, &other.0);
+        if cgvref == self.0.i {
+            BoolRef(self.0)
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+
+    fn cg_neq(self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let cgvref = cg.neq(&self.0, &other.0);
+        if cgvref == self.0.i {
+            BoolRef(self.0)
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+}
 
 impl<'cg> Into<CGValueRef<'cg>> for BoolRef<'cg> {
     fn into(self) -> CGValueRef<'cg> {
@@ -339,20 +381,88 @@ impl CodeGen {
         CGValueRef::new(i, self, v.data_type.clone())
     }
 
-    fn add(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.add(l.i, r.i)
-    }
-
     #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.inner.borrow_mut().reset();
     }
 
+    //--------------------------------------------------------------------------------
+    // Arithmetic operations
+    
+    fn add(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.add(l.i, r.i)
+    }
+
+    fn sub(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.sub(l.i, r.i)
+    }
+
+    fn mul(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.mul(l.i, r.i)
+    }
+
+    fn div(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.div(l.i, r.i)
+    }
+
+    fn rem(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.rem(l.i, r.i)
+    }
+
+    fn eq(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.eq(l.i, r.i)
+    }
+
+    fn neq(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.neq(l.i, r.i)
+    }
+
+    fn lt(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.lt(l.i, r.i)
+    }
+
+    fn lte(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.lte(l.i, r.i)
+    }
+
+    fn gt(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.gt(l.i, r.i)
+    }
+
+    fn gte(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.gte(l.i, r.i)
+    }
+
+    fn and(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.and(l.i, r.i)
+    }
+
+    fn or(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
+        let cg = &mut self.inner.borrow_mut();
+        cg.or(l.i, r.i)
+    }
+    
+    //--------------------------------------------------------------------------------
+    // Other operations
+
     pub fn generate_return<'a, D: Deref<Target = CGValueRef<'a>>>(&self, return_value: D) {
         let cg = &mut self.inner.borrow_mut();
         cg.generate_return(return_value.i);
     }
+
+    //--------------------------------------------------------------------------------
 
     // Takes Ownership of the return value and resets all registers
     // TODO: References will be invalid after this. We cannot enforce 
@@ -377,7 +487,7 @@ impl CodeGen {
 // The same is true for readonly values. We also manage free slots (as soon as the reference to a value)
 // is droppped, it is actually freed through RAII (Drop trait).
 //
-// Operations have to make sure to call the dirty_reg1/2 (only dirty_reg1 is implemented for now)
+// Operations have to make sure to call the dirty_reg0/2 (only dirty_reg0 is implemented for now)
 // function whenever they change the value in a register. This function will then make sure that
 // the value is marked dirty and spilled to the stack if necessary. We load values into registers
 // lazily. Just because you create a constant, that doesn't mean there will be any code generated
@@ -445,21 +555,21 @@ impl CodeGenInner {
                     CGValue::Constant(_) => {
                         panic!("We should have allocated a stack slot before dirtying a const value");
                     },
-                    CGValue::Free(_) => {},
+                    CGValue::Free(_) => { /* User doesn't need this anymore so we can just throw it away without writing it back */},
                 }
             }
         }
         false
     }
 
-    fn put_in_reg1(&mut self, v: usize) {
+    fn put_in_reg0(&mut self, v: usize) {
         if self.free_reg(0, v) {
             return;
         }
 
         // Lookup which value is currently in the first register
-        let reg2_state = self.reg_state[1].clone();
-        if let Some((i, _)) = reg2_state {
+        let reg1_state = self.reg_state[1].clone();
+        if let Some((i, _)) = reg1_state {
             if i == v {
                 todo!("Also support moving from second to first register")
             }
@@ -479,12 +589,12 @@ impl CodeGenInner {
         self.reg_state[0] = Some((v, false));
     }
     
-    fn put_in_reg2(&mut self, v: usize) {
+    fn put_in_reg1(&mut self, v: usize) {
         self.free_reg(1, v);
 
         // Is our value in the first register? if so we can just swap the registers
-        let reg1_state = self.reg_state[0].clone();
-        if let Some((i, dirty)) = reg1_state {
+        let reg0_state = self.reg_state[0].clone();
+        if let Some((i, dirty)) = reg0_state {
             if i == v {
                 if dirty {
                     todo!("Handle this case"); // should currently not happen
@@ -509,7 +619,7 @@ impl CodeGenInner {
         self.reg_state[1] = Some((v, false));
     }
 
-    fn dirty_reg1(&mut self) -> Option<usize> {
+    fn dirty_reg0(&mut self) -> Option<usize> {
         let reg_state = self.reg_state[0].clone();
         let reg_state2 = self.reg_state[1].clone();
         // If we have the same value in the second register, we must set it to free
@@ -545,11 +655,28 @@ impl CodeGenInner {
     }
 
     #[allow(dead_code)]
-    fn dirty_reg2(&mut self) -> Option<usize> {
-        // This case is non-trivial because we also have to handle the case where value is already in reg1 and is dirty
+    fn dirty_reg1(&mut self) -> Option<usize> {
+        // This case is non-trivial because we also have to handle the case where value is already in reg0 and is dirty
         // In this case we could have two diverging states for the same value
         // Maybe this can't even happen as long as we keep the "one reference per mutable value" invariant
         todo!("Implement dirtying of second register")
+    }
+
+    fn lose_reg(&mut self, reg: usize) -> Option<()> {
+        if let Some((i, dirty)) = &mut self.reg_state[reg] {
+            let dirty = if *dirty {
+                // We lost a dirty value, this should not happen unless we throw away the value anyway
+                // We return true here because it was dirty but don't panic yet as the caller has
+                // to decide whether this is acceptable or not.
+                None
+            } else {
+                Some(())
+            };
+            self.reg_state[reg] = None;
+            dirty
+        } else {
+            Some(())
+        }
     }
 
     fn allocate_stack(&mut self, data_type: DataType) -> usize {
@@ -592,7 +719,7 @@ impl CodeGenInner {
                         *i = self.values.len();
                     }
                 } else {
-                    self.put_in_reg1(v);
+                    self.put_in_reg0(v);
                     self.reg_state[0].unwrap().0 = self.values.len();
                 }
                 self.allocate_stack(data_type)
@@ -626,30 +753,132 @@ impl CodeGenInner {
         }
     }
 
-    // Move/Borrow semantics actually have a meaning here
-    // If a value is moved it means that we can overwrite it
-    // We specifically don't do SSA here.
-    fn add(&mut self, l: usize, r: usize) -> usize {
+    //--------------------------------------------------------------------------------
+    // Arithmetic operations
+
+    fn gen_arith(&mut self, gen_op: fn(&mut CopyPatchBackend, DataType), gen_op_const: fn(&mut CopyPatchBackend, ConstValue), l: usize, r: usize) -> usize {
         let vr = self.values[r].clone();
-        self.put_in_reg1(l);
+        self.put_in_reg0(l);
         match vr {
             CGValue::Variable{data_type,..} => {
-                self.put_in_reg2(r);
-                self.inner.generate_add(data_type);
+                self.put_in_reg1(r);
+                gen_op(&mut self.inner, data_type);
             },
             CGValue::Constant(c) => {
-                self.inner.generate_add_const(c);
+                gen_op_const(&mut self.inner, c);
             },
             CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
-        self.dirty_reg1().unwrap()
+        self.lose_reg(1);
+        self.dirty_reg0().unwrap()
     }
 
+    fn add(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_add, 
+            CopyPatchBackend::generate_add_const,
+             l, r)
+    }
+
+    fn sub(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_sub, 
+            CopyPatchBackend::generate_sub_const,
+             l, r)
+    }
+
+    fn mul(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_mul, 
+            CopyPatchBackend::generate_mul_const,
+             l, r)
+    }
+
+    fn div(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_div, 
+            CopyPatchBackend::generate_div_const,
+             l, r)
+    }
+
+    fn rem(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_rem, 
+            CopyPatchBackend::generate_rem_const,
+             l, r)
+    }
+
+    fn eq(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_eq, 
+            CopyPatchBackend::generate_eq_const,
+             l, r)
+    }
+
+    fn neq(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_neq, 
+            CopyPatchBackend::generate_neq_const,
+             l, r)
+    }
+
+    fn lt(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_lt, 
+            CopyPatchBackend::generate_lt_const,
+             l, r)
+    }
+
+    fn lte(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_lte, 
+            CopyPatchBackend::generate_lte_const,
+             l, r)
+    }
+
+    fn gt(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_gt, 
+            CopyPatchBackend::generate_gt_const,
+             l, r)
+    }
+
+    fn gte(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_gte, 
+            CopyPatchBackend::generate_gte_const,
+             l, r)
+    }
+
+    fn and(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_and, 
+            CopyPatchBackend::generate_and_const,
+             l, r)
+    }
+
+    fn or(&mut self, l: usize, r: usize) -> usize {
+        self.gen_arith(
+            CopyPatchBackend::generate_or, 
+            CopyPatchBackend::generate_or_const,
+             l, r)
+    }
+
+    //--------------------------------------------------------------------------------
+    // Other operations
+
     fn generate_return(&mut self, return_value: usize) {
-        self.put_in_reg1(return_value);
+        self.put_in_reg0(return_value);
         self.inner.generate_put_stack(0);
         self.inner.generate_ret();
     }
+
+    //--------------------------------------------------------------------------------
+    // Control flow
+
+   // fn generate_if<
+
+    //--------------------------------------------------------------------------------
 
     fn generate_code(&self) -> GeneratedCode {
         self.inner.generate_code(self.stack_size)
