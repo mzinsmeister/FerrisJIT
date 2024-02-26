@@ -152,13 +152,12 @@ fn get_fn_ptr(f: unsafe extern "C" fn(*mut u8) -> *mut u8) -> *const c_void {
 }
 
 
-
 // We try to write a nice rustic API here that is easy to use
 // and takes advantage of the borrow checker to make sure that
 // we don't do stupid shit. Therefore we will introduce wrappers
 // representing values here which will then allow us to do all the
 // register/stack moving automatically while still beeing efficient
-// and reusing values in registers as much as possible
+// and reusing values in registers as much as possible.
 
 #[derive(Debug, Clone)]
 enum CGValue {
@@ -363,6 +362,27 @@ impl CodeGen {
     }
 
 }
+
+
+
+// How this works is that we have "values" which are roughly equivalent to 
+// variables in a high level language. Note that we don't do SSA here. I
+// don't think it's really beneficial for Copy and patch as it would probably
+// make it harder to detect whether we can reuse a value in a register or not
+// However keep the invariant that all mutable values (which for now are all
+// values except for the arguments) are only referenced exactly once. The borrow checker
+// helps us with this. We also keep the state of our registers, most notably what values
+// are currently in them and whether they are dirty or not. Even Constants can be in registers
+// however once they become dirty we change their type to variable and allocate stack space for them.
+// The same is true for readonly values. We also manage free slots (as soon as the reference to a value)
+// is droppped, it is actually freed through RAII (Drop trait).
+//
+// Operations have to make sure to call the dirty_reg1/2 (only dirty_reg1 is implemented for now)
+// function whenever they change the value in a register. This function will then make sure that
+// the value is marked dirty and spilled to the stack if necessary. We load values into registers
+// lazily. Just because you create a constant, that doesn't mean there will be any code generated
+// for it. We only load it into a register when we actually need it. We also try to move between
+// registers and stack as little as possible. 
 
 /// Convenience layer around copy and patch compilation backend
 /// so that you don't have to think about registers anymore
