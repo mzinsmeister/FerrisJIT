@@ -71,7 +71,8 @@ pub enum StencilOperation {
     Take,
     Take1,
     Take2,
-    TakeConst,
+    Take1Const,
+    Take2Const,
     Ret,
     Duplex,
     Put,
@@ -124,7 +125,8 @@ impl Display for StencilOperation {
             StencilOperation::CondBr => write!(f, "cond-br"),
             StencilOperation::UncondBr => write!(f, "uncond-br"),
             StencilOperation::Take => write!(f, "take"),
-            StencilOperation::TakeConst => write!(f, "take-const"),
+            StencilOperation::Take1Const => write!(f, "take1-const"),
+            StencilOperation::Take2Const => write!(f, "take2-const"),
             StencilOperation::Take1 => write!(f, "take1"),
             StencilOperation::Take2 => write!(f, "take2"),
             StencilOperation::Load => write!(f, "load"),
@@ -548,15 +550,32 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
-    fn compile_take_const(&self, data_type: DataType) -> Stencil {
-        let s_type = StencilType::new(StencilOperation::TakeConst, Some(data_type.clone()));
-        self.compile_stencil(s_type.clone(), &[], |_, _| {
+    fn compile_take_1_const(&self, data_type: DataType) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Take1Const, Some(data_type.clone()));
+        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type.clone(), &[uint8_ptr.into(), uint8_ptr.into()], |args, _| {
             let same_width_int = data_type.get_same_width_uint().get_llvm_type(self.context).into_int_type();
             let x = self.init_placeholder(same_width_int);
+            let y = args[1].into_pointer_value();
             if data_type.is_float() {
-                vec![self.builder.build_bitcast(x, data_type.get_llvm_type(self.context), "cast").unwrap().into()]
+                vec![self.builder.build_bitcast(x, data_type.get_llvm_type(self.context), "cast").unwrap().into(), y.into()]
             } else {
-                vec![x.into()]
+                vec![x.into(), y.into()]
+            }
+        })
+    }
+
+    fn compile_take_2_const(&self, data_type: DataType) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Take1Const, Some(data_type.clone()));
+        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type.clone(), &[uint8_ptr.into(), uint8_ptr.into()], |args, _| {
+            let same_width_int = data_type.get_same_width_uint().get_llvm_type(self.context).into_int_type();
+            let x = args[0].into_pointer_value();
+            let y = self.init_placeholder(same_width_int);
+            if data_type.is_float() {
+                vec![x.into(), self.builder.build_bitcast(y, data_type.get_llvm_type(self.context), "cast").unwrap().into()]
+            } else {
+                vec![x.into(), y.into()]
             }
         })
     }
@@ -899,11 +918,16 @@ fn compile_all_take_const(stencil_lib: &mut BTreeMap<StencilType, Stencil>) {
     let context = Context::create();
     let mut result = BTreeMap::new();
     let types = &[DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::F32, DataType::F64];
-    let op = StencilOperation::TakeConst;
+    let op = StencilOperation::Take1Const;
+    let op2 = StencilOperation::Take2Const;
     for ty in types {
         let s_type = StencilType::new(op, Some(ty.clone()));
         let codegen = StencilCodeGen::new(&context);
-        let stencil = codegen.compile_take_const(s_type.clone().data_type.unwrap());
+        let stencil = codegen.compile_take_1_const(s_type.clone().data_type.unwrap());
+        result.insert(s_type.clone(), stencil);
+        let s_type = StencilType::new(op2, Some(ty.clone()));
+        let codegen = StencilCodeGen::new(&context);
+        let stencil = codegen.compile_take_2_const(s_type.clone().data_type.unwrap());
         result.insert(s_type.clone(), stencil);
     }
     // insert the unsigned stencils again for signed types

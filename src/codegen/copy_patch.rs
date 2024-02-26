@@ -31,6 +31,11 @@ impl CopyPatchBackend {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.code.clear();
+        self.fixup_holes.clear();
+    }   
+
     fn copy_and_patch(&mut self, stencil: &Stencil, holes_values: Vec<u64>) {
         let start_ofs = self.code.len();
         self.code.extend_from_slice(&stencil.code);
@@ -86,8 +91,15 @@ impl CopyPatchBackend {
         self.copy_and_patch(stencil, holes_values);
     }
 
-    pub fn generate_take_const(&mut self, ir_const: ConstValue) {
-        let s_type = StencilType::new(StencilOperation::TakeConst, Some(ir_const.get_type()));
+    pub fn generate_take_1_const(&mut self, ir_const: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::Take1Const, Some(ir_const.get_type()));
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![ir_const.bitcast_to_u64()];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_take_2_const(&mut self, ir_const: ConstValue) {
+        let s_type = StencilType::new(StencilOperation::Take2Const, Some(ir_const.get_type()));
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![ir_const.bitcast_to_u64()];
         self.copy_and_patch(stencil, holes_values);
@@ -289,11 +301,11 @@ impl CopyPatchBackend {
         });
     }
 
-    pub fn generate_code<T>(&self, stack_size: usize) -> GeneratedCode<T> {
+    pub fn generate_code(&self, stack_size: usize) -> GeneratedCode {
     
         let ghc_stencil = STENCILS.get(&StencilType::new(StencilOperation::GhcWrapper, None)).unwrap();
     
-        let gc = GeneratedCode::<T>::new(stack_size, ghc_stencil, &self.code);
+        let gc = GeneratedCode::new(stack_size, ghc_stencil, &self.code);
     
         // Fix up the holes that need an absolute address
         // TODO: Find a nicer solution for this

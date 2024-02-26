@@ -11,7 +11,7 @@ use clap::Parser;
 use csv::Reader;
 use rustyline::{error::ReadlineError, history::MemHistory, Config, Editor};
 
-use crate::{codegen::ir::DataType, expr::eval_expression};
+use crate::{codegen::{get_type, ir::DataType}, expr::eval_expression};
 
 /// Search for a pattern in a file and display the lines that contain it.
 #[derive(Parser)]
@@ -26,19 +26,25 @@ struct Cli {
 
 fn eval<T: Display>(expr: &expr::Expr, test_data: &[Vec<i64>], benchmark: bool) {
     let codegen_start = std::time::Instant::now();
-    let code = generate_code::<T>(&expr, test_data[0].len());
+    let code = generate_code(&expr, test_data[0].len());
     let codegen_elapsed = codegen_start.elapsed();
     match code {
         Ok(code) => {
             println!("Generated {} bytes of x86-64 binary in {:?}", code.code_len, codegen_elapsed);
             if benchmark {
-                let start_time = std::time::Instant::now();
-                for line in test_data.iter() {
-                    code.call(line);
-                }
-                
-                let elapsed = start_time.elapsed();
-
+                let elapsed = if get_type(&expr) == DataType::I64 {
+                    let start_time = std::time::Instant::now();
+                    for line in test_data.iter() {
+                        code.call::<i64>(line);
+                    }
+                    start_time.elapsed()
+                } else {
+                    let start_time = std::time::Instant::now();
+                    for line in test_data.iter() {
+                        code.call::<bool>(line);
+                    }
+                    start_time.elapsed()
+                };
                 
                 let start_interp = std::time::Instant::now();
 
@@ -65,8 +71,13 @@ fn eval<T: Display>(expr: &expr::Expr, test_data: &[Vec<i64>], benchmark: bool) 
 
             } else {
                 for line in test_data.iter() {
-                    let result = code.call(line);
-                    println!("Result: {}", result);
+                    if get_type(&expr) == DataType::Bool {
+                        let result = code.call::<bool>(line);
+                        println!("Result: {}", result);
+                    } else {
+                        let result = code.call::<i64>(line);
+                        println!("Result: {}", result);
+                    }
                 }
             }
         },
@@ -176,9 +187,9 @@ mod test {
     fn test_codegen_1() {
         let expr_str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code::<i64>(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
-            let result = code.call(&[*i]);
+            let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
             if let Atom::Num(n) = interp_result {
                 assert_eq!(result, n);
@@ -192,9 +203,9 @@ mod test {
     fn test_codegen_2() {
         let expr_str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code::<i64>(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
-            let result = code.call(&[*i]);
+            let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
             if let Atom::Num(n) = interp_result {
                 assert_eq!(result, n);
@@ -209,9 +220,9 @@ mod test {
         let expr_str = "(+ (+ $0 $0) (* (/ $0 2) (- (* 9 4) $0)))";
 
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code::<i64>(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
-            let result = code.call(&[*i]);
+            let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
             if let Atom::Num(n) = interp_result {
                 assert_eq!(result, n);
@@ -226,9 +237,9 @@ mod test {
     fn test_codegen_4() {
         let expr_str = "(= (= $0 5) (= (- (+ $0 $0) (* -2 $0)) 20)))";
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code::<bool>(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
-            let result = code.call(&[*i]);
+            let result = code.call::<bool>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
             if let Atom::Boolean(n) = interp_result {
                 assert_eq!(result, n);
@@ -243,9 +254,9 @@ mod test {
     #[test]
     fn test_codegen_very_complex_1() {
         let expr = parse_expr_from_str(VERY_COMPLEX_EXPR_1).unwrap();
-        let code = generate_code::<i64>(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1).unwrap();
         for i in [0, 1, 5].iter() {
-            let result = code.call(&[*i]);
+            let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
             if let Atom::Num(n) = interp_result {
                 assert_eq!(result, n);
