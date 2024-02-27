@@ -133,7 +133,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     codegen::init_stencils();
 
     // REPL for evaluating expressions on the data
-
     let mut rl = Editor::<(), MemHistory>::with_history(Config::default(), MemHistory::new())?;
 
 
@@ -142,6 +141,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         match readline {
             Ok(line) => {
                 rl.add_history_entry(line.as_str()).unwrap();
+                let parse_start = std::time::Instant::now();
                 let expr = parse_expr_from_str(&line);
                 let expr = match expr {
                     Ok(expr) => expr,
@@ -149,7 +149,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         println!("Parse-Error: {}", e);
                         continue;
                     }
-                };     
+                };
+                let parse_elapsed = parse_start.elapsed();
+                println!("Parsed in {:?}", parse_elapsed);
                 let result_type = codegen::get_type(&expr);
 
                 match result_type {

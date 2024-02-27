@@ -99,7 +99,7 @@ Compiled is 317.25x faster
 ```
 
 When i still moved stuff from/to stack and from/to registers by hand instead of using my new CodeGen abstraction, codegen/compilation was ~5x faster but i think less than a milisecond for this expression is good enough. Most database queries will be quite a lot less code than this. I think once you have more complex
-structures in your code you really want the abstraction though. The code produced should be roughly the same quality as the one with hand written stack movements. Besides the fact that execution time is roughly the same, the code size is also slightly less (22297 bytes vs 22771 in the example above).
+structures in your code you really want the abstraction though. The code produced should be roughly the same quality as the one with hand written stack movements. Besides the fact that execution time is roughly the same, the code size is also slightly less (22297 bytes vs 22771 in the example above). Also note that once we get into the millisecond range for codegen (gen_expr.py with 1,000+ complexity) we usually spend more than 50% (for 10,000+ complexity more like 80%+) of the actual time of codegen in constant folding. Also parsing almost always takes significantly longer than codegen. Since our LISP style expressions are one of the simplest thigns to parse you can imagine, this difference should only increase WITH more complex languages like SQL. That constant folding takes such a long time for these deep trees should not really be a problem in reality since they usually only nest <10 levels deep anyway.
 
 If you want to test against a hardcoded Rust expression you can just hack that expression into the main.rs file at the line where it says 
 ```                            

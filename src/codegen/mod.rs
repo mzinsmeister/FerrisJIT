@@ -57,7 +57,7 @@ enum CGValue {
         readonly: bool
     },
     Constant(ConstValue),
-    Free(Option<usize>)
+    Free
 }
 
 struct CGValueRef<'cg> {
@@ -529,6 +529,7 @@ struct CodeGenInner {
     args_size: usize,
     values: Vec<CGValue>,
     free_slots: Vec<usize>,
+    free_stack_pos: Vec<usize>,
     // We save whether a register is potentially dirty
     // one value can only be in one register at a time unless it's a readonly/const value
     // as soon as a readonly/const value is dirtied it becomes a different mutable variable
@@ -549,6 +550,7 @@ impl CodeGenInner {
             args_size: args,
             values,
             free_slots: Vec::new(),
+            free_stack_pos: Vec::new(),
             reg_state: [None, None],
             inner: CopyPatchBackend::new(),
             stack_ptr: args * 8,
@@ -586,7 +588,7 @@ impl CodeGenInner {
                     CGValue::Constant(_) => {
                         panic!("We should have allocated a stack slot before dirtying a const value");
                     },
-                    CGValue::Free(_) => { /* User doesn't need this anymore so we can just throw it away without writing it back. */},
+                    CGValue::Free => { /* User doesn't need this anymore so we can just throw it away without writing it back. */},
                 }
             }
         }
@@ -646,7 +648,7 @@ impl CodeGenInner {
                     _ => unreachable!(),
                 }
             },
-            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
+            CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
         self.reg_state[reg] = Some((v, false));
     }
@@ -736,14 +738,14 @@ impl CodeGenInner {
             i
         } else {
             let i = self.values.len();
-            self.values.push(CGValue::Free(None));
+            self.values.push(CGValue::Free);
             i
         };
         let value = &mut self.values[i];
         match value {
-            CGValue::Free(ref mut slot) => {
-                let stack_ofs = if let Some(s) = slot {
-                    *s
+            CGValue::Free => {
+                let stack_ofs = if let Some(s) = self.free_stack_pos.pop() {
+                    s
                 } else {
                     let s = self.stack_ptr;
                     self.stack_ptr += 8;
@@ -783,7 +785,7 @@ impl CodeGenInner {
                 self.values.push(CGValue::Constant(c));
                 i
             },
-            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
+            CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
     }
 
@@ -794,7 +796,8 @@ impl CodeGenInner {
                 if *readonly {
                     return;
                 }
-                self.values[v] = CGValue::Free(Some(*stack_pos));
+                self.free_stack_pos.push(*stack_pos);
+                self.values[v] = CGValue::Free;
                 self.free_slots.push(v);
                 // Check reg slots and free them if necessary
                 for reg in self.reg_state.iter_mut() {
@@ -806,10 +809,10 @@ impl CodeGenInner {
                 }
             },
             CGValue::Constant(_) => {
-                self.values[v] = CGValue::Free(None);
+                self.values[v] = CGValue::Free;
                 self.free_slots.push(v);
             }
-            CGValue::Free(_) => {/* TODO: Make sure double frees cannot happen, even internally */},
+            CGValue::Free => {/* TODO: Make sure double frees cannot happen, even internally */},
         }
     }
 
@@ -828,7 +831,7 @@ impl CodeGenInner {
                 self.put_in_reg(0, l);
                 gen_op_const(&mut self.inner, c);
             },
-            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
+            CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
         self.dirty_reg(0).unwrap()
     }
