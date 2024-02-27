@@ -7,7 +7,7 @@ use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, IntType};
+use inkwell::types::{BasicMetadataTypeEnum, IntType};
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, OptimizationLevel};
 
@@ -17,6 +17,10 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
 use super::ir::DataType;
+
+// We make sure that normal stencils preserve at least this amount of arguments
+// after the call if they are unused in the result (e.g. second arg for add will be preserved)
+const PRESERVED_ARGS: usize = 2;
 
 // For reference (if you look into the Disassembly). 
 // Order of Registers in argument passing of the GHC-CC: R13, RBP, R12, RBX, R14, RSI, RDI, R8, R9, R15
@@ -68,14 +72,16 @@ pub enum StencilOperation {
     UncondBr,
 
     // These are the technical ones
-    Take,
     Take1,
     Take2,
     Take1Const,
     Take2Const,
     Ret,
-    Duplex,
-    Put,
+    Duplex1,
+    Duplex2,
+    Swap12,
+    Put1,
+    Put2,
     GetStackPtr,
     Load,
     LoadOfs,
@@ -126,7 +132,6 @@ impl Display for StencilOperation {
             StencilOperation::LteConst => write!(f, "ulte-const"),
             StencilOperation::CondBr => write!(f, "cond-br"),
             StencilOperation::UncondBr => write!(f, "uncond-br"),
-            StencilOperation::Take => write!(f, "take"),
             StencilOperation::Take1Const => write!(f, "take1-const"),
             StencilOperation::Take2Const => write!(f, "take2-const"),
             StencilOperation::Take1 => write!(f, "take1"),
@@ -136,8 +141,11 @@ impl Display for StencilOperation {
             StencilOperation::Store => write!(f, "store"),
             StencilOperation::StoreOfs => write!(f, "store-ofs"),
             StencilOperation::Ret => write!(f, "ret"),
-            StencilOperation::Duplex => write!(f, "duplex"),
-            StencilOperation::Put => write!(f, "put"),
+            StencilOperation::Duplex1 => write!(f, "duplex1"),
+            StencilOperation::Duplex2 => write!(f, "duplex2"),
+            StencilOperation::Swap12 => write!(f, "swap12"),
+            StencilOperation::Put1 => write!(f, "put1"),
+            StencilOperation::Put2 => write!(f, "put2"),
             StencilOperation::GetStackPtr => write!(f, "get-stack-ptr"),
             StencilOperation::CallCFunction => write!(f, "c-func-call"),
             StencilOperation::GhcWrapper => write!(f, "__GHC_CC-CONVERTER__")
@@ -481,6 +489,10 @@ impl<'ctx> StencilCodeGen<'ctx> {
             new_args.push(arg.clone());
         }
 
+        for _ in new_args.len()..=PRESERVED_ARGS {
+            new_args.push(i8_ptr_type.into());
+        }
+        
         let fn_type = void_type.fn_type(&new_args, false);
         let function = self.module.add_function(&format!("{}", s_type), fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
@@ -506,6 +518,11 @@ impl<'ctx> StencilCodeGen<'ctx> {
             tailcall_args_types.push(arg.get_type().into());
         }
 
+        for i in tailcall_args.len()..=PRESERVED_ARGS {
+            tailcall_args.push(function.get_nth_param(i as u32).unwrap().into());
+            tailcall_args_types.push(i8_ptr_type.into());
+        }
+
         let tailcallfun = self.get_tailcall_placeholder(&tailcall_args_types);
 
         let tc = self.builder.build_call(tailcallfun, &tailcall_args, "tailcall").unwrap();
@@ -516,18 +533,6 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let elf = self.compile(self.large_ph.get());
         
         get_stencil(s_type, elf.as_slice(), true, self.large_ph.get())
-    }
-
-
-    fn compile_take_stack(&self) -> Stencil {
-        let s_type = StencilType::new(StencilOperation::Take, Some(DataType::I64));
-        self.compile_stencil(s_type, &[], |_, stackptr| {
-            let i8_type = self.context.i8_type();
-            let offset = self.init_placeholder(self.context.i64_type());
-            let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
-            let x = self.builder.build_load(self.context.i64_type(), valueptr, "x").unwrap().into_int_value();
-            vec![x.into()]
-        })
     }
 
     fn compile_take_first_stack(&self) -> Stencil {
@@ -588,11 +593,29 @@ impl<'ctx> StencilCodeGen<'ctx> {
     // Compiles a stencil that takes one argument and calls a function with two arguments
     // We could instead also just have one that moves from the first to the second and calls
     // with an undefined first value but this is more flexible and performance should be the same
-    fn compile_duplex(&self) -> Stencil {
-        let s_type = StencilType::new(StencilOperation::Duplex, None);
-        self.compile_stencil(s_type, &[self.context.i64_type().into()], |args, _| {
-            let x = args[0].into_int_value();
-            vec![x.into(), x.into()]
+    fn compile_duplex1(&self) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Duplex1, None);
+        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type, &[uint8_ptr.into()], |args, _| {
+            let x = args[0];
+            vec![x, x]
+        })
+    }
+
+    fn compile_duplex2(&self) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Duplex2, None);
+        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type, &[uint8_ptr.into(), uint8_ptr.into()], |args, _| {
+            let y = args[1];
+            vec![y, y]
+        })
+    }
+
+    fn compile_swap12(&self) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Swap12, None);
+        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        self.compile_stencil(s_type, &[uint8_ptr.into(), uint8_ptr.into()], |args, _| {
+            vec![args[1], args[0]]
         })
     }
 
@@ -682,7 +705,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     fn compile_load(&self, d_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Load, Some(d_type.clone()));
         let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
-        self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, stackptr| {
+        self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, _| {
             let valueptr = args[0].into_pointer_value();
             let x = self.builder.build_load(d_type.get_llvm_type(self.context), valueptr, "x").unwrap();
             vec![x.into()]
@@ -690,9 +713,9 @@ impl<'ctx> StencilCodeGen<'ctx> {
     }
 
     fn compile_load_ofs(&self, d_type: DataType) -> Stencil {
-        let s_type = StencilType::new(StencilOperation::Take, Some(d_type.clone()));
+        let s_type = StencilType::new(StencilOperation::LoadOfs, Some(d_type.clone()));
         let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
-        self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, stackptr| {
+        self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, _| {
             let offset = self.init_placeholder(self.context.i32_type());
             let base_valueptr = args[0].into_pointer_value();
             let valueptr = unsafe { self.builder.build_gep(self.context.i8_type(), base_valueptr, &[offset], "valueptr").unwrap() };
@@ -704,7 +727,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     fn compile_store(&self, d_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Store, Some(d_type.clone()));
         let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
-        self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, stackptr| {
+        self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, _| {
             let x = args[0];
             let valueptr = args[1].into_pointer_value();
             self.builder.build_store(valueptr, x).unwrap();
@@ -715,7 +738,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     fn compile_store_ofs(&self, d_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::StoreOfs, Some(d_type.clone()));
         let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
-        self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, stackptr| {
+        self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, _| {
             let x = args[0];
             let offset = self.init_placeholder(self.context.i32_type());
             let base_valueptr = args[1].into_pointer_value();
@@ -725,15 +748,27 @@ impl<'ctx> StencilCodeGen<'ctx> {
         })
     }
 
-    fn compile_put_stack(&self) -> Stencil {
-        let s_type = StencilType::new(StencilOperation::Put, Some(DataType::I64));
-        self.compile_stencil(s_type, &[self.context.i64_type().into()], |args, stackptr| {
+    fn compile_put_1_stack(&self) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Put1, Some(DataType::I64));
+        self.compile_stencil(s_type, &[self.context.i64_type().into(), self.context.i64_type().into()], |args, stackptr| {
             let i8_type = self.context.i8_type();
             let x = args[0].into_int_value();
             let offset = self.init_placeholder(self.context.i64_type());
             let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
             self.builder.build_store(valueptr, x).unwrap();
-            vec![x.into()]
+            vec![x.into(), args[1]]
+        })
+    }
+
+    fn compile_put_2_stack(&self) -> Stencil {
+        let s_type = StencilType::new(StencilOperation::Put2, Some(DataType::I64));
+        self.compile_stencil(s_type, &[self.context.i64_type().into(), self.context.i64_type().into()], |args, stackptr| {
+            let i8_type = self.context.i8_type();
+            let x = args[1].into_int_value();
+            let offset = self.init_placeholder(self.context.i64_type());
+            let valueptr = unsafe { self.builder.build_gep(i8_type, stackptr, &[offset], "valueptr").unwrap() };
+            self.builder.build_store(valueptr, x).unwrap();
+            vec![args[0], x.into()]
         })
     }
 
@@ -753,7 +788,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
             let x = args[0].into_int_value();
             let y = self.init_placeholder(op_type);
             let res = perform_op(&self.builder, s_type.data_type.clone().unwrap(), x, y);
-            vec![res.into()]
+            vec![res.into()] // We make sure to return the second value just in case
         })
     }
 
@@ -1013,11 +1048,13 @@ fn compile_stencil(stencil_lib: &mut BTreeMap<StencilType, Stencil>, comp_fn: fn
 pub fn compile_all_stencils() -> BTreeMap<StencilType, Stencil> {
     let mut stencil_library = BTreeMap::new();
 
-    compile_stencil(&mut stencil_library, |c| c.compile_put_stack());
-    compile_stencil(&mut stencil_library,  |c| c.compile_take_stack());
     compile_stencil(&mut stencil_library, |c| c.compile_take_first_stack());
     compile_stencil(&mut stencil_library,  |c| c.compile_take_second_stack());
-    compile_stencil(&mut stencil_library, |c| c.compile_duplex());
+    compile_stencil(&mut stencil_library, |c| c.compile_put_1_stack());
+    compile_stencil(&mut stencil_library, |c| c.compile_put_2_stack());
+    compile_stencil(&mut stencil_library, |c| c.compile_duplex1());
+    compile_stencil(&mut stencil_library, |c| c.compile_duplex2());
+    compile_stencil(&mut stencil_library, |c| c.compile_swap12());
     compile_stencil(&mut stencil_library, |c| c.compile_ret_stencil());
     compile_stencil(&mut stencil_library, |c| c.compile_ghc_wrapper());
     compile_stencil(&mut stencil_library, |c| c.compile_cond());

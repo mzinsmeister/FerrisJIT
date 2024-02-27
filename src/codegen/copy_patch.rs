@@ -2,6 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::codegen::stencils::{compile_all_stencils, Stencil};
 
+#[cfg(feature = "print-asm")]
+use super::disassemble;
+
 use super::{ir::{ConstValue, DataType}, stencils::{StencilOperation, StencilType}, GeneratedCode};
 use lazy_static::lazy_static;
 use libc::c_void;
@@ -38,7 +41,7 @@ pub struct CopyPatchBackend {
 
 #[allow(dead_code)]
 impl CopyPatchBackend {
-    pub fn new(args: usize) -> Self {
+    pub fn new() -> Self {
         Self {  
             code: Vec::new(),
             fixup_holes: Vec::new(),
@@ -82,14 +85,22 @@ impl CopyPatchBackend {
     }
 
     pub fn generate_take_stack(&mut self, n: usize) {
-        let s_type = StencilType::new(StencilOperation::Take, Some(DataType::I64));
+        self.generate_take_1_stack(n);
+    }
+
+    pub fn generate_put_stack(&mut self, n: usize) {
+        self.generate_put_1_stack(n);
+    }
+
+    pub fn generate_put_1_stack(&mut self, n: usize) {
+        let s_type = StencilType::new(StencilOperation::Put1, Some(DataType::I64));
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![n as u64];
         self.copy_and_patch(stencil, holes_values);
     }
 
-    pub fn generate_put_stack(&mut self, n: usize) {
-        let s_type = StencilType::new(StencilOperation::Put, Some(DataType::I64));
+    pub fn generate_put_2_stack(&mut self, n: usize) {
+        let s_type = StencilType::new(StencilOperation::Put2, Some(DataType::I64));
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![n as u64];
         self.copy_and_patch(stencil, holes_values);
@@ -312,8 +323,22 @@ impl CopyPatchBackend {
         self.copy_and_patch(stencil, holes_values);
     }
 
-    pub fn generate_duplex(&mut self) {
-        let s_type = StencilType::new(StencilOperation::Duplex, None);
+    pub fn generate_duplex1(&mut self) {
+        let s_type = StencilType::new(StencilOperation::Duplex1, None);
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_duplex2(&mut self) {
+        let s_type = StencilType::new(StencilOperation::Duplex2, None);
+        let stencil = STENCILS.get(&s_type).unwrap();
+        let holes_values = vec![];
+        self.copy_and_patch(stencil, holes_values);
+    }
+
+    pub fn generate_swap12(&mut self) {
+        let s_type = StencilType::new(StencilOperation::Swap12, None);
         let stencil = STENCILS.get(&s_type).unwrap();
         let holes_values = vec![];
         self.copy_and_patch(stencil, holes_values);
@@ -441,9 +466,9 @@ impl CopyPatchBackend {
             }
         }
     
-        #[cfg(feature = "print-asm")]
+    #[cfg(feature = "print-asm")]
         {
-            let gc_code_slice = unsafe { std::slice::from_raw_parts(gc.code as *const u8, cg.code.len()) };
+            let gc_code_slice = unsafe { std::slice::from_raw_parts(gc.code as *const u8, self.code.len()) };
             disassemble::disassemble(gc_code_slice);
         }
     

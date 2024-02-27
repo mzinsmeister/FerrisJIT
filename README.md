@@ -99,7 +99,7 @@ Compiled is 210.90x faster
 ```
 
 When i still moved stuff from/to stack and from/to registers by hand instead of using my new CodeGen abstraction, codegen/compilation was ~5x faster but i think less than a milisecond for this expression is good enough. Most database queries will be quite a lot less code than this. I think once you have more complex
-structures in your code you really want the abstraction though.
+structures in your code you really want the abstraction though. Also it seems like our register allocation or stack movement generation is not ideal yet. The old variant produced significantly less code (about 1/4 less) and ran about 40% faster. I don't think this is fundamentally because of the new abstraction but more because the way we decide when to move stuff to and from registers is not ideal yet.
 
 If you want to test against a hardcoded Rust expression you can just hack that expression into the main.rs file at the line where it says 
 ```                            

@@ -6,7 +6,6 @@ mod copy_patch;
 mod expr_codegen;
 mod generated_code;
 
-
 use std::{cell::RefCell, hint::black_box, ops::Deref, ptr};
 use libc::c_void;
 
@@ -35,7 +34,7 @@ pub(crate) fn init_stencils() {
     println!("Stencil initialization: {:?}", compile_elapsed);
 }
 
-
+#[allow(dead_code)]
 fn get_fn_ptr(f: unsafe extern "C" fn(*mut u8) -> *mut u8) -> *const c_void {
     f as *const c_void
 }
@@ -340,10 +339,40 @@ impl Clone for BoolRef<'_> {
     }
 }
 
+impl<'cg> std::ops::BitAnd<&Self> for BoolRef<'cg> {
+    type Output = BoolRef<'cg>;
+
+    fn bitand(self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        let cgvref = cg.and(&self.0, &rhs.0);
+        if cgvref == self.0.i {
+            self
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+}
+
+impl<'cg> std::ops::BitOr<&Self> for BoolRef<'cg> {
+    type Output = BoolRef<'cg>;
+
+    fn bitor(self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        let cgvref = cg.or(&self.0, &rhs.0);
+        if cgvref == self.0.i {
+            self
+        } else {
+            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
+        }
+    }
+}
+
+
 struct CodeGen {
     inner: RefCell<CodeGenInner>,
 }
 
+#[allow(dead_code)]
 impl CodeGen {
 
     fn new(args: usize) -> Self {
@@ -500,12 +529,16 @@ struct CodeGenInner {
     args_size: usize,
     values: Vec<CGValue>,
     free_slots: Vec<usize>,
-    reg_state: [Option<(usize, bool)>; 2], // We save whether a register is potentially dirty
+    // We save whether a register is potentially dirty
+    // one value can only be in one register at a time unless it's a readonly/const value
+    // as soon as a readonly/const value is dirtied it becomes a different mutable variable
+    reg_state: [Option<(usize, bool)>; 2], 
     inner: CopyPatchBackend,
     stack_ptr: usize, // TODO: Use actual byte sizes. For now we just use 8 bytes for everything
     stack_size: usize
 }
 
+#[allow(dead_code)]
 impl CodeGenInner {
 
     fn new(args: usize) -> Self {
@@ -517,7 +550,7 @@ impl CodeGenInner {
             values,
             free_slots: Vec::new(),
             reg_state: [None, None],
-            inner: CopyPatchBackend::new(args),
+            inner: CopyPatchBackend::new(),
             stack_ptr: args * 8,
             stack_size: args * 8,
         }
@@ -533,7 +566,7 @@ impl CodeGenInner {
         self.inner.reset();
     }
 
-    fn free_reg(&mut self, reg: usize, new_i: usize) -> bool {
+    fn free_reg(&mut self, reg: usize) {
         if let Some((i, dirty)) = &mut self.reg_state[reg] {
             if *dirty {
                 let cur_value = &self.values[*i];
@@ -542,100 +575,143 @@ impl CodeGenInner {
                         if *readonly {
                             panic!("We should have allocated a stack slot before dirtying a readonly value");
                         }
-                        if *i != new_i {
-                            // Save it to its designated stack location
-                            match reg {
-                                0 => self.inner.generate_put_stack(*stack_pos),
-                                _ => todo!("Implement dirtying of second register"),
-                            }
-                        } else {
-                            return true;
+                        // Save it to its designated stack location
+                        match reg {
+                            0 => self.inner.generate_put_1_stack(*stack_pos),
+                            1 => self.inner.generate_put_2_stack(*stack_pos),
+                            _ => unreachable!(),
                         }
+                        self.reg_state[reg].as_mut().unwrap().1 = false;
                     },
                     CGValue::Constant(_) => {
                         panic!("We should have allocated a stack slot before dirtying a const value");
                     },
-                    CGValue::Free(_) => { /* User doesn't need this anymore so we can just throw it away without writing it back */},
+                    CGValue::Free(_) => { /* User doesn't need this anymore so we can just throw it away without writing it back. */},
                 }
             }
         }
-        false
     }
 
-    fn put_in_reg0(&mut self, v: usize) {
-        if self.free_reg(0, v) {
-            return;
-        }
-
-        // Lookup which value is currently in the first register
-        let reg1_state = self.reg_state[1].clone();
-        if let Some((i, _)) = reg1_state {
-            if i == v {
-                todo!("Also support moving from second to first register")
-            }
-        }
-        let value = &self.values[v];
-        // Load the value into the first scratch register
-        match value {
-            CGValue::Variable{stack_pos,..}=> {
-                // TODO: do take stack with datatype
-                self.inner.generate_take_1_stack(*stack_pos);
-            },
-            CGValue::Constant(c) => {
-                self.inner.generate_take_1_const(*c);
-            },
-            CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
-        }
-        self.reg_state[0] = Some((v, false));
-    }
-    
-    fn put_in_reg1(&mut self, v: usize) {
-        self.free_reg(1, v);
-
-        // Is our value in the first register? if so we can just swap the registers
-        let reg0_state = self.reg_state[0].clone();
-        if let Some((i, dirty)) = reg0_state {
-            if i == v {
-                if dirty {
-                    todo!("Handle this case"); // should currently not happen
-                }
-                self.inner.generate_duplex();
-                self.reg_state[1] = self.reg_state[0].clone();
+    /// Put a single value into a single register. Use "put_in_regs" if you want to set both registers
+    /// This might change the state of the other register!
+    fn put_in_reg(&mut self, reg: usize, v: usize) {
+        // Do we already have the correct value?
+        if let Some((i, _)) = &self.reg_state[reg] {
+            if *i == v {
                 return;
             }
         }
         let value = &self.values[v];
-        // Load the value into the first scratch register
+        // Is our value in the other register? if so we can just swap the registers
+        let other_reg_n = (reg + 1) % 2;
+        let other_reg_state = self.reg_state[other_reg_n].clone();
+        if let Some((i, _)) = other_reg_state {
+            if i == v {
+                if let CGValue::Variable{readonly, ..} = &value {
+                    if *readonly {
+                        // We can just duplicate the value
+                        self.free_reg(reg);
+                        match other_reg_n {
+                            0 => self.inner.generate_duplex1(),
+                            1 => self.inner.generate_duplex2(),
+                            _ => unreachable!(),
+                        }
+                        self.reg_state[reg] = self.reg_state[other_reg_n].clone();
+                        return;
+                    }
+                }
+                // We just swap the registers so that we don't have to move anything
+                self.inner.generate_swap12();
+                self.reg_state.swap(0, 1);
+                return;
+            }
+        }
+        // We have to go to memory, therefore spill the current value if necessary
+        self.free_reg(reg);
+        let value: &CGValue = &self.values[v];
+        // Load the value to the register
         match value {
             CGValue::Variable{stack_pos, ..} => {
                 // TODO: do take stack with datatype
-                self.inner.generate_take_2_stack(*stack_pos);
+                match reg {
+                    0 => self.inner.generate_take_1_stack(*stack_pos),
+                    1 => self.inner.generate_take_2_stack(*stack_pos),
+                    _ => unreachable!(),
+                }
             },
             CGValue::Constant(c) => {
-                self.inner.generate_take_2_const(*c);
+                match reg {
+                    0 => self.inner.generate_take_1_const(c.clone()),
+                    1 => self.inner.generate_take_2_const(c.clone()),
+                    _ => unreachable!(),
+                }
             },
             CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
-        self.reg_state[1] = Some((v, false));
+        self.reg_state[reg] = Some((v, false));
     }
 
-    fn dirty_reg0(&mut self) -> Option<usize> {
-        let reg_state = self.reg_state[0].clone();
-        let reg_state2 = self.reg_state[1].clone();
-        // If we have the same value in the second register, we must set it to free
-        if let Some((i, _)) = reg_state2 { // TODO: What if its dirty here?
-            if i == reg_state2.unwrap().0 {
-                self.reg_state[1] = None;
-            }
+    // Get two values into registers in the most efficient way possible
+    fn put_in_regs(&mut self, reg0_v: usize, reg1_v: usize) {
+        let v0_reg_n = self.reg_state.iter()
+            .enumerate()
+            .find(|(_, r)| r.as_ref().map(|r| r.0 == reg0_v).unwrap_or(false))
+            .map(|(i, _)| i);
+        let v1_reg_n = self.reg_state.iter()
+            .enumerate()
+            .find(|(_, r)| r.as_ref().map(|r| r.0 == reg1_v).unwrap_or(false))
+            .map(|(i, _)| i);
+
+        // Depending on the different constellations we might have here we can do different things
+        // Both values are already in the correct (!) registers
+        if v0_reg_n == Some(0) && v1_reg_n == Some(1) {
+            return;
         }
+        // Both want the same value and it already is in a register
+        if v0_reg_n.is_some() && v0_reg_n == v1_reg_n {
+            // just duplicate the value
+            if let Some(0) = v0_reg_n {
+                self.free_reg(1);
+                self.inner.generate_duplex1();
+                self.reg_state[1] = self.reg_state[0].clone();
+            } else {
+                self.free_reg(0);
+                self.inner.generate_duplex2();
+                self.reg_state[0] = self.reg_state[1].clone();
+            }
+            return;
+        }
+
+        // registers are swapped
+        if matches!(v0_reg_n, Some(1)) && matches!(v1_reg_n, Some(0)) {
+            self.inner.generate_swap12();
+            self.reg_state.swap(0, 1);
+            return;
+        }
+
+        if let Some(0) = v1_reg_n {
+            // v2 is in register 0
+            // Make sure to get that value into register 1 first
+            self.put_in_reg(1, reg1_v);
+            self.put_in_reg(0, reg0_v);
+        } else {
+            // In any other case this will be the most efficient way
+            // Either v1 is in register 1 or we have to go to memory for both anyway
+            self.put_in_reg(0, reg0_v);
+            self.put_in_reg(1, reg1_v);
+        }
+    }
+
+    fn dirty_reg(&mut self, reg: usize) -> Option<usize> {
+        let reg_state = self.reg_state[reg].clone();
         if let Some((i, _)) = reg_state {
             // Check whether the value is readonly and if it is we allocate a new value
-            self.reg_state[0].as_mut().unwrap().1 = true;
+            self.reg_state[reg].as_mut().unwrap().1 = true;
             match &self.values[i] {
                 CGValue::Variable{readonly,..} => {
                     if *readonly {
                         let slot = self.allocate_stack(DataType::I64);
-                        self.reg_state[0].as_mut().unwrap().0 = slot;
+                        self.reg_state[reg].as_mut().unwrap().0 = slot;
                         return Some(slot);
                     } else {
                         return Some(i);
@@ -650,32 +726,8 @@ impl CodeGenInner {
                 },
                 _ => unreachable!(),
             }
-        }
-        None
-    }
-
-    #[allow(dead_code)]
-    fn dirty_reg1(&mut self) -> Option<usize> {
-        // This case is non-trivial because we also have to handle the case where value is already in reg0 and is dirty
-        // In this case we could have two diverging states for the same value
-        // Maybe this can't even happen as long as we keep the "one reference per mutable value" invariant
-        todo!("Implement dirtying of second register")
-    }
-
-    fn lose_reg(&mut self, reg: usize) -> Option<()> {
-        if let Some((i, dirty)) = &mut self.reg_state[reg] {
-            let dirty = if *dirty {
-                // We lost a dirty value, this should not happen unless we throw away the value anyway
-                // We return true here because it was dirty but don't panic yet as the caller has
-                // to decide whether this is acceptable or not.
-                None
-            } else {
-                Some(())
-            };
-            self.reg_state[reg] = None;
-            dirty
         } else {
-            Some(())
+            panic!("tried to dirty a register that is not in use");
         }
     }
 
@@ -719,7 +771,7 @@ impl CodeGenInner {
                         *i = self.values.len();
                     }
                 } else {
-                    self.put_in_reg0(v);
+                    self.put_in_reg(0, v);
                     self.reg_state[0].unwrap().0 = self.values.len();
                 }
                 self.allocate_stack(data_type)
@@ -744,6 +796,14 @@ impl CodeGenInner {
                 }
                 self.values[v] = CGValue::Free(Some(*stack_pos));
                 self.free_slots.push(v);
+                // Check reg slots and free them if necessary
+                for reg in self.reg_state.iter_mut() {
+                    if let Some((i, _)) = reg {
+                        if *i == v {
+                            *reg = None;
+                        }
+                    }
+                }
             },
             CGValue::Constant(_) => {
                 self.values[v] = CGValue::Free(None);
@@ -756,109 +816,110 @@ impl CodeGenInner {
     //--------------------------------------------------------------------------------
     // Arithmetic operations
 
-    fn gen_arith(&mut self, gen_op: fn(&mut CopyPatchBackend, DataType), gen_op_const: fn(&mut CopyPatchBackend, ConstValue), l: usize, r: usize) -> usize {
+    fn gen_arith<const COMMUTATIVE: bool>(&mut self, gen_op: fn(&mut CopyPatchBackend, DataType), gen_op_const: fn(&mut CopyPatchBackend, ConstValue), l: usize, r: usize) -> usize {
         let vr = self.values[r].clone();
-        self.put_in_reg0(l);
+        // TODO: Use commutative property to optimize this
         match vr {
             CGValue::Variable{data_type,..} => {
-                self.put_in_reg1(r);
+                self.put_in_regs(l, r);
                 gen_op(&mut self.inner, data_type);
             },
             CGValue::Constant(c) => {
+                self.put_in_reg(0, l);
                 gen_op_const(&mut self.inner, c);
             },
             CGValue::Free(_) => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
-        self.lose_reg(1);
-        self.dirty_reg0().unwrap()
+        self.dirty_reg(0).unwrap()
     }
 
     fn add(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<true>(
             CopyPatchBackend::generate_add, 
             CopyPatchBackend::generate_add_const,
              l, r)
     }
 
     fn sub(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<false>(
             CopyPatchBackend::generate_sub, 
             CopyPatchBackend::generate_sub_const,
              l, r)
     }
 
     fn mul(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<true>(
             CopyPatchBackend::generate_mul, 
             CopyPatchBackend::generate_mul_const,
              l, r)
     }
 
     fn div(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<false>(
             CopyPatchBackend::generate_div, 
             CopyPatchBackend::generate_div_const,
              l, r)
     }
 
     fn rem(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<false>(
             CopyPatchBackend::generate_rem, 
             CopyPatchBackend::generate_rem_const,
              l, r)
     }
 
     fn eq(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<true>(
             CopyPatchBackend::generate_eq, 
             CopyPatchBackend::generate_eq_const,
              l, r)
     }
 
     fn neq(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<true>(
             CopyPatchBackend::generate_neq, 
             CopyPatchBackend::generate_neq_const,
              l, r)
     }
 
+    // TODO: exchange lt/gte and lte/gt here if the first one is a const
     fn lt(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<false>(
             CopyPatchBackend::generate_lt, 
             CopyPatchBackend::generate_lt_const,
              l, r)
     }
 
     fn lte(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<false>(
             CopyPatchBackend::generate_lte, 
             CopyPatchBackend::generate_lte_const,
              l, r)
     }
 
     fn gt(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<false>(
             CopyPatchBackend::generate_gt, 
             CopyPatchBackend::generate_gt_const,
              l, r)
     }
 
     fn gte(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<false>(
             CopyPatchBackend::generate_gte, 
             CopyPatchBackend::generate_gte_const,
              l, r)
     }
 
     fn and(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<true>(
             CopyPatchBackend::generate_and, 
             CopyPatchBackend::generate_and_const,
              l, r)
     }
 
     fn or(&mut self, l: usize, r: usize) -> usize {
-        self.gen_arith(
+        self.gen_arith::<true>(
             CopyPatchBackend::generate_or, 
             CopyPatchBackend::generate_or_const,
              l, r)
@@ -868,7 +929,7 @@ impl CodeGenInner {
     // Other operations
 
     fn generate_return(&mut self, return_value: usize) {
-        self.put_in_reg0(return_value);
+        self.put_in_reg(0, return_value);
         self.inner.generate_put_stack(0);
         self.inner.generate_ret();
     }
@@ -876,7 +937,7 @@ impl CodeGenInner {
     //--------------------------------------------------------------------------------
     // Control flow
 
-   // fn generate_if<
+    // TODO
 
     //--------------------------------------------------------------------------------
 

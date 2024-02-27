@@ -2,7 +2,10 @@ use std::fmt::Display;
 
 use crate::expr::{Atom, BuiltIn, Expr};
 
-use super::{ir::{ConstValue, DataType}, BoolRef, CGEq, CGValueRef, CodeGen, GeneratedCode, I64Ref};
+#[cfg(feature = "print-asm")]
+use crate::codegen::disassemble;
+
+use super::{ir::DataType, BoolRef, CGEq, CGValueRef, CodeGen, GeneratedCode, I64Ref};
 
 fn fold_op(fun: &BuiltIn, l: Atom, r: Atom) -> Option<Atom> {
     match (fun, l, r) {
@@ -252,7 +255,7 @@ fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr]
     Ok(cur)
 }
 
-fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr, args: usize) -> Result<CGValueRef<'cg>, CodeGenError> {
+fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr) -> Result<CGValueRef<'cg>, CodeGenError> {
     Ok(match expr {
         Expr::Constant(e) => {
             return Err(CodeGenError::Const(e.clone()));
@@ -292,18 +295,11 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, CodeGenE
 
     let cg = CodeGen::new(args);
 
-    let return_val = generate_code_inner(&cg, expr, args)?;
+    let return_val = generate_code_inner(&cg, expr)?;
 
     cg.generate_return(&return_val);
 
     let gc = cg.generate_code();
-
-    #[cfg(feature = "print-asm")]
-    {
-        let gc_code_slice = unsafe { std::slice::from_raw_parts(gc.code as *const u8, cg.code.len()) };
-        disassemble::disassemble(gc_code_slice);
-    }
-
 
     Ok(gc)
 }
