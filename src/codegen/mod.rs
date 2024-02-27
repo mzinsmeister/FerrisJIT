@@ -6,7 +6,7 @@ mod copy_patch;
 mod expr_codegen;
 mod generated_code;
 
-use std::{cell::RefCell, hint::black_box, ops::Deref, ptr};
+use std::{cell::RefCell, hint::black_box, ops::Deref, ptr, rc::Rc};
 use libc::c_void;
 
 use crate::codegen::{copy_patch::STENCILS, ir::DataType};
@@ -60,7 +60,7 @@ enum CGValue {
     Free
 }
 
-struct CGValueRef<'cg> {
+pub struct CGValueRef<'cg> {
     i: usize,
     cg: &'cg CodeGen,
     data_type: DataType
@@ -123,7 +123,15 @@ trait CGCmp<'o> {
 }
 
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
-struct I64Ref<'cg> (CGValueRef<'cg>);
+pub struct I64Ref<'cg> (CGValueRef<'cg>);
+
+impl<'cg> Deref for I64Ref<'cg> {
+    type Target = CGValueRef<'cg>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl<'cg> CGEq<'cg> for I64Ref<'cg> {
     fn cg_eq(self, other: &Self) -> BoolRef<'cg> {
@@ -295,7 +303,15 @@ impl<'cg> std::ops::Rem<&Self> for I64Ref<'cg> {
 
 
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
-struct BoolRef<'cg> (CGValueRef<'cg>);
+pub struct BoolRef<'cg> (CGValueRef<'cg>);
+
+impl<'cg> Deref for BoolRef<'cg> {
+    type Target = CGValueRef<'cg>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl<'cg> CGEq<'cg> for BoolRef<'cg> {
     fn cg_eq(self, other: &Self) -> BoolRef<'cg> {
@@ -368,142 +384,6 @@ impl<'cg> std::ops::BitOr<&Self> for BoolRef<'cg> {
 }
 
 
-struct CodeGen {
-    inner: RefCell<CodeGenInner>,
-}
-
-#[allow(dead_code)]
-impl CodeGen {
-
-    fn new(args: usize) -> Self {
-        let cg = Self {
-            inner: RefCell::new(CodeGenInner::new(args)),
-        };
-        cg        
-    }
-
-    // We make sure arguments are immutable so having multiple references to them is not a problem
-    pub fn get_arg(&self, n: usize) -> I64Ref {
-        I64Ref(CGValueRef::new_readonly(n, self, DataType::I64))
-    }
-
-    pub fn new_i64_const(&self, n: i64) -> I64Ref {
-        let inner = &mut self.inner.borrow_mut();
-        let i = inner.values.len();
-        inner.values.push(CGValue::Constant(ConstValue::I64(n)));
-        I64Ref(CGValueRef::new(i, self, DataType::I64))
-    }
-
-    pub fn new_bool_const(&self, b: bool) -> BoolRef {
-        let inner = &mut self.inner.borrow_mut();
-        let i = inner.values.len();
-        inner.values.push(CGValue::Constant(ConstValue::Bool(b)));
-        BoolRef(CGValueRef::new(i, self, DataType::Bool))
-    }
-
-    fn free_value(&self, v: &CGValueRef) {
-        self.inner.borrow_mut().free_value(v.i);
-    }
-
-    fn clone_value(&self, v: &CGValueRef) -> CGValueRef {
-        let i = self.inner.borrow_mut().clone_value(v.i);
-        CGValueRef::new(i, self, v.data_type.clone())
-    }
-
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        self.inner.borrow_mut().reset();
-    }
-
-    //--------------------------------------------------------------------------------
-    // Arithmetic operations
-    
-    fn add(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.add(l.i, r.i)
-    }
-
-    fn sub(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.sub(l.i, r.i)
-    }
-
-    fn mul(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.mul(l.i, r.i)
-    }
-
-    fn div(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.div(l.i, r.i)
-    }
-
-    fn rem(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.rem(l.i, r.i)
-    }
-
-    fn eq(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.eq(l.i, r.i)
-    }
-
-    fn neq(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.neq(l.i, r.i)
-    }
-
-    fn lt(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.lt(l.i, r.i)
-    }
-
-    fn lte(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.lte(l.i, r.i)
-    }
-
-    fn gt(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.gt(l.i, r.i)
-    }
-
-    fn gte(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.gte(l.i, r.i)
-    }
-
-    fn and(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.and(l.i, r.i)
-    }
-
-    fn or(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        let cg = &mut self.inner.borrow_mut();
-        cg.or(l.i, r.i)
-    }
-    
-    //--------------------------------------------------------------------------------
-    // Other operations
-
-    pub fn generate_return<'a, D: Deref<Target = CGValueRef<'a>>>(&self, return_value: D) {
-        let cg = &mut self.inner.borrow_mut();
-        cg.generate_return(return_value.i);
-    }
-
-    //--------------------------------------------------------------------------------
-
-    // Takes Ownership of the return value and resets all registers
-    // TODO: References will be invalid after this. We cannot enforce 
-    pub fn generate_code(&self) -> GeneratedCode {
-        let cg = &mut self.inner.borrow_mut();
-        cg.generate_code()
-    }
-
-}
-
-
-
 // How this works is that we have "values" which are roughly equivalent to 
 // variables in a high level language. Note that we don't do SSA here. I
 // don't think it's really beneficial for Copy and patch as it would probably
@@ -525,7 +405,8 @@ impl CodeGen {
 
 /// Convenience layer around copy and patch compilation backend
 /// so that you don't have to think about registers anymore
-struct CodeGenInner {
+
+struct MemoryManagement {
     args_size: usize,
     values: Vec<CGValue>,
     free_slots: Vec<usize>,
@@ -534,15 +415,13 @@ struct CodeGenInner {
     // one value can only be in one register at a time unless it's a readonly/const value
     // as soon as a readonly/const value is dirtied it becomes a different mutable variable
     reg_state: [Option<(usize, bool)>; 2], 
-    inner: CopyPatchBackend,
     stack_ptr: usize, // TODO: Use actual byte sizes. For now we just use 8 bytes for everything
-    stack_size: usize
+    stack_size: usize,
+    cp_backend: Rc<CopyPatchBackend>
 }
 
-#[allow(dead_code)]
-impl CodeGenInner {
-
-    fn new(args: usize) -> Self {
+impl MemoryManagement {
+    fn new(cp_backend: Rc<CopyPatchBackend>, args: usize) -> Self {
         let values = (0..args).into_iter()
             .map(|i| CGValue::Variable{ data_type: DataType::I64, stack_pos: i * 8, readonly: true})
             .collect();
@@ -552,9 +431,9 @@ impl CodeGenInner {
             free_slots: Vec::new(),
             free_stack_pos: Vec::new(),
             reg_state: [None, None],
-            inner: CopyPatchBackend::new(),
             stack_ptr: args * 8,
             stack_size: args * 8,
+            cp_backend
         }
     }
 
@@ -565,7 +444,6 @@ impl CodeGenInner {
         self.free_slots.clear();
         self.stack_ptr = self.args_size * 8;
         self.stack_size = self.args_size * 8;
-        self.inner.reset();
     }
 
     fn free_reg(&mut self, reg: usize) {
@@ -579,8 +457,8 @@ impl CodeGenInner {
                         }
                         // Save it to its designated stack location
                         match reg {
-                            0 => self.inner.generate_put_1_stack(*stack_pos),
-                            1 => self.inner.generate_put_2_stack(*stack_pos),
+                            0 => self.cp_backend.generate_put_1_stack(*stack_pos),
+                            1 => self.cp_backend.generate_put_2_stack(*stack_pos),
                             _ => unreachable!(),
                         }
                         self.reg_state[reg].as_mut().unwrap().1 = false;
@@ -597,7 +475,7 @@ impl CodeGenInner {
     /// Put a single value into a single register. Use "put_in_regs" if you want to set both registers
     /// This might change the state of the other register!
     fn put_in_reg(&mut self, reg: usize, v: usize) {
-        // Do we already have the correct value?
+                // Do we already have the correct value?
         if let Some((i, _)) = &self.reg_state[reg] {
             if *i == v {
                 return;
@@ -614,8 +492,8 @@ impl CodeGenInner {
                         // We can just duplicate the value
                         self.free_reg(reg);
                         match other_reg_n {
-                            0 => self.inner.generate_duplex1(),
-                            1 => self.inner.generate_duplex2(),
+                            0 => self.cp_backend.generate_duplex1(),
+                            1 => self.cp_backend.generate_duplex2(),
                             _ => unreachable!(),
                         }
                         self.reg_state[reg] = self.reg_state[other_reg_n].clone();
@@ -623,7 +501,7 @@ impl CodeGenInner {
                     }
                 }
                 // We just swap the registers so that we don't have to move anything
-                self.inner.generate_swap12();
+                self.cp_backend.generate_swap12();
                 self.reg_state.swap(0, 1);
                 return;
             }
@@ -636,15 +514,15 @@ impl CodeGenInner {
             CGValue::Variable{stack_pos, ..} => {
                 // TODO: do take stack with datatype
                 match reg {
-                    0 => self.inner.generate_take_1_stack(*stack_pos),
-                    1 => self.inner.generate_take_2_stack(*stack_pos),
+                    0 => self.cp_backend.generate_take_1_stack(*stack_pos),
+                    1 => self.cp_backend.generate_take_2_stack(*stack_pos),
                     _ => unreachable!(),
                 }
             },
             CGValue::Constant(c) => {
                 match reg {
-                    0 => self.inner.generate_take_1_const(c.clone()),
-                    1 => self.inner.generate_take_2_const(c.clone()),
+                    0 => self.cp_backend.generate_take_1_const(c.clone()),
+                    1 => self.cp_backend.generate_take_2_const(c.clone()),
                     _ => unreachable!(),
                 }
             },
@@ -674,11 +552,11 @@ impl CodeGenInner {
             // just duplicate the value
             if let Some(0) = v0_reg_n {
                 self.free_reg(1);
-                self.inner.generate_duplex1();
+                self.cp_backend.generate_duplex1();
                 self.reg_state[1] = self.reg_state[0].clone();
             } else {
                 self.free_reg(0);
-                self.inner.generate_duplex2();
+                self.cp_backend.generate_duplex2();
                 self.reg_state[0] = self.reg_state[1].clone();
             }
             return;
@@ -686,7 +564,7 @@ impl CodeGenInner {
 
         // registers are swapped
         if matches!(v0_reg_n, Some(1)) && matches!(v1_reg_n, Some(0)) {
-            self.inner.generate_swap12();
+            self.cp_backend.generate_swap12();
             self.reg_state.swap(0, 1);
             return;
         }
@@ -766,7 +644,7 @@ impl CodeGenInner {
             CGValue::Variable{data_type,..} => {
                 if let Some((i, dirty)) = &mut self.reg_state[0] {
                     if *dirty {
-                        self.inner.generate_put_stack(*i);
+                        self.cp_backend.generate_put_stack(*i);
                         *dirty = false;
                     }
                     if *i == v {
@@ -815,70 +693,136 @@ impl CodeGenInner {
             CGValue::Free => {/* TODO: Make sure double frees cannot happen, even internally */},
         }
     }
+}
+
+pub struct CodeGen {
+    inner: Rc<CopyPatchBackend>,
+    memory_management: RefCell<MemoryManagement>
+}
+
+#[allow(dead_code)]
+impl CodeGen {
+
+    pub fn new(args: usize) -> Self {
+        let values = (0..args).into_iter()
+            .map(|i| CGValue::Variable{ data_type: DataType::I64, stack_pos: i * 8, readonly: true})
+            .collect();
+        let cp_backend = Rc::new(CopyPatchBackend::new());
+        let memory_management = MemoryManagement {
+            args_size: args,
+            values,
+            free_slots: Vec::new(),
+            free_stack_pos: Vec::new(),
+            reg_state: [None, None],
+            stack_ptr: args * 8,
+            stack_size: args * 8,
+            cp_backend: cp_backend.clone()
+        };
+        Self {
+            inner: cp_backend,
+            memory_management: RefCell::new(memory_management)
+        }
+    }
+
+    // We make sure arguments are immutable so having multiple references to them is not a problem
+    pub fn get_arg(&self, n: usize) -> I64Ref {
+        I64Ref(CGValueRef::new_readonly(n, self, DataType::I64))
+    }
+
+    pub fn new_i64_const(&self, n: i64) -> I64Ref {
+        let mut memory_management = self.memory_management.borrow_mut();
+        let i = memory_management.values.len();
+        memory_management.values.push(CGValue::Constant(ConstValue::I64(n)));
+        I64Ref(CGValueRef::new(i, self, DataType::I64))
+    }
+
+    pub fn new_bool_const(&self, b: bool) -> BoolRef {
+        let mut memory_management = self.memory_management.borrow_mut();
+        let i = memory_management.values.len();
+        memory_management.values.push(CGValue::Constant(ConstValue::Bool(b)));
+        BoolRef(CGValueRef::new(i, self, DataType::Bool))
+    }
+
+    fn free_value(&self, v: &CGValueRef) {
+        self.memory_management.borrow_mut().free_value(v.i);
+    }
+
+    fn clone_value(&self, v: &CGValueRef) -> CGValueRef {
+        let mut memory_management = self.memory_management.borrow_mut();
+        let i = memory_management.clone_value(v.i);
+        CGValueRef::new(i, self, v.data_type.clone())
+    }
+
+    #[allow(dead_code)]
+    fn reset(&mut self) {
+        self.memory_management.borrow_mut().reset();
+        self.inner.reset();
+    }
 
     //--------------------------------------------------------------------------------
     // Arithmetic operations
 
-    fn gen_arith<const COMMUTATIVE: bool>(&mut self, gen_op: fn(&mut CopyPatchBackend, DataType), gen_op_const: fn(&mut CopyPatchBackend, ConstValue), l: usize, r: usize) -> usize {
-        let vr = self.values[r].clone();
+    fn gen_arith<const COMMUTATIVE: bool>(&self,  gen_op: fn(&CopyPatchBackend, DataType), gen_op_const: fn(&CopyPatchBackend, ConstValue), l: &CGValueRef, r: &CGValueRef) -> usize {
+        let mut memory_management = self.memory_management.borrow_mut();
+        let vr = memory_management.values[r.i].clone();
         // TODO: Use commutative property to optimize this
         match vr {
             CGValue::Variable{data_type,..} => {
-                self.put_in_regs(l, r);
-                gen_op(&mut self.inner, data_type);
+                memory_management.put_in_regs(l.i, r.i);
+                gen_op(&self.inner, data_type);
             },
             CGValue::Constant(c) => {
-                self.put_in_reg(0, l);
-                gen_op_const(&mut self.inner, c);
+                memory_management.put_in_reg(0, l.i);
+                gen_op_const(&self.inner, c);
             },
             CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
-        self.dirty_reg(0).unwrap()
+        memory_management.dirty_reg(0).unwrap()
     }
 
-    fn add(&mut self, l: usize, r: usize) -> usize {
+    fn add(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<true>(
             CopyPatchBackend::generate_add, 
             CopyPatchBackend::generate_add_const,
              l, r)
     }
 
-    fn sub(&mut self, l: usize, r: usize) -> usize {
+    fn sub(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<false>(
             CopyPatchBackend::generate_sub, 
             CopyPatchBackend::generate_sub_const,
              l, r)
     }
 
-    fn mul(&mut self, l: usize, r: usize) -> usize {
+    fn mul(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<true>(
             CopyPatchBackend::generate_mul, 
             CopyPatchBackend::generate_mul_const,
              l, r)
     }
 
-    fn div(&mut self, l: usize, r: usize) -> usize {
+    fn div(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<false>(
             CopyPatchBackend::generate_div, 
             CopyPatchBackend::generate_div_const,
              l, r)
     }
 
-    fn rem(&mut self, l: usize, r: usize) -> usize {
+    fn rem(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<false>(
             CopyPatchBackend::generate_rem, 
             CopyPatchBackend::generate_rem_const,
              l, r)
     }
 
-    fn eq(&mut self, l: usize, r: usize) -> usize {
+    fn eq(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<true>(
             CopyPatchBackend::generate_eq, 
             CopyPatchBackend::generate_eq_const,
              l, r)
     }
 
-    fn neq(&mut self, l: usize, r: usize) -> usize {
+    fn neq(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<true>(
             CopyPatchBackend::generate_neq, 
             CopyPatchBackend::generate_neq_const,
@@ -886,42 +830,42 @@ impl CodeGenInner {
     }
 
     // TODO: exchange lt/gte and lte/gt here if the first one is a const
-    fn lt(&mut self, l: usize, r: usize) -> usize {
+    fn lt(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<false>(
             CopyPatchBackend::generate_lt, 
             CopyPatchBackend::generate_lt_const,
              l, r)
     }
 
-    fn lte(&mut self, l: usize, r: usize) -> usize {
+    fn lte(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<false>(
             CopyPatchBackend::generate_lte, 
             CopyPatchBackend::generate_lte_const,
              l, r)
     }
 
-    fn gt(&mut self, l: usize, r: usize) -> usize {
+    fn gt(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<false>(
             CopyPatchBackend::generate_gt, 
             CopyPatchBackend::generate_gt_const,
              l, r)
     }
 
-    fn gte(&mut self, l: usize, r: usize) -> usize {
+    fn gte(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<false>(
             CopyPatchBackend::generate_gte, 
             CopyPatchBackend::generate_gte_const,
              l, r)
     }
 
-    fn and(&mut self, l: usize, r: usize) -> usize {
+    fn and(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<true>(
             CopyPatchBackend::generate_and, 
             CopyPatchBackend::generate_and_const,
              l, r)
     }
 
-    fn or(&mut self, l: usize, r: usize) -> usize {
+    fn or(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
         self.gen_arith::<true>(
             CopyPatchBackend::generate_or, 
             CopyPatchBackend::generate_or_const,
@@ -929,23 +873,32 @@ impl CodeGenInner {
     }
 
     //--------------------------------------------------------------------------------
+    // Control flow
+
+    fn generate_if<THEN: FnMut()>(&self, condition: BoolRef, mut then_branch: THEN) {
+        let mut memory_management = self.memory_management.borrow_mut();
+        memory_management.put_in_reg(0, condition.i);
+        drop(memory_management);
+        self.inner.generate_if(move || {
+            then_branch();
+        });
+        let mut memory_management = self.memory_management.borrow_mut();
+        memory_management.free_reg(0);
+    }
+
+    //--------------------------------------------------------------------------------
     // Other operations
 
-    fn generate_return(&mut self, return_value: usize) {
-        self.put_in_reg(0, return_value);
+    fn generate_return(&self, return_value: CGValueRef) {
+        self.memory_management.borrow_mut().put_in_reg(0, return_value.i);
         self.inner.generate_put_stack(0);
         self.inner.generate_ret();
     }
 
     //--------------------------------------------------------------------------------
-    // Control flow
-
-    // TODO
-
-    //--------------------------------------------------------------------------------
 
     fn generate_code(&self) -> GeneratedCode {
-        self.inner.generate_code(self.stack_size)
+        self.inner.generate_code(self.memory_management.borrow().stack_size)
     }
 }
 

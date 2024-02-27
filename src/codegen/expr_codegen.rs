@@ -295,9 +295,26 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, CodeGenE
 
     let cg = CodeGen::new(args);
 
-    let return_val = generate_code_inner(&cg, expr)?;
+    // Uncomment this and comment the gnerate_code_inner to test ifs
+    
+    //let c1 = cg.new_i64_const(0);
+    //let c2 = cg.new_i64_const(1);
+    //let b1 = c1.cg_eq(&c2);
 
-    cg.generate_return(&return_val);
+    let b1 = cg.new_bool_const(true);
+
+    /*let mut val = cg.new_i64_const(0);
+
+    cg.generate_if(b1, || {
+        val = val.clone() + &cg.new_i64_const(1);
+    });*/
+
+    let return_value = b1.into(); // val.into();
+    
+
+    //let return_value = generate_code_inner(&cg, expr)?;
+
+    cg.generate_return(return_value);
 
     let gc = cg.generate_code();
 

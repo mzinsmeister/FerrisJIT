@@ -181,7 +181,7 @@ impl ConstValue {
 
     pub fn bitcast_to_u64(&self) -> u64 {
         match self {
-            ConstValue::Bool(b) => *b as u64,
+            ConstValue::Bool(b) => if *b { 1 } else { 0 },
             ConstValue::I8(i) => *i as u64,
             ConstValue::I16(i) => *i as u64,
             ConstValue::I32(i) => *i as u64,
@@ -195,4 +195,23 @@ impl ConstValue {
         }
     
     }
+}
+
+enum Operation {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
