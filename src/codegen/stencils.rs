@@ -249,7 +249,7 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> S
             let name = &strtab.get_at(sym.st_name);
             if let Some(name) = name {
                 if name.starts_with("PH") {
-                    assert!(reloc.r_type == reloc::R_X86_64_PC32 || reloc.r_type == reloc::R_X86_64_64, "Unexpected relocation type: {:?}", reloc.r_type);
+                    assert!(reloc.r_type == reloc::R_X86_64_PLT32 || reloc.r_type == reloc::R_X86_64_64, "Unexpected relocation type: {:?}", reloc.r_type);
                     //println!("Relocation: {:?}: {:#?}", name, reloc);
                     relocs.push((name.to_string(), reloc));
                 }
