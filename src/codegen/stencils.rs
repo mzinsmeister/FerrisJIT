@@ -332,24 +332,21 @@ impl<'ctx> StencilCodeGen<'ctx> {
     }
 
     fn init_placeholder(&self, ty: IntType<'ctx>) -> IntValue<'ctx> {
-        let global_ty: BasicTypeEnum = if ty.get_bit_width() > 4 {
-            self.context.i8_type().array_type(1048576).into()
-        } else {
-            self.context.i8_type().into()
-        };
+        let global_ty: BasicTypeEnum = self.context.i8_type().array_type(1048576).into();
 
         let global = self.module.add_global(global_ty, None, format!("PH{}", self.ph_counter.get()).as_str());
-        //global.set_linkage(Linkage::External);
+        global.set_linkage(Linkage::External);
         global.set_alignment(1);
 
         self.ph_counter.set(self.ph_counter.get() + 1);
 
-        if ty.get_bit_width() > 4 {
+        // TODO: Make this work. At the moment this just generates these weird rip-relative relocation records.
+        //if ty.get_bit_width() > 32 {
             self.large_ph.set(true);
-        }
+        //}
 
         let ptr = global.as_pointer_value();
-
+        
         self.builder.build_ptr_to_int(ptr, ty, "ptrtoint").unwrap()
     }
 
@@ -387,10 +384,10 @@ impl<'ctx> StencilCodeGen<'ctx> {
                 // it will not inline any basic blocks and not do tail calls for the cond
                 OptimizationLevel::Aggressive, 
                 RelocMode::Static,
-                if large {CodeModel::Large } else { CodeModel::Small }, // TODO: Fix Smaller code model values
+                // TODO: Shouldn't medium code model only use 64 bit relocations only for large data?
+                if large {CodeModel::Large } else { CodeModel::Small }, 
             )
             .unwrap();
-
 
         let passes: &[&str] = &[
             "instcombine",
@@ -947,7 +944,7 @@ fn compile_all_int_op() -> BTreeMap<StencilType, Stencil> {
         (StencilOperation::Lt, StencilOperation::LtConst, int_lt), 
         (StencilOperation::Lte, StencilOperation::LteConst, int_le), 
     ];
-    let types = vec![DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
+    let types = vec![DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
 
     let mut stencils = BTreeMap::new();
 
@@ -1009,8 +1006,6 @@ fn compile_all_take_const(stencil_lib: &mut BTreeMap<StencilType, Stencil>) {
         result.insert(s_type, stencil);
     }
     stencil_lib.append(&mut result);
-    let u8_stencil = stencil_lib.get(&StencilType::new(StencilOperation::Take1Const, Some(DataType::U8))).unwrap().clone();
-    stencil_lib.insert(StencilType::new(StencilOperation::Take1Const, Some(DataType::Bool)), u8_stencil);
 }
 
 fn compile_all_load_store() -> BTreeMap<StencilType, Stencil>{
