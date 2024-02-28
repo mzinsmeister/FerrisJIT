@@ -2,6 +2,7 @@
 
 .vscode
 
-# Ignore dumped debugging stencil object files
+# Ignore dumped debugging stencil object files and test data
 /stencils-dump
 *.o
+vlong.txt

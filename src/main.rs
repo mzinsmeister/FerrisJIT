@@ -22,6 +22,9 @@ struct Cli {
     /// Whether to run in benchmark mode
     #[arg(short, long)]
     benchmark: bool,
+    /// Number of elements to generate
+    #[arg(short, long)]
+    number: Option<u64>
 }
 
 fn eval<T: Display>(expr: &expr::Expr, test_data: &[Vec<i64>], benchmark: bool) {
@@ -118,11 +121,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             .collect()
     } else {
         println!("No csv file specified, using default dummy data");
-        if args.benchmark {
-            (0..1_000_000i64).map(|n| vec![n]).collect()
+        let default_n = if args.benchmark {
+            1_000_000i64
         } else {
-            (0..10).map(|n| vec![n]).collect()
-        }
+            10
+        };
+        let n = args.number.map_or(default_n, |n| n as i64);
+        (0..n).map(|x| vec![x]).collect()
     };
 
     if test_data.len() == 0 {
