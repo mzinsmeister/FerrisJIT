@@ -1,4 +1,4 @@
-use goblin::elf::reloc;
+use goblin::elf;
 use inkwell::builder::Builder;
 
 use inkwell::context::Context;
@@ -183,9 +183,8 @@ impl Display for StencilType {
 pub struct Stencil {
     pub s_type: StencilType,
     pub code: Vec<u8>,
-    pub holes: Vec<(usize, bool)>,
-    pub tail_holes: Vec<usize>,
-    pub large: bool
+    pub holes: Vec<Reloc>,
+    pub tail_holes: Vec<Reloc>,
 }
 
 impl Display for Stencil {
@@ -198,32 +197,58 @@ impl Display for Stencil {
 #[allow(dead_code)]
 impl Stencil {
     pub fn code_without_jump(&self) -> &[u8] {
-        if self.large {
-            &self.code[..self.code.len() - 2]
-        } else {
-            &self.code[..self.code.len() - 5]
+        match self.tail_holes.last().unwrap().reloc_type {
+            RelocType::Rel32 => &self.code[..self.tail_holes.last().unwrap().offset - 5],
+            RelocType::Abs64 => &self.code[..self.tail_holes.last().unwrap().offset - 2],
+            _ => panic!("Unexpected relocation type for tail call: {:?}", self.tail_holes.last().unwrap().reloc_type)
+        
         }
-    }
-
-    pub fn get_holes_bytelen(&self) -> usize {
-        if self.large {
-            8
-        } else {
-            4
-        }
-    }
-
-    pub fn get_tailcall_bytelen(&self) -> usize {
-        if self.large {
-            2
-        } else {
-            5
-        }
-    
     }
 }
 
-fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> Stencil {
+// Simplified and platform independent relocation types
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub enum RelocType {
+    Abs32,
+    Rel32, // We assume that this is automatically a function then
+    Abs64,
+    Abs64Fun
+}
+
+impl RelocType {
+    fn from_elf_code(reloc: u32) -> RelocType {
+        match reloc {
+            elf::reloc::R_X86_64_32 => RelocType::Abs32,
+            elf::reloc::R_X86_64_PLT32 => RelocType::Rel32,
+            elf::reloc::R_X86_64_64 => RelocType::Abs64,
+            _ => panic!("Unexpected relocation type: {}", elf::reloc::r_to_str(reloc, elf::header::EM_X86_64))
+        }
+    }
+
+    fn from_elf_code_fun(reloc: u32) -> RelocType {
+        match reloc {
+            elf::reloc::R_X86_64_64 => RelocType::Abs64Fun,
+            elf::reloc::R_X86_64_PLT32 => RelocType::Rel32,
+            _ => panic!("Unexpected relocation type for function: {}", elf::reloc::r_to_str(reloc, elf::header::EM_X86_64))
+        }
+    }
+
+    pub fn get_hole_len(&self) -> usize {
+        match self {
+            RelocType::Abs32 | RelocType::Rel32 => 4,
+            RelocType::Abs64 | RelocType::Abs64Fun => 8,
+        }        
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Reloc {
+    pub offset: usize,
+    pub reloc_type: RelocType,
+}
+
+
+fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool) -> Stencil {
     let gobj = goblin::elf::Elf::parse(elf).unwrap();
 
     //println!("---------------------------");
@@ -249,12 +274,22 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> S
             let name = &strtab.get_at(sym.st_name);
             if let Some(name) = name {
                 if name.starts_with("PH") {
-                    assert!(reloc.r_type == reloc::R_X86_64_PLT32 || reloc.r_type == reloc::R_X86_64_64, "Unexpected relocation type: {:?}", reloc.r_type);
                     //println!("Relocation: {:?}: {:#?}", name, reloc);
-                    relocs.push((name.to_string(), reloc));
+                    let r_type = if name.ends_with("F") {
+                        RelocType::from_elf_code_fun(reloc.r_type)
+                    } else {
+                        RelocType::from_elf_code(reloc.r_type)
+                    };
+                    if name.ends_with("F") && r_type == RelocType::Abs32 {
+                        panic!("Unexpected relocation type for function pointer: {:?}", r_type)
+                    }
+                    let ph_id_str = name[2..].split("F").next().unwrap();
+                    let ph_id: usize = ph_id_str.parse().unwrap();
+                    relocs.push((ph_id, Reloc { offset: reloc.r_offset as usize, reloc_type: r_type }));
                 }
                 if name == &"TAIL" {
-                    tail_holes.push(reloc.r_offset as usize);
+                    let reloc_type = RelocType::from_elf_code_fun(reloc.r_type);
+                    tail_holes.push(Reloc { offset: reloc.r_offset as usize, reloc_type});  
                 }
             }
         }
@@ -280,23 +315,32 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> S
     }
 
     relocs.sort_by(|a, b| a.0.cmp(&b.0));
-    tail_holes.sort();
 
-    let holes = relocs.iter().map(|(n, reloc)| (reloc.r_offset as usize, n.ends_with("F"))).collect();
+    // Make sure reloc ids are consecutive
+    debug_assert!(relocs.iter().enumerate().all(|(i, (id, _))| *id == i + 1));
+    let holes = relocs.iter().map(|(_, reloc)| *reloc).collect::<Vec<_>>();
 
-    let large = relocs.iter().any(|(_, r)| r.r_type == reloc::R_X86_64_64);
+    tail_holes.sort_by(|a, b| a.offset.cmp(&b.offset));
 
     let mut code = code.unwrap().to_vec();
 
     if cut_jmp {
-        let truncate = if large { 
-            // Cut out the last tail hole plus the two bytes before it
-            let last_tail_hole = tail_holes.pop().unwrap();
-            // Remove the 10 byte range from the code
-            code.drain(last_tail_hole - 2..last_tail_hole + 8);
-            2
-        } else { 5 }; 
-        code.truncate(code.len() - truncate);
+        let last_tail_hole: Reloc = tail_holes.pop().unwrap();
+        let trunc = match last_tail_hole.reloc_type {
+            RelocType::Rel32 => {
+                // Cut out the last tail hole plus the two bytes before it
+                // Remove the 6 byte range from the code
+                5
+            },
+            RelocType::Abs64Fun => {
+                // Cut out the last tail hole plus the two bytes before it
+                // Remove the 10 byte range from the code
+                code.drain(last_tail_hole.offset - 2..last_tail_hole.offset + 8);
+                2
+            },
+            _ => panic!("Unexpected relocation type for tail call: {:?}", last_tail_hole.reloc_type)
+        };
+        code.truncate(code.len() - trunc);
     }
 
     Stencil {
@@ -304,7 +348,6 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> S
         s_type,
         holes,
         tail_holes,
-        large
     }
 }
 
@@ -313,7 +356,7 @@ struct StencilCodeGen<'ctx> {
     module: Module<'ctx>,
     builder: Builder<'ctx>,
     ph_counter: Cell<usize>,
-    large_ph: Cell<bool>
+    code_model: Cell<CodeModel>
 }
 
 #[allow(dead_code)]
@@ -327,7 +370,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
             module,
             builder,
             ph_counter: Cell::new(1),
-            large_ph: Cell::new(false)
+            code_model: Cell::new(CodeModel::Small)
         }
     }
 
@@ -335,15 +378,15 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let global_ty: BasicTypeEnum = self.context.i8_type().array_type(1048576).into();
 
         let global = self.module.add_global(global_ty, None, format!("PH{}", self.ph_counter.get()).as_str());
-        global.set_linkage(Linkage::External);
+        global.set_linkage(Linkage::Internal);
         global.set_alignment(1);
 
         self.ph_counter.set(self.ph_counter.get() + 1);
 
         // TODO: Make this work. At the moment this just generates these weird rip-relative relocation records.
-        //if ty.get_bit_width() > 32 {
-            self.large_ph.set(true);
-        //}
+        if ty.get_bit_width() > 32 && self.code_model.get() == CodeModel::Small {
+            self.code_model.set(CodeModel::Medium);
+        }
 
         let ptr = global.as_pointer_value();
         
@@ -356,7 +399,6 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let function = self.module.add_function(format!("PH{}F", self.ph_counter.get()).as_str(), fn_type, Some(Linkage::External));
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
         self.ph_counter.set(self.ph_counter.get() + 1);
-        self.large_ph.set(true);
         function
     }
 
@@ -368,7 +410,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         function
     }
 
-    fn compile(&self, large: bool) -> MemoryBuffer {
+    fn compile(&self) -> MemoryBuffer {
         // Print out the LLVM IR
         //println!("{}", self.module.print_to_string().to_string());
 
@@ -385,7 +427,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
                 OptimizationLevel::Aggressive, 
                 RelocMode::Static,
                 // TODO: Shouldn't medium code model only use 64 bit relocations only for large data?
-                if large {CodeModel::Large } else { CodeModel::Small }, 
+                self.code_model.get(), 
             )
             .unwrap();
 
@@ -434,12 +476,14 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         self.builder.build_return(None).unwrap();
 
+        self.code_model.set(CodeModel::Large);
+
         // Print out the LLVM IR
         //println!("{}", self.module.print_to_string().to_string());
 
-        let elf = self.compile(true);
+        let elf = self.compile();
     
-        get_stencil(s_type, elf.as_slice(), false, true)
+        get_stencil(s_type, elf.as_slice(), false)
     }
 
     // We can also generate stencil variants that take 0-6 64 bit arguments for example
@@ -462,7 +506,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         // We can then put our arguments somewhere in memory and pass a pointer to that
         // We also get back a single pointer to the result
         let c_function_type = uint8_ptr.fn_type(&[uint8_ptr.into()], false);
-        let c_function = self.module.add_function("PH-1", c_function_type, Some(Linkage::External));
+        let c_function = self.module.add_function("PH1F", c_function_type, Some(Linkage::External));
         c_function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMCCallConv as u32);
 
         let call = self.builder.build_indirect_call(c_function_type, c_function.as_global_value().as_pointer_value(), &[arg.into()], "call").unwrap();
@@ -476,9 +520,11 @@ impl<'ctx> StencilCodeGen<'ctx> {
         tc.set_tail_call(true);      
         self.builder.build_return(None).unwrap();
 
-        let elf = self.compile(true);
+        self.code_model.set(CodeModel::Large);
+
+        let elf = self.compile();
     
-        get_stencil(StencilType::new(StencilOperation::CallCFunction, None), elf.as_slice(), true, true)
+        get_stencil(StencilType::new(StencilOperation::CallCFunction, None), elf.as_slice(), true)
     }
 
     fn compile_stencil<F: Fn(&[BasicValueEnum<'ctx>], PointerValue<'ctx>) -> Vec<BasicValueEnum<'ctx>>>(&self, s_type: StencilType, args: &[BasicMetadataTypeEnum<'ctx>], operation: F) -> Stencil {
@@ -500,6 +546,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
         
         let fn_type = void_type.fn_type(&new_args, false);
         let function = self.module.add_function(&format!("{}", s_type), fn_type, None);
+        // We need to set our functions DSO Local!
+        function.set_linkage(Linkage::Internal);
         let basic_block = self.context.append_basic_block(function, "entry");
 
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
@@ -535,9 +583,9 @@ impl<'ctx> StencilCodeGen<'ctx> {
         tc.set_tail_call(true);
         self.builder.build_return(None).unwrap();
 
-        let elf = self.compile(self.large_ph.get());
+        let elf = self.compile();
         
-        get_stencil(s_type, elf.as_slice(), true, self.large_ph.get())
+        get_stencil(s_type, elf.as_slice(), true)
     }
 
     fn compile_take_first_stack(&self) -> Stencil {
@@ -693,9 +741,9 @@ impl<'ctx> StencilCodeGen<'ctx> {
         call.set_tail_call(true);
         self.builder.build_return(None).unwrap();*/
 
-        let elf = self.compile(false);
+        let elf = self.compile();
     
-        get_stencil(s_type, elf.as_slice(), false, false)    
+        get_stencil(s_type, elf.as_slice(), false)    
     }
 
     fn compile_get_stack_ptr(&self) -> Stencil {
@@ -818,8 +866,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
         tc.set_tail_call(true);
         self.builder.build_return(None).unwrap();
                 
-        let elf = self.compile(false);
-        get_stencil(s_type, elf.as_slice(), false, false)    
+        let elf = self.compile();
+        get_stencil(s_type, elf.as_slice(), false)    
     }
 
 
@@ -837,9 +885,9 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         self.builder.build_return(None).unwrap();
                 
-        let elf = self.compile(false);
+        let elf = self.compile();
     
-        get_stencil(s_type, elf.as_slice(), false, false)    
+        get_stencil(s_type, elf.as_slice(), false)    
     }
 }
 

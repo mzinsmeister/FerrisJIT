@@ -704,20 +704,8 @@ pub struct CodeGen {
 impl CodeGen {
 
     pub fn new(args: usize) -> Self {
-        let values = (0..args).into_iter()
-            .map(|i| CGValue::Variable{ data_type: DataType::I64, stack_pos: i * 8, readonly: true})
-            .collect();
         let cp_backend = Rc::new(CopyPatchBackend::new());
-        let memory_management = MemoryManagement {
-            args_size: args,
-            values,
-            free_slots: Vec::new(),
-            free_stack_pos: Vec::new(),
-            reg_state: [None, None],
-            stack_ptr: args * 8,
-            stack_size: args * 8,
-            cp_backend: cp_backend.clone()
-        };
+        let memory_management = MemoryManagement::new(cp_backend.clone(), args);
         Self {
             inner: cp_backend,
             memory_management: RefCell::new(memory_management)

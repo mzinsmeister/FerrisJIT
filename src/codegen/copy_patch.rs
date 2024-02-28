@@ -1,6 +1,6 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
-use crate::codegen::stencils::{compile_all_stencils, Stencil};
+use crate::codegen::stencils::{compile_all_stencils, Stencil, RelocType};
 
 #[cfg(feature = "print-asm")]
 use super::disassemble;
@@ -60,28 +60,44 @@ impl CopyPatchBackend {
         code.extend_from_slice(&stencil.code);
         let end_ofs = code.len();
         let stencil_slice = &mut code[start_ofs..end_ofs];
-        let hole_lengths = if stencil.large { 8 } else { 4 };
-        for (&(ofs, fun), val) in stencil.holes.iter().zip(holes_values.iter()) {
-            if stencil.large {
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&val.to_ne_bytes());
-                if fun {
-                    fixup_holes.push(start_ofs + ofs);
-                }
-            } else {
-                let val = if fun { (end_ofs as i32 - (ofs as i32 + 4)) as u32 } else { *val as u32 };
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&val.to_ne_bytes());
+        for (&reloc, val) in stencil.holes.iter().zip(holes_values.iter()) {
+            let hole_len = reloc.reloc_type.get_hole_len();
+            if reloc.offset + hole_len > stencil_slice.len() {
+                continue;
+            }
+            match reloc.reloc_type {
+                RelocType::Abs64 | RelocType::Abs64Fun => {
+                    stencil_slice[reloc.offset..reloc.offset + hole_len].copy_from_slice(&val.to_ne_bytes());
+                    if reloc.reloc_type == RelocType::Abs64Fun {
+                        fixup_holes.push(start_ofs + reloc.offset);
+                    }
+                },
+                RelocType::Abs32 => {
+                    let val = *val as u32;
+                    stencil_slice[reloc.offset..reloc.offset + hole_len].copy_from_slice(&val.to_ne_bytes());
+                },
+                RelocType::Rel32 => {
+                    let val = (*val as i64 - (reloc.offset as i64 + 4)) as i32;
+                    stencil_slice[reloc.offset..reloc.offset + hole_len].copy_from_slice(&val.to_ne_bytes());
+                },
             }
         }
 
-        for &ofs in &stencil.tail_holes {
-            if ofs + hole_lengths > stencil_slice.len() {
+        for &reloc in &stencil.tail_holes {
+            let hole_len = reloc.reloc_type.get_hole_len();
+            if reloc.offset + hole_len > stencil_slice.len() {
                 continue;
             }
-            if stencil.large {
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&(end_ofs).to_ne_bytes());
-                fixup_holes.push(start_ofs + ofs);
-            } else {
-                stencil_slice[ofs..ofs + hole_lengths].copy_from_slice(&((end_ofs - (ofs + 4)) as u32).to_ne_bytes());
+            match reloc.reloc_type {
+                RelocType::Abs64Fun => {
+                    stencil_slice[reloc.offset..reloc.offset + hole_len].copy_from_slice(&end_ofs.to_ne_bytes());
+                    fixup_holes.push(start_ofs + reloc.offset);
+                },
+                RelocType::Rel32 => {
+                    let val = (end_ofs as i64 - (reloc.offset as i64 + 4)) as i32;
+                    stencil_slice[reloc.offset..reloc.offset + hole_len].copy_from_slice(&val.to_ne_bytes());
+                },
+                _ => unreachable!("Function pointers should never have reloc type {:?}", reloc.reloc_type),
             }
         }
     }
@@ -385,9 +401,8 @@ impl CopyPatchBackend {
 
     pub fn generate_if<THEN: FnOnce()>(&self, then: THEN) {
         let cond_stencil = STENCILS.get(&StencilType::new(StencilOperation::CondBr, None)).unwrap();
-        assert_eq!(cond_stencil.get_holes_bytelen(), 4);
-        let then_hole = cond_stencil.holes[0].0;
-        if then_hole + 4 >= cond_stencil.code.len() {
+        let then_hole = cond_stencil.holes[0];
+        if then_hole.reloc_type == RelocType::Rel32 && then_hole.offset + 4 == cond_stencil.code.len() {
             let code_without_jump = cond_stencil.code_without_jump();
             let mut code = self.code.borrow_mut();
             let start_len = code.len();
@@ -396,10 +411,10 @@ impl CopyPatchBackend {
             drop(code);
             then();
             let mut code = self.code.borrow_mut();
-            let else_hole_ofs = start_len + cond_stencil.holes[1].0;
+            let else_hole_ofs = start_len + cond_stencil.holes[1].offset;
             let end_ofs = code.len();
             let else_hole = &mut code[else_hole_ofs..else_hole_ofs + 4];
-            else_hole.copy_from_slice(&((end_ofs - (else_hole_ofs + 4)) as u32).to_ne_bytes());
+            else_hole.copy_from_slice(&((end_ofs as i32 - (else_hole_ofs as i32 + 4)) as u32).to_ne_bytes());
         } else {
             // TODO: Just implement this in case some other LLVM version produces some other code
             panic!("LLVM has produced some unexpected output it seems. Fix this case! {}:{}", file!(), line!())
@@ -410,14 +425,14 @@ impl CopyPatchBackend {
     pub fn generate_uncond_branch(&self, ofs: i32) -> usize {
         let s_type = StencilType::new(StencilOperation::UncondBr, None);
         let stencil = STENCILS.get(&s_type).unwrap();
-        assert_eq!(stencil.get_holes_bytelen(), 4);
-        assert_eq!(stencil.tail_holes.len(), 1);
+        debug_assert_eq!(stencil.tail_holes[0].reloc_type, RelocType::Rel32);
+        debug_assert_eq!(stencil.tail_holes.len(), 1);
         let code = &mut self.code.borrow_mut();
         let start_len = code.len();
         code.extend_from_slice(&stencil.code);
         let inst_len = stencil.code.len();
         let ofs = ofs - (inst_len as i32);
-        let tail_hole_ofs = start_len + stencil.tail_holes[0];
+        let tail_hole_ofs = start_len + stencil.tail_holes[0].offset;
         let ofs_hole = &mut code[tail_hole_ofs..tail_hole_ofs + 4];
         ofs_hole.copy_from_slice(&ofs.to_ne_bytes());
         tail_hole_ofs
@@ -425,9 +440,10 @@ impl CopyPatchBackend {
 
     pub fn generate_if_else<THEN: FnOnce(), ELSE: FnOnce()>(&self, then_branch: THEN, else_branch: ELSE) {
         let cond_stencil = STENCILS.get(&StencilType::new(StencilOperation::CondBr, None)).unwrap();
-        assert_eq!(cond_stencil.get_holes_bytelen(), 4);
-        let then_hole = cond_stencil.holes[0].0;
-        let else_hole = cond_stencil.holes[1].0;
+        debug_assert_eq!(cond_stencil.holes[0].reloc_type, RelocType::Rel32);
+        debug_assert_eq!(cond_stencil.holes[1].reloc_type, RelocType::Rel32);
+        let then_hole = cond_stencil.holes[0].offset;
+        let else_hole = cond_stencil.holes[1].offset;
         if then_hole + 4 >= cond_stencil.code.len()  {
             let mut code = self.code.borrow_mut();
             let start_len = code.len();
