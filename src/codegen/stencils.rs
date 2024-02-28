@@ -1,3 +1,4 @@
+use goblin::elf::reloc;
 use inkwell::builder::Builder;
 
 use inkwell::context::Context;
@@ -7,7 +8,7 @@ use inkwell::module::{Linkage, Module};
 use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine};
 
-use inkwell::types::{BasicMetadataTypeEnum, IntType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum, IntType};
 use inkwell::values::{BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, OptimizationLevel};
 
@@ -248,6 +249,7 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> S
             let name = &strtab.get_at(sym.st_name);
             if let Some(name) = name {
                 if name.starts_with("PH") {
+                    assert!(reloc.r_type == reloc::R_X86_64_PC32 || reloc.r_type == reloc::R_X86_64_64, "Unexpected relocation type: {:?}", reloc.r_type);
                     //println!("Relocation: {:?}: {:#?}", name, reloc);
                     relocs.push((name.to_string(), reloc));
                 }
@@ -282,6 +284,8 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> S
 
     let holes = relocs.iter().map(|(n, reloc)| (reloc.r_offset as usize, n.ends_with("F"))).collect();
 
+    let large = relocs.iter().any(|(_, r)| r.r_type == reloc::R_X86_64_64);
+
     let mut code = code.unwrap().to_vec();
 
     if cut_jmp {
@@ -298,9 +302,9 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool, large: bool) -> S
     Stencil {
         code,
         s_type,
-        holes: holes,
-        tail_holes: tail_holes,
-        large: large
+        holes,
+        tail_holes,
+        large
     }
 }
 
@@ -328,10 +332,14 @@ impl<'ctx> StencilCodeGen<'ctx> {
     }
 
     fn init_placeholder(&self, ty: IntType<'ctx>) -> IntValue<'ctx> {
-        let i8_array_type = self.context.i8_type().array_type(1048576);
+        let global_ty: BasicTypeEnum = if ty.get_bit_width() > 4 {
+            self.context.i8_type().array_type(1048576).into()
+        } else {
+            self.context.i8_type().into()
+        };
 
-        let global = self.module.add_global(i8_array_type, Some(AddressSpace::default()), format!("PH{}", self.ph_counter.get()).as_str());
-        global.set_linkage(Linkage::External);
+        let global = self.module.add_global(global_ty, None, format!("PH{}", self.ph_counter.get()).as_str());
+        //global.set_linkage(Linkage::External);
         global.set_alignment(1);
 
         self.ph_counter.set(self.ph_counter.get() + 1);
@@ -379,7 +387,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
                 // it will not inline any basic blocks and not do tail calls for the cond
                 OptimizationLevel::Aggressive, 
                 RelocMode::Static,
-                if large {CodeModel::Large } else { CodeModel::Medium },
+                if large {CodeModel::Large } else { CodeModel::Small }, // TODO: Fix Smaller code model values
             )
             .unwrap();
 
@@ -939,7 +947,7 @@ fn compile_all_int_op() -> BTreeMap<StencilType, Stencil> {
         (StencilOperation::Lt, StencilOperation::LtConst, int_lt), 
         (StencilOperation::Lte, StencilOperation::LteConst, int_le), 
     ];
-    let types = vec![DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
+    let types = vec![DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
 
     let mut stencils = BTreeMap::new();
 
@@ -974,7 +982,7 @@ fn compile_all_int_op() -> BTreeMap<StencilType, Stencil> {
 fn compile_all_take_const(stencil_lib: &mut BTreeMap<StencilType, Stencil>) {
     let context = Context::create();
     let mut result = BTreeMap::new();
-    let types = &[DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::F32, DataType::F64];
+    let types = &[DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::F32, DataType::F64];
     let op = StencilOperation::Take1Const;
     let op2 = StencilOperation::Take2Const;
     for ty in types {
@@ -990,17 +998,19 @@ fn compile_all_take_const(stencil_lib: &mut BTreeMap<StencilType, Stencil>) {
     // insert the unsigned stencils again for signed types
     let mut new_stencils = Vec::new();
     for (s_type, stencil) in result.iter() {
-    if let Some(ty) = s_type.data_type.as_ref() {
-        if let Some(new_ty) = ty.flip_signed() {
-            let new_s_type = StencilType::new(s_type.operation, Some(new_ty));
-            new_stencils.push((new_s_type, stencil.clone()));
+        if let Some(ty) = s_type.data_type.as_ref() {
+            if let Some(new_ty) = ty.flip_signed() {
+                let new_s_type = StencilType::new(s_type.operation, Some(new_ty));
+                new_stencils.push((new_s_type, stencil.clone()));
+            }
         }
     }
-    }
     for (s_type, stencil) in new_stencils {
-    result.insert(s_type, stencil);
+        result.insert(s_type, stencil);
     }
     stencil_lib.append(&mut result);
+    let u8_stencil = stencil_lib.get(&StencilType::new(StencilOperation::Take1Const, Some(DataType::U8))).unwrap().clone();
+    stencil_lib.insert(StencilType::new(StencilOperation::Take1Const, Some(DataType::Bool)), u8_stencil);
 }
 
 fn compile_all_load_store() -> BTreeMap<StencilType, Stencil>{
