@@ -694,7 +694,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let void_type = self.context.void_type();
         let bool_type = self.context.bool_type();
         let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
-        let fn_type = void_type.fn_type(&[i8_ptr_type.into(), bool_type.into()], false);
+        let fn_type = void_type.fn_type(&[i8_ptr_type.into(), bool_type.into(), i8_ptr_type.into()], false);
         let function_head = self.module.add_function("cond", fn_type, None);
         let basic_block = self.context.append_basic_block(function_head, "entry");
 
@@ -705,9 +705,11 @@ impl<'ctx> StencilCodeGen<'ctx> {
         self.builder.position_at_end(basic_block);
 
         let cond = function_head.get_nth_param(1).unwrap().into_int_value();
+        let x = i8_ptr_type.get_undef();
+        let y = function_head.get_nth_param(2).unwrap();
 
-        let then_tailcallfun = self.init_fn_placeholder(&[i8_ptr_type.into()]);
-        let else_tailcallfun = self.init_fn_placeholder(&[i8_ptr_type.into()]);
+        let then_tailcallfun = self.init_fn_placeholder(&[i8_ptr_type.into(), i8_ptr_type.into(), i8_ptr_type.into()]);
+        let else_tailcallfun = self.init_fn_placeholder(&[i8_ptr_type.into(), i8_ptr_type.into(), i8_ptr_type.into()]);
 
         let then_block = self.context.append_basic_block(function_head, "then");
         let else_block = self.context.append_basic_block(function_head, "else");
@@ -716,14 +718,14 @@ impl<'ctx> StencilCodeGen<'ctx> {
         self.builder.build_conditional_branch(cond, then_block, else_block).unwrap();
 
         self.builder.position_at_end(then_block);
-        let call = self.builder.build_call(then_tailcallfun, &[stackptr.into()], "call").unwrap();
+        let call = self.builder.build_call(then_tailcallfun, &[stackptr.into(), x.into(), y.into()], "call").unwrap();
         call.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
         call.set_tail_call(true);
         self.builder.build_return(None).unwrap();
         //self.builder.build_unconditional_branch(end_block).unwrap();
 
         self.builder.position_at_end(else_block);
-        let call = self.builder.build_call(else_tailcallfun, &[stackptr.into()], "call").unwrap();
+        let call = self.builder.build_call(else_tailcallfun, &[stackptr.into(), x.into(), y.into()], "call").unwrap();
         call.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
         call.set_tail_call(true);
         self.builder.build_return(None).unwrap();

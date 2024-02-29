@@ -403,7 +403,7 @@ impl CopyPatchBackend {
         let cond_stencil = STENCILS.get(&StencilType::new(StencilOperation::CondBr, None)).unwrap();
         let then_hole = cond_stencil.holes[0];
         if then_hole.reloc_type == RelocType::Rel32 && then_hole.offset + 4 == cond_stencil.code.len() {
-            let code_without_jump =  &cond_stencil.code[..cond_stencil.code.len()-5];
+            let code_without_jump: &[u8] =  &cond_stencil.code[..cond_stencil.code.len()-5];
             let mut code = self.code.borrow_mut();
             let start_len = code.len();
             code.extend_from_slice(&code_without_jump);
@@ -442,17 +442,18 @@ impl CopyPatchBackend {
         let cond_stencil = STENCILS.get(&StencilType::new(StencilOperation::CondBr, None)).unwrap();
         debug_assert_eq!(cond_stencil.holes[0].reloc_type, RelocType::Rel32);
         debug_assert_eq!(cond_stencil.holes[1].reloc_type, RelocType::Rel32);
-        let then_hole = cond_stencil.holes[0].offset;
-        let else_hole = cond_stencil.holes[1].offset;
-        if then_hole + 4 >= cond_stencil.code.len()  {
+        let else_hole = cond_stencil.holes[1];
+        let then_hole = cond_stencil.holes[0];
+        if then_hole.reloc_type == RelocType::Rel32 && then_hole.offset + 4 == cond_stencil.code.len() {
+            let code_without_jump: &[u8] =  &cond_stencil.code[..cond_stencil.code.len()-5];
             let mut code = self.code.borrow_mut();
             let start_len = code.len();
-            code.extend_from_slice(&cond_stencil.code_without_jump());
+            code.extend_from_slice(code_without_jump);
             // Drop the borrow so that the closure can borrow self again
             drop(code);
             then_branch();
             let tail_hole_ofs = self.emit_uncond_branch(0);
-            let else_hole_ofs = start_len + else_hole;
+            let else_hole_ofs = start_len + else_hole.offset;
             let mut code = self.code.borrow_mut();
             let end_ofs = code.len();
             let else_hole = &mut code[else_hole_ofs..else_hole_ofs + 4];

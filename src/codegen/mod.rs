@@ -3,7 +3,6 @@ pub mod stencils;
 pub mod ir;
 mod disassemble;
 mod copy_patch;
-mod expr_codegen;
 mod generated_code;
 
 use core::panic;
@@ -14,7 +13,6 @@ use crate::codegen::{copy_patch::STENCILS, ir::DataType};
 
 use self::{copy_patch::CopyPatchBackend, ir::ConstValue};
 
-pub use expr_codegen::{get_type, generate_code, CodeGenError};
 pub use generated_code::GeneratedCode;
 
 // This is a simple example of how we can generate code that calls back into pre-compiled
@@ -61,7 +59,7 @@ enum CGValue {
 }
 
 
-trait Setable<'o, Other> {
+pub trait Setable<'o, Other> {
     fn set(&self, other: Other);
 }
 
@@ -74,7 +72,7 @@ enum CGValueRefInner {
 pub struct CGValueRef<'cg> {
     inner: CGValueRefInner,
     cg: &'cg CodeGen,
-    data_type: DataType,
+    pub data_type: DataType,
 }
 
 impl<'cg> Drop for CGValueRef<'cg> {
@@ -133,13 +131,13 @@ impl<'cg> std::fmt::Debug for CGValueRef<'cg> {
         write!(f, "CGValueRef({:?}, {:x})", self.inner, ptr::addr_of!(self.cg) as usize)
     }
 }
-trait CGEq<'o, Other> {
+pub trait CGEq<'o, Other> {
     fn cg_eq(self, other: Other) -> BoolRef<'o>;
 
     fn cg_neq(self, other: Other) -> BoolRef<'o>;
 }
 
-trait CGCmp<'o, Other> {
+pub trait CGCmp<'o, Other> {
     fn cg_lt(self, other: Other) -> BoolRef<'o>;
 
     fn cg_lte(self, other: Other) -> BoolRef<'o>;
@@ -823,13 +821,36 @@ impl CodeGen {
         //I64Ref(CGValueRef::new_readonly(n, self, DataType::I64))
     }
 
-    pub fn new_i64_const(&self, n: i64) -> I64Ref {
-        I64Ref(CGValueRef::new_const(ConstValue::I64(n), self))
+    fn new_var(&self, data_type: DataType) -> CGValueRef {
+        let mut memory_management = self.memory_management.borrow_mut();
+        let i = memory_management.allocate_stack(data_type);
+        CGValueRef::new(i, self, data_type)
     }
 
-    pub fn new_bool_const(&self, b: bool) -> BoolRef {
-        BoolRef(CGValueRef::new_const(ConstValue::Bool(b), self))
+    fn new_const(&self, c: ConstValue) -> CGValueRef {
+        CGValueRef::new_const(c, self)
     }
+
+    /// Create a new i64 constant. Note that `set` cannot be called on constants!
+    pub fn new_i64_const(&self, n: i64) -> I64Ref {
+        I64Ref(self.new_const(ConstValue::I64(n)))
+    }
+
+    /// Create a new i64 variable. If you don't need to change the value, use a constant instead.
+    pub fn new_i64_var(&self) -> I64Ref {
+        I64Ref(self.new_var(DataType::I64))
+    }
+
+    /// Create a new bool constant. Note that `set` cannot be called on constants!
+    pub fn new_bool_const(&self, b: bool) -> BoolRef {
+        BoolRef(self.new_const(ConstValue::Bool(b)))
+    }
+
+    /// Create a new bool variable. If you don't need to change the value, use a constant instead.
+    pub fn new_bool_var(&self) -> BoolRef {
+        BoolRef(self.new_var(DataType::Bool))
+    }
+
 
     fn load_const(&self, v: usize, c: ConstValue) {
         let mut memory_management = self.memory_management.borrow_mut();
@@ -1014,7 +1035,11 @@ impl CodeGen {
     //       So that they can then be passed as arguments to the closure and
     //       mutated directly there. This way we could omit the flush of those
     //       to the stack if they already are in a register. 
-    pub fn generate_if(&self, mut condition: BoolRef, then_branch: impl Fn()) {
+
+    /// Generate an if statement. You cannot assign to variables outside the closure passed as then_branch
+    /// this is by design because it prevents you from accidentially generating nonsensical code. 
+    /// Use the `set` function instead.
+    pub fn gen_if(&self, mut condition: BoolRef, then_branch: impl Fn()) {
         let mut memory_management = self.memory_management.borrow_mut();
         let i = match &condition.0.inner {
             CGValueRefInner::Value(i) => *i,
@@ -1027,18 +1052,47 @@ impl CodeGen {
         };
         memory_management.put_in_reg(0, i);
         drop(memory_management);
-        self.inner.emit_if(move || {
+        self.inner.emit_if(|| {
+            self.memory_management.borrow_mut().lose_reg(0);
             then_branch();
         });
         let mut memory_management = self.memory_management.borrow_mut();
-        memory_management.lose_reg(0);
+        memory_management.flush_regs();
     }
 
-    // TODO: This currently doesn't work with constants because we load them lazily which leads to the
-    //       constant instead of the updated value beeing loaded again in the loop condition
-    //       What we could do as a quick fix is materialize every constant into a variable before we enter a loop
+    /// Generate an if else statement. You cannot assign to variables declared outside the closures passed as 
+    /// then_branch and else_branch. This is by design because it prevents you from accidentially 
+    /// generating nonsensical code. Use the `set` function instead.
+    pub fn gen_if_else(&self, mut condition: BoolRef, then_branch: impl Fn(), else_branch: impl Fn()) {
+        let mut memory_management = self.memory_management.borrow_mut();
+        let i = match &condition.0.inner {
+            CGValueRefInner::Value(i) => *i,
+            CGValueRefInner::Const(c) => {
+                let new_i = memory_management.allocate_stack(DataType::Bool);
+                memory_management.init(new_i, *c);
+                condition.0.inner = CGValueRefInner::Value(new_i);
+                new_i
+            }
+        };
+        memory_management.put_in_reg(0, i);
+        drop(memory_management);
+        self.inner.emit_if_else(|| {
+            self.memory_management.borrow_mut().lose_reg(0);
+            then_branch();
+            let mut memory_management = self.memory_management.borrow_mut();
+            memory_management.flush_regs();
+        }, || {
+            else_branch();
+            let mut memory_management = self.memory_management.borrow_mut();
+            memory_management.flush_regs();
+        });
+    }
+
+    /// Generate a while loop. You cannot assign to variables declared outside the closure passed as
+    /// condition. This is by design because it prevents you from accidentially generating nonsensical code.
+    /// Use the `set` function instead.
     pub fn gen_while<'cg>(&self, condition: impl Fn() -> BoolRef<'cg>, body: impl Fn()) {
-        self.memory_management.borrow_mut().flush_regs();
+        self.memory_management.borrow_mut().lose_reg(0);
         self.inner.emit_loop( || {
             let res = condition();
             let i = match res.0.inner {
@@ -1053,12 +1107,13 @@ impl CodeGen {
         }, || {
             body();
         });
+        self.memory_management.borrow_mut().flush_regs();
     }
 
     //--------------------------------------------------------------------------------
     // Other operations
 
-    fn generate_return(&self, return_value: CGValueRef) {
+    pub fn generate_return(&self, return_value: CGValueRef) {
         let i = match return_value.inner {
             CGValueRefInner::Value(i) => i,
             CGValueRefInner::Const(c) => {
@@ -1074,7 +1129,7 @@ impl CodeGen {
 
     //--------------------------------------------------------------------------------
 
-    fn generate_code(&self) -> GeneratedCode {
+    pub fn generate_code(&self) -> GeneratedCode {
         self.inner.generate_code(self.memory_management.borrow().stack_size)
     }
 }

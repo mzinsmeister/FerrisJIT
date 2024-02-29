@@ -1,9 +1,10 @@
 mod expr;
 mod codegen;
+mod expr_codegen;
 
 use std::{error::Error, fmt::Display, hint::black_box};
 
-use codegen::generate_code;
+use expr_codegen::generate_code;
 use expr::parse_expr_from_str;
 
 
@@ -11,7 +12,7 @@ use clap::Parser;
 use csv::Reader;
 use rustyline::{error::ReadlineError, history::MemHistory, Config, Editor};
 
-use crate::{codegen::{get_type, ir::DataType}, expr::eval_expression};
+use crate::{codegen::ir::DataType, expr::eval_expression, expr_codegen::get_type};
 
 /// Search for a pattern in a file and display the lines that contain it.
 #[derive(Parser)]
@@ -86,10 +87,10 @@ fn eval<T: Display>(expr: &expr::Expr, test_data: &[Vec<i64>], benchmark: bool) 
         },
         Err(c) => {
             match c {
-                codegen::CodeGenError::TypeError => {
+                expr_codegen::CodeGenError::TypeError => {
                     println!("Type error");
                 }
-                codegen::CodeGenError::Const(n) => {
+                expr_codegen::CodeGenError::Const(n) => {
                     println!("Result(const): {}", n);
                 }
             }
@@ -157,7 +158,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 };
                 let parse_elapsed = parse_start.elapsed();
                 println!("Parsed in {:?}", parse_elapsed);
-                let result_type = codegen::get_type(&expr);
+                let result_type = expr_codegen::get_type(&expr);
 
                 match result_type {
                     DataType::I64 => eval::<i64>(&expr, &test_data, args.benchmark),

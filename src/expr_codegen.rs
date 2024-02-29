@@ -5,7 +5,7 @@ use crate::expr::{Atom, BuiltIn, Expr};
 #[cfg(feature = "print-asm")]
 use crate::codegen::disassemble;
 
-use super::{ir::DataType, BoolRef, CGEq, CGValueRef, CodeGen, GeneratedCode, I64Ref};
+use crate::codegen::{ir::DataType, BoolRef, CGEq, CGValueRef, CodeGen, GeneratedCode, I64Ref};
 
 fn fold_op(fun: &BuiltIn, l: Atom, r: Atom) -> Option<Atom> {
     match (fun, l, r) {
@@ -297,7 +297,6 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, CodeGenE
 
     // Uncomment this and comment the gnerate_code_inner to test ifs
 
-    //let b1 = cg.new_bool_const(false);
     /*let val = cg.get_arg(0);
 
     let summand = cg.get_arg(0) + 1;
@@ -306,13 +305,30 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, CodeGenE
         val.clone().cg_lt(10)
     }, || {
         val.set(val.clone() + &summand);
-    });*/
-   
-    /*cg.generate_if(b1, || {
-    //    val = val.clone() + &cg.new_i64_const(1);
-    //});*/
+    });
+    let return_value = val.into();
+    */
 
-    //let return_value = val.into();
+   
+    /*
+    let b1: BoolRef<'_> = cg.new_bool_const(false);
+    cg.gen_if(b1, || {
+        val.set(val.clone() + 1);
+    });
+    let return_value = val.into();
+    */
+
+    /*let b2 = (cg.get_arg(0) % 2).cg_eq(0);
+
+    let val = cg.get_arg(0);
+
+    cg.gen_if_else(b2, || {
+        val.set(val.clone() + 1);
+    }, || {
+        val.set(val.clone() + 2);
+    });
+    let return_value = val.into();
+    */
     
     let return_value = generate_code_inner(&cg, expr)?;
 
