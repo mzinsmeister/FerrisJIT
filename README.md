@@ -1,7 +1,7 @@
 # Beginning of an experimental copy-and-patch like compiler backend written in Rust
 
 <p align="center">
-    <img src="ferrisjit.svg" alt="" style="max-width: 500px"></img>
+    <img src="ferrisjit.svg" alt="" width="350px"></img>
 </p>
 
 
