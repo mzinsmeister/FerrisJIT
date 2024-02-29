@@ -10,7 +10,7 @@ Automatic stencil generation for integer-types and integer-operations should be 
 
 ## Next steps
 
-Next steps would be control flow constructs and beeing able to generate llvm ir for the entire expressions using the same code that generates the stencils.
+Next steps would generating llvm ir on the fly while copy-patching for the entire expressions using the same code that generates the stencils. Note that we would only need to generate the actual operation stencils (arithmetic/boolean/control-flow/...) here and not the helper stencils that are just used to move stuff around to/from/between registers.
 
 ## Try it!
 

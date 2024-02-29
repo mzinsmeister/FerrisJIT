@@ -297,16 +297,23 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, CodeGenE
 
     // Uncomment this and comment the gnerate_code_inner to test ifs
 
-    /*let b1 = cg.new_bool_const(false);
-    let mut val = cg.new_i64_const(0);
+    //let b1 = cg.new_bool_const(false);
+    /*let val = cg.get_arg(0);
 
-    cg.generate_if(b1, || {
-        val = val.clone() + &cg.new_i64_const(1);
+    let summand = cg.get_arg(0) + 1;
+
+    cg.gen_while(|| {
+        val.clone().cg_lt(10)
+    }, || {
+        val.set(val.clone() + &summand);
     });*/
+   
+    /*cg.generate_if(b1, || {
+    //    val = val.clone() + &cg.new_i64_const(1);
+    //});*/
 
     //let return_value = val.into();
     
-
     let return_value = generate_code_inner(&cg, expr)?;
 
     cg.generate_return(return_value);

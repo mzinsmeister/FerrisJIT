@@ -6,7 +6,8 @@ mod copy_patch;
 mod expr_codegen;
 mod generated_code;
 
-use std::{cell::RefCell, hint::black_box, ops::Deref, ptr, rc::Rc};
+use core::panic;
+use std::{cell::RefCell, collections::BTreeMap, hint::black_box, ops::Deref, ptr, rc::Rc};
 use libc::c_void;
 
 use crate::codegen::{copy_patch::STENCILS, ir::DataType};
@@ -56,14 +57,24 @@ enum CGValue {
         stack_pos: usize,
         readonly: bool
     },
-    Constant(ConstValue),
     Free
 }
 
+
+trait Setable<'o, Other> {
+    fn set(&self, other: Other);
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
+enum CGValueRefInner {
+    Value(usize),
+    Const(ConstValue)
+}
+
 pub struct CGValueRef<'cg> {
-    i: usize,
+    inner: CGValueRefInner,
     cg: &'cg CodeGen,
-    data_type: DataType
+    data_type: DataType,
 }
 
 impl<'cg> Drop for CGValueRef<'cg> {
@@ -74,53 +85,74 @@ impl<'cg> Drop for CGValueRef<'cg> {
 
 impl<'cg> CGValueRef<'cg> {
     fn new(i: usize, cg: &'cg CodeGen, data_type: DataType) -> Self {
-        CGValueRef { i, cg, data_type }
+        CGValueRef { inner: CGValueRefInner::Value(i), cg, data_type }
     }
 
-    fn new_readonly(i: usize, cg: &'cg CodeGen, data_type: DataType) -> Self {
-        CGValueRef { i, cg, data_type }
+    fn new_const(c: ConstValue, cg: &'cg CodeGen) -> Self {
+        CGValueRef { inner: CGValueRefInner::Const(c), cg, data_type: c.get_type() }
+    }
+}
+
+impl Setable<'_, &Self> for CGValueRef<'_> {
+    fn set(&self, other: &Self) {
+        if self != other {
+            self.cg.copy_value(other, self);
+        }
+    }
+}
+
+impl<'cg, T: Into<CGValueRef<'cg>>,> Setable<'cg, T> for CGValueRef<'cg> {
+    fn set(&self, other: T) {
+        let other = other.into();
+        if self != &other {
+            self.cg.copy_value(&other, self);
+        }
     }
 }
 
 impl<'cg> PartialEq for CGValueRef<'cg> {
     fn eq(&self, other: &Self) -> bool {
-        self.i == other.i && ptr::eq(self.cg, other.cg)
+        self.inner == other.inner && ptr::eq(self.cg, other.cg)
     }
 }
 
-impl<'cg> Eq for CGValueRef<'cg,> {}
+impl<'cg> Eq for CGValueRef<'cg> {}
 
 impl<'cg> PartialOrd for CGValueRef<'cg> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         if !ptr::eq(self.cg, other.cg) {
             None
         } else {
-            self.i.partial_cmp(&other.i)
+            self.inner.partial_cmp(&other.inner)
         }
     }
 }
 
 impl<'cg> std::fmt::Debug for CGValueRef<'cg> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CGValueRef({}, {:x})", self.i, ptr::addr_of!(self.cg) as usize)
+        write!(f, "CGValueRef({:?}, {:x})", self.inner, ptr::addr_of!(self.cg) as usize)
     }
 }
+trait CGEq<'o, Other> {
+    fn cg_eq(self, other: Other) -> BoolRef<'o>;
 
-trait CGEq<'o> {
-    fn cg_eq(self, other: &Self) -> BoolRef<'o>;
-
-    fn cg_neq(self, other: &Self) -> BoolRef<'o>;
+    fn cg_neq(self, other: Other) -> BoolRef<'o>;
 }
 
-trait CGCmp<'o> {
-    fn lt(self, other: &Self) -> BoolRef<'o>;
+trait CGCmp<'o, Other> {
+    fn cg_lt(self, other: Other) -> BoolRef<'o>;
 
-    fn lte(self, other: &Self) -> BoolRef<'o>;
+    fn cg_lte(self, other: Other) -> BoolRef<'o>;
 
-    fn gt(self, other: &Self) -> BoolRef<'o>;
+    fn cg_gt(self, other: Other) -> BoolRef<'o>;
 
-    fn gte(self, other: &Self) -> BoolRef<'o>;
+    fn cg_gte(self, other: Other) -> BoolRef<'o>;
 }
+
+// Since we can't 
+/*trait CGSet<'o, Other> {
+    fn cg_set(self, other: Other);
+}*/
 
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
 pub struct I64Ref<'cg> (CGValueRef<'cg>);
@@ -133,69 +165,89 @@ impl<'cg> Deref for I64Ref<'cg> {
     }
 }
 
-impl<'cg> CGEq<'cg> for I64Ref<'cg> {
-    fn cg_eq(self, other: &Self) -> BoolRef<'cg> {
+impl<'cg> CGEq<'cg, &Self> for I64Ref<'cg> {
+    fn cg_eq(mut self, other: &Self) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let cgvref = cg.eq(&self.0, &other.0);
-        if cgvref == self.0.i {
-            BoolRef(self.0)
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        cg.eq(&mut self.0, &other.0);
+        BoolRef(self.0)
     }
 
-    fn cg_neq(self, other: &Self) -> BoolRef<'cg> {
+    fn cg_neq(mut self, other: &Self) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let cgvref = cg.neq(&self.0, &other.0);
-        if cgvref == self.0.i {
-            BoolRef(self.0)
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        cg.neq(&mut self.0, &other.0);
+        BoolRef(self.0)
     }
 }
 
-impl<'cg> CGCmp<'cg> for I64Ref<'cg> {
-    fn lt(self, other: &Self) -> BoolRef<'cg> {
+impl<'cg> CGEq<'cg, i64> for I64Ref<'cg> {
+    fn cg_eq(mut self, other: i64) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let cgvref = cg.lt(&self.0, &other.0);
-        if cgvref == self.0.i {
-            BoolRef(self.0)
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        let other = CGValueRef::new_const(ConstValue::I64(other), self.cg);
+        cg.eq(&mut self.0, &other);
+        BoolRef(self.0)
     }
 
-    fn lte(self, other: &Self) -> BoolRef<'cg> {
+    fn cg_neq(mut self, other: i64) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let cgvref = cg.lte(&self.0, &other.0);
-        if cgvref == self.0.i {
-            BoolRef(self.0)
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        let other = CGValueRef::new_const(ConstValue::I64(other), self.cg);
+        cg.neq(&mut self.0, &other);
+        BoolRef(self.0)
+    }
+}
+
+impl<'cg> CGCmp<'cg, &Self> for I64Ref<'cg> {
+    fn cg_lt(mut self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        cg.lt(&mut self.0, &other.0);
+        BoolRef(self.0)
     }
 
-    fn gt(self, other: &Self) -> BoolRef<'cg> {
+    fn cg_lte(mut self, other: &Self) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let cgvref = cg.gt(&self.0, &other.0);
-        if cgvref == self.0.i {
-            BoolRef(self.0)
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        cg.lte(&mut self.0, &other.0);
+        BoolRef(self.0)
     }
 
-    fn gte(self, other: &Self) -> BoolRef<'cg> {
+    fn cg_gt(mut self, other: &Self) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let cgvref = cg.gte(&self.0, &other.0);
-        if cgvref == self.0.i {
-            BoolRef(self.0)
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        cg.gt(&mut self.0, &other.0);
+        BoolRef(self.0)
     }
 
+    fn cg_gte(mut self, other: &Self) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        cg.gte(&mut self.0, &other.0);
+        BoolRef(self.0)
+    }
+}
+
+impl<'cg> CGCmp<'cg, i64> for I64Ref<'cg> {
+    fn cg_lt(mut self, other: i64) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let other = CGValueRef::new_const(ConstValue::I64(other), self.cg);
+        cg.lt(&mut self.0, &other);
+        BoolRef(self.0)
+    }
+
+    fn cg_lte(mut self, other: i64) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let other = CGValueRef::new_const(ConstValue::I64(other), self.cg);
+        cg.lte(&mut self.0, &other);
+        BoolRef(self.0)
+    }
+    fn cg_gt(mut self, other: i64) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let other = CGValueRef::new_const(ConstValue::I64(other), self.cg);
+        cg.gt(&mut self.0, &other);
+        BoolRef(self.0)
+    }
+
+    fn cg_gte(mut self, other: i64) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let other = CGValueRef::new_const(ConstValue::I64(other), self.cg);
+        cg.gte(&mut self.0, &other);
+        BoolRef(self.0)
+    }
 }
 
 impl<'cg> Into<CGValueRef<'cg>> for I64Ref<'cg> {
@@ -222,14 +274,21 @@ impl<'cg> From<CGValueRef<'cg>> for I64Ref<'cg> {
 impl<'cg> std::ops::Add<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
 
-    fn add(self, rhs: &Self) -> Self::Output {
+    fn add(mut self, rhs: &Self) -> Self::Output {
         let cg = self.0.cg;
-        let cgvref = cg.add(&self.0, &rhs.0);
-        if cgvref == self.0.i {
-            self
-        } else {
-            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
-        }
+        cg.add(&mut self.0, &rhs.0);
+        self
+    }
+}
+
+impl<'cg> std::ops::Add<i64> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn add(mut self, rhs: i64) -> Self::Output {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.add(&mut self.0, &rhs);
+        self
     }
 }
 
@@ -247,59 +306,86 @@ impl<'cg> std::ops::Add<&Self> for I64Ref<'cg> {
 impl<'cg> std::ops::Mul<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
 
-    fn mul(self, rhs: &Self) -> Self::Output {
+    fn mul(mut self, rhs: &Self) -> Self::Output {
         let cg = self.0.cg;
-        let cgvref = cg.mul(&self.0, &rhs.0);
-        if cgvref == self.0.i {
-            self
-        } else {
-            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
-        }
+        cg.mul(&mut self.0, &rhs.0);
+        self
+    }
+}
+
+impl<'cg> std::ops::Mul<i64> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn mul(mut self, rhs: i64) -> Self::Output {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.mul(&mut self.0, &rhs);
+        self
     }
 }
 
 impl<'cg> std::ops::Sub<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
 
-    fn sub(self, rhs: &Self) -> Self::Output {
+    fn sub(mut self, rhs: &Self) -> Self::Output {
         let cg = self.0.cg;
-        let cgvref = cg.sub(&self.0, &rhs.0);
-        if cgvref == self.0.i {
-            self
-        } else {
-            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
-        }
+        cg.sub(&mut self.0, &rhs.0);
+        self
+    }
+}
+
+impl<'cg> std::ops::Sub<i64> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn sub(mut self, rhs: i64) -> Self::Output {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.sub(&mut self.0, &rhs);
+        self
     }
 }
 
 impl<'cg> std::ops::Div<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
 
-    fn div(self, rhs: &Self) -> Self::Output {
+    fn div(mut self, rhs: &Self) -> Self::Output {
         let cg = self.0.cg;
-        let cgvref = cg.div(&self.0, &rhs.0);
-        if cgvref == self.0.i {
-            self
-        } else {
-            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
-        }
+        cg.div(&mut self.0, &rhs.0);
+        self
+    }
+}
+
+impl<'cg> std::ops::Div<i64> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn div(mut self, rhs: i64) -> Self::Output {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.div(&mut self.0, &rhs);
+        self
     }
 }
 
 impl<'cg> std::ops::Rem<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
 
-    fn rem(self, rhs: &Self) -> Self::Output {
+    fn rem(mut self, rhs: &Self) -> Self::Output {
         let cg = self.0.cg;
-        let cgvref = cg.rem(&self.0, &rhs.0);
-        if cgvref == self.0.i {
-            self
-        } else {
-            I64Ref(CGValueRef::new(cgvref, cg, self.0.data_type.clone()))
-        }
+        cg.rem(&mut self.0, &rhs.0);
+        self
     }
 }
 
+impl<'cg> std::ops::Rem<i64> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn rem(mut self, rhs: i64) -> Self::Output {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.rem(&mut self.0, &rhs);
+        self
+    }
+}
 
 
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
@@ -313,25 +399,33 @@ impl<'cg> Deref for BoolRef<'cg> {
     }
 }
 
-impl<'cg> CGEq<'cg> for BoolRef<'cg> {
-    fn cg_eq(self, other: &Self) -> BoolRef<'cg> {
+impl<'cg> CGEq<'cg, &Self> for BoolRef<'cg> {
+    fn cg_eq(mut self, other: &Self) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let cgvref = cg.eq(&self.0, &other.0);
-        if cgvref == self.0.i {
-            BoolRef(self.0)
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        cg.eq(&mut self.0, &other.0);
+        BoolRef(self.0)
     }
 
-    fn cg_neq(self, other: &Self) -> BoolRef<'cg> {
+    fn cg_neq(mut self, other: &Self) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let cgvref = cg.neq(&self.0, &other.0);
-        if cgvref == self.0.i {
-            BoolRef(self.0)
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        cg.neq(&mut self.0, &other.0);
+        BoolRef(self.0)
+    }
+}
+
+impl<'cg> CGEq<'cg, bool> for BoolRef<'cg> {
+    fn cg_eq(mut self, other: bool) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let other = CGValueRef::new_const(ConstValue::Bool(other), self.cg);
+        cg.eq(&mut self.0, &other);
+        BoolRef(self.0)
+    }
+
+    fn cg_neq(mut self, other: bool) -> BoolRef<'cg> {
+        let cg = self.0.cg;
+        let other = CGValueRef::new_const(ConstValue::Bool(other), self.cg);
+        cg.neq(&mut self.0, &other);
+        BoolRef(self.0)
     }
 }
 
@@ -358,28 +452,20 @@ impl Clone for BoolRef<'_> {
 impl<'cg> std::ops::BitAnd<&Self> for BoolRef<'cg> {
     type Output = BoolRef<'cg>;
 
-    fn bitand(self, rhs: &Self) -> Self::Output {
+    fn bitand(mut self, rhs: &Self) -> Self::Output {
         let cg = self.0.cg;
-        let cgvref = cg.and(&self.0, &rhs.0);
-        if cgvref == self.0.i {
-            self
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        cg.and(&mut self.0, &rhs.0);
+        self
     }
 }
 
 impl<'cg> std::ops::BitOr<&Self> for BoolRef<'cg> {
     type Output = BoolRef<'cg>;
 
-    fn bitor(self, rhs: &Self) -> Self::Output {
+    fn bitor(mut self, rhs: &Self) -> Self::Output {
         let cg = self.0.cg;
-        let cgvref = cg.or(&self.0, &rhs.0);
-        if cgvref == self.0.i {
-            self
-        } else {
-            BoolRef(CGValueRef::new(cgvref, cg, DataType::Bool))
-        }
+        cg.or(&mut self.0, &rhs.0);
+        self
     }
 }
 
@@ -406,11 +492,21 @@ impl<'cg> std::ops::BitOr<&Self> for BoolRef<'cg> {
 /// Convenience layer around copy and patch compilation backend
 /// so that you don't have to think about registers anymore
 
+fn get_data_type_size(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::I64 | DataType::U64 => 8,
+        DataType::I32 | DataType::U32 => 4,
+        DataType::I16 | DataType::U16 => 2,
+        DataType::I8 | DataType::U8 | DataType::Bool => 1,
+        _ => unimplemented!()
+    }
+}
+
 struct MemoryManagement {
     args_size: usize,
     values: Vec<CGValue>,
     free_slots: Vec<usize>,
-    free_stack_pos: Vec<usize>,
+    free_stack_pos: BTreeMap<usize, Vec<usize>>,
     // We save whether a register is potentially dirty
     // one value can only be in one register at a time unless it's a readonly/const value
     // as soon as a readonly/const value is dirtied it becomes a different mutable variable
@@ -429,7 +525,7 @@ impl MemoryManagement {
             args_size: args,
             values,
             free_slots: Vec::new(),
-            free_stack_pos: Vec::new(),
+            free_stack_pos: BTreeMap::new(),
             reg_state: [None, None],
             stack_ptr: args * 8,
             stack_size: args * 8,
@@ -446,6 +542,43 @@ impl MemoryManagement {
         self.stack_size = self.args_size * 8;
     }
 
+    fn alloc_stack(&mut self, size: usize) -> usize {
+        if let Some(next) = self.free_stack_pos.get_mut(&size) {
+            let pos = next.pop().unwrap();
+            if next.is_empty() {
+                self.free_stack_pos.remove(&size);
+            }
+            pos
+        } else {
+            let pos = self.stack_ptr;
+            self.stack_ptr += size;
+            self.stack_size = self.stack_size.max(self.stack_ptr);
+            pos
+        }
+    }
+
+    #[allow(dead_code)]
+    fn alloc_stack_at_least(&mut self, size: usize) -> usize {
+        if let Some((&next_size, next)) = self.free_stack_pos.range_mut(size..).next() {
+            let pos = next.pop().unwrap();
+            if next.is_empty() {
+                self.free_stack_pos.remove(&next_size);
+            }
+            pos
+        } else {
+            let pos = self.stack_ptr;
+            self.stack_ptr += size;
+            self.stack_size = self.stack_size.max(self.stack_ptr);
+            pos
+        }
+    }
+
+    #[allow(dead_code)]
+    fn free_stack(&mut self, pos: usize, size: usize) {
+        self.free_stack_pos.entry(size).or_default().push(pos);
+    }
+
+    /// Frees a register, saving its content to the stack if necessary
     fn free_reg(&mut self, reg: usize) {
         if let Some((i, dirty)) = &mut self.reg_state[reg] {
             if *dirty {
@@ -457,18 +590,21 @@ impl MemoryManagement {
                         }
                         // Save it to its designated stack location
                         match reg {
-                            0 => self.cp_backend.generate_put_1_stack(*stack_pos),
-                            1 => self.cp_backend.generate_put_2_stack(*stack_pos),
+                            0 => self.cp_backend.emit_put_1_stack(*stack_pos),
+                            1 => self.cp_backend.emit_put_2_stack(*stack_pos),
                             _ => unreachable!(),
                         }
                         self.reg_state[reg].as_mut().unwrap().1 = false;
                     },
-                    CGValue::Constant(_) => {
-                        panic!("We should have allocated a stack slot before dirtying a const value");
-                    },
                     CGValue::Free => { /* User doesn't need this anymore so we can just throw it away without writing it back. */},
                 }
             }
+        }
+    }
+
+    fn flush_regs(&mut self) {
+        for reg in 0..2 {
+            self.lose_reg(reg);
         }
     }
 
@@ -492,8 +628,8 @@ impl MemoryManagement {
                         // We can just duplicate the value
                         self.free_reg(reg);
                         match other_reg_n {
-                            0 => self.cp_backend.generate_duplex1(),
-                            1 => self.cp_backend.generate_duplex2(),
+                            0 => self.cp_backend.emit_duplex1(),
+                            1 => self.cp_backend.emit_duplex2(),
                             _ => unreachable!(),
                         }
                         self.reg_state[reg] = self.reg_state[other_reg_n].clone();
@@ -501,7 +637,7 @@ impl MemoryManagement {
                     }
                 }
                 // We just swap the registers so that we don't have to move anything
-                self.cp_backend.generate_swap12();
+                self.cp_backend.emit_swap12();
                 self.reg_state.swap(0, 1);
                 return;
             }
@@ -514,15 +650,8 @@ impl MemoryManagement {
             CGValue::Variable{stack_pos, ..} => {
                 // TODO: do take stack with datatype
                 match reg {
-                    0 => self.cp_backend.generate_take_1_stack(*stack_pos),
-                    1 => self.cp_backend.generate_take_2_stack(*stack_pos),
-                    _ => unreachable!(),
-                }
-            },
-            CGValue::Constant(c) => {
-                match reg {
-                    0 => self.cp_backend.generate_take_1_const(c.clone()),
-                    1 => self.cp_backend.generate_take_2_const(c.clone()),
+                    0 => self.cp_backend.emit_take_1_stack(*stack_pos),
+                    1 => self.cp_backend.emit_take_2_stack(*stack_pos),
                     _ => unreachable!(),
                 }
             },
@@ -552,11 +681,11 @@ impl MemoryManagement {
             // just duplicate the value
             if let Some(0) = v0_reg_n {
                 self.free_reg(1);
-                self.cp_backend.generate_duplex1();
+                self.cp_backend.emit_duplex1();
                 self.reg_state[1] = self.reg_state[0].clone();
             } else {
                 self.free_reg(0);
-                self.cp_backend.generate_duplex2();
+                self.cp_backend.emit_duplex2();
                 self.reg_state[0] = self.reg_state[1].clone();
             }
             return;
@@ -564,7 +693,7 @@ impl MemoryManagement {
 
         // registers are swapped
         if matches!(v0_reg_n, Some(1)) && matches!(v1_reg_n, Some(0)) {
-            self.cp_backend.generate_swap12();
+            self.cp_backend.emit_swap12();
             self.reg_state.swap(0, 1);
             return;
         }
@@ -597,13 +726,6 @@ impl MemoryManagement {
                         return Some(i);
                     }
                 },
-                CGValue::Constant(c) => {
-                    let stack_pos = self.stack_ptr;
-                    self.stack_ptr += 8;
-                    self.stack_size = self.stack_size.max(self.stack_ptr);
-                    self.values[i] = CGValue::Variable { data_type: c.get_type(), stack_pos, readonly: false };
-                    return Some(i);
-                },
                 _ => unreachable!(),
             }
         } else {
@@ -612,29 +734,15 @@ impl MemoryManagement {
     }
 
     fn allocate_stack(&mut self, data_type: DataType) -> usize {
-        let i = if let Some(i) = self.free_slots.pop() {
+        let stack_pos = self.alloc_stack(get_data_type_size(&data_type));
+        if let Some(i) = self.free_slots.pop() {
+            self.values[i] = CGValue::Variable{ data_type, stack_pos, readonly: false};
             i
         } else {
             let i = self.values.len();
-            self.values.push(CGValue::Free);
+            self.values.push(CGValue::Variable{ data_type, stack_pos, readonly: false});
             i
-        };
-        let value = &mut self.values[i];
-        match value {
-            CGValue::Free => {
-                let stack_ofs = if let Some(s) = self.free_stack_pos.pop() {
-                    s
-                } else {
-                    let s = self.stack_ptr;
-                    self.stack_ptr += 8;
-                    self.stack_size = self.stack_size.max(self.stack_ptr);
-                    s
-                };
-                *value = CGValue::Variable{ data_type, stack_pos: stack_ofs, readonly: false};
-            },
-            _ => unreachable!(),
         }
-        i
     }
 
     /// Clones the value and returns it. Use the new value first if possible.
@@ -642,26 +750,11 @@ impl MemoryManagement {
         let value = self.values[v].clone();
         match value {
             CGValue::Variable{data_type,..} => {
-                if let Some((i, dirty)) = &mut self.reg_state[0] {
-                    if *dirty {
-                        self.cp_backend.generate_put_stack(*i);
-                        *dirty = false;
-                    }
-                    if *i == v {
-                        *i = self.values.len();
-                    }
-                } else {
-                    self.put_in_reg(0, v);
-                    self.reg_state[0].unwrap().0 = self.values.len();
-                }
-                self.allocate_stack(data_type)
-            },
-            CGValue::Constant(c) => {
-                // We can just copy constants 
-                // TODO: Do similar free slot handling for constants but only take Free(None)'s
-                let i = self.values.len();
-                self.values.push(CGValue::Constant(c));
-                i
+                self.free_reg(0);
+                self.put_in_reg(0, v);
+                let new_i = self.allocate_stack(data_type);
+                self.reg_state[0] = Some((new_i, true));
+                new_i
             },
             CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
         }
@@ -670,13 +763,13 @@ impl MemoryManagement {
     fn free_value(&mut self, v: usize) {
         let value = &self.values[v];
         match value {
-            CGValue::Variable{readonly, stack_pos,..} => {
+            CGValue::Variable{readonly, stack_pos, data_type} => {
                 if *readonly {
                     return;
                 }
-                self.free_stack_pos.push(*stack_pos);
-                self.values[v] = CGValue::Free;
                 self.free_slots.push(v);
+                self.free_stack(*stack_pos, get_data_type_size(data_type));
+                self.values[v] = CGValue::Free;
                 // Check reg slots and free them if necessary
                 for reg in self.reg_state.iter_mut() {
                     if let Some((i, _)) = reg {
@@ -685,13 +778,20 @@ impl MemoryManagement {
                         }
                     }
                 }
-            },
-            CGValue::Constant(_) => {
-                self.values[v] = CGValue::Free;
-                self.free_slots.push(v);
             }
             CGValue::Free => {/* TODO: Make sure double frees cannot happen, even internally */},
         }
+    }
+
+    fn lose_reg(&mut self, reg: usize) {
+        self.free_reg(reg);
+        self.reg_state[reg] = None;
+    }
+
+    fn init(&mut self, i: usize, c: ConstValue) {
+        self.free_reg(0);
+        self.cp_backend.emit_take_1_const(c);
+        self.reg_state[0] = Some((i, false));
     }
 }
 
@@ -712,33 +812,79 @@ impl CodeGen {
         }
     }
 
-    // We make sure arguments are immutable so having multiple references to them is not a problem
     pub fn get_arg(&self, n: usize) -> I64Ref {
-        I64Ref(CGValueRef::new_readonly(n, self, DataType::I64))
+        // We immediately copy the arg to a new position so that we can handle it like any other value
+        // The lazy approach is great but it doesn't work for stuff like loops
+
+        let mut memory_management = self.memory_management.borrow_mut();
+        let i = memory_management.clone_value(n);
+        I64Ref(CGValueRef::new(i, self, DataType::I64))
+
+        //I64Ref(CGValueRef::new_readonly(n, self, DataType::I64))
     }
 
     pub fn new_i64_const(&self, n: i64) -> I64Ref {
-        let mut memory_management = self.memory_management.borrow_mut();
-        let i = memory_management.values.len();
-        memory_management.values.push(CGValue::Constant(ConstValue::I64(n)));
-        I64Ref(CGValueRef::new(i, self, DataType::I64))
+        I64Ref(CGValueRef::new_const(ConstValue::I64(n), self))
     }
 
     pub fn new_bool_const(&self, b: bool) -> BoolRef {
+        BoolRef(CGValueRef::new_const(ConstValue::Bool(b), self))
+    }
+
+    fn load_const(&self, v: usize, c: ConstValue) {
         let mut memory_management = self.memory_management.borrow_mut();
-        let i = memory_management.values.len();
-        memory_management.values.push(CGValue::Constant(ConstValue::Bool(b)));
-        BoolRef(CGValueRef::new(i, self, DataType::Bool))
+        memory_management.init(v, c);
     }
 
     fn free_value(&self, v: &CGValueRef) {
-        self.memory_management.borrow_mut().free_value(v.i);
+        match v.inner {
+            CGValueRefInner::Value(i) => self.memory_management.borrow_mut().free_value(i),
+            CGValueRefInner::Const(_) => {/* We don't have to do anything here */}
+        }
     }
 
     fn clone_value(&self, v: &CGValueRef) -> CGValueRef {
-        let mut memory_management = self.memory_management.borrow_mut();
-        let i = memory_management.clone_value(v.i);
-        CGValueRef::new(i, self, v.data_type.clone())
+        match v.inner {
+            CGValueRefInner::Const(c) => {
+                CGValueRef::new_const(c, self)
+            },
+            CGValueRefInner::Value(i) => {
+                let mut memory_management = self.memory_management.borrow_mut();
+                let i = memory_management.clone_value(i);
+                CGValueRef::new(i, self, v.data_type.clone())
+            }
+        }
+    }
+
+
+    fn copy_value(&self, src: &CGValueRef, dest: &CGValueRef) {
+        let (dest_i, dest_ptr) = match dest.inner {
+            CGValueRefInner::Value(i) => {
+                let memory_management = self.memory_management.borrow();
+                let dest_ptr = match &memory_management.values[i] {
+                    CGValue::Variable{stack_pos,..} => *stack_pos,
+                    _ => unreachable!(),
+                };
+                (i, dest_ptr)
+            },
+            CGValueRefInner::Const(_) => {
+                // TODO: Can we encode this in the type system so that stuff like this is not possible?
+                panic!("Cannot copy to a constant");
+            }
+        };
+        match src.inner {
+            CGValueRefInner::Value(i) => {
+                let mut memory_management = self.memory_management.borrow_mut();
+                memory_management.put_in_reg(0, i);
+                self.inner.emit_put_1_stack(dest_ptr);
+                memory_management.put_in_reg(1, dest_i);
+            },
+            CGValueRefInner::Const(c) => {
+               self.memory_management.borrow_mut().init(dest_i, c);
+            }
+
+        }
+    
     }
 
     #[allow(dead_code)]
@@ -750,137 +896,180 @@ impl CodeGen {
     //--------------------------------------------------------------------------------
     // Arithmetic operations
 
-    fn gen_arith<const COMMUTATIVE: bool>(&self,  gen_op: fn(&CopyPatchBackend, DataType), gen_op_const: fn(&CopyPatchBackend, ConstValue), l: &CGValueRef, r: &CGValueRef) -> usize {
+    fn gen_arith<const COMMUTATIVE: bool>(&self,  gen_op: fn(&CopyPatchBackend, DataType), gen_op_const: fn(&CopyPatchBackend, ConstValue), l: &mut CGValueRef, r: &CGValueRef) {
         let mut memory_management = self.memory_management.borrow_mut();
-        let vr = memory_management.values[r.i].clone();
-        // TODO: Use commutative property to optimize this
-        match vr {
-            CGValue::Variable{data_type,..} => {
-                memory_management.put_in_regs(l.i, r.i);
-                gen_op(&self.inner, data_type);
+        match (l.inner, r.inner) {
+            (CGValueRefInner::Value(li), CGValueRefInner::Value(ri)) => {
+                memory_management.put_in_regs(li, ri);
+                gen_op(&self.inner, l.data_type.clone());
             },
-            CGValue::Constant(c) => {
-                memory_management.put_in_reg(0, l.i);
-                gen_op_const(&self.inner, c);
+            (CGValueRefInner::Value(li), CGValueRefInner::Const(c)) => {
+                let vl = memory_management.values[li].clone();
+                match vl {
+                    CGValue::Variable{..} => {
+                        memory_management.put_in_reg(0, li);
+                        gen_op_const(&self.inner, c);
+                    },
+                    CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
+                }
             },
-            CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
+            (CGValueRefInner::Const(c), CGValueRefInner::Value(ri)) => {
+                if COMMUTATIVE {
+                    memory_management.put_in_reg(0, ri);
+                    gen_op_const(&self.inner, c);
+                } else {
+                    let new_l = memory_management.allocate_stack(c.get_type());
+                    memory_management.init(new_l, c);
+                    memory_management.put_in_regs(new_l, ri);
+                    gen_op(&self.inner, c.get_type());
+                    l.inner = CGValueRefInner::Value(new_l);
+                }
+            },
+            (CGValueRefInner::Const(c1), CGValueRefInner::Const(c2)) => {
+                let new_l = memory_management.allocate_stack(c1.get_type());
+                memory_management.init(new_l, c1);
+                memory_management.put_in_reg(0, new_l);
+                gen_op_const(&self.inner, c2);
+                l.inner = CGValueRefInner::Value(new_l);
+            }
         }
-        memory_management.dirty_reg(0).unwrap()
+        memory_management.dirty_reg(0).unwrap();
     }
 
-    fn add(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<true>(
-            CopyPatchBackend::generate_add, 
-            CopyPatchBackend::generate_add_const,
-             l, r)
+    fn add(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<true>(CopyPatchBackend::emit_add,CopyPatchBackend::emit_add_const, l, r)
     }
 
-    fn sub(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<false>(
-            CopyPatchBackend::generate_sub, 
-            CopyPatchBackend::generate_sub_const,
-             l, r)
+    fn sub(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<false>(CopyPatchBackend::emit_sub,CopyPatchBackend::emit_sub_const, l, r)
     }
 
-    fn mul(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<true>(
-            CopyPatchBackend::generate_mul, 
-            CopyPatchBackend::generate_mul_const,
-             l, r)
+    fn mul(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<true>(CopyPatchBackend::emit_mul,CopyPatchBackend::emit_mul_const, l, r)
     }
 
-    fn div(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<false>(
-            CopyPatchBackend::generate_div, 
-            CopyPatchBackend::generate_div_const,
-             l, r)
+    fn div(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<false>(CopyPatchBackend::emit_div,CopyPatchBackend::emit_div_const,  l, r)
     }
 
-    fn rem(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<false>(
-            CopyPatchBackend::generate_rem, 
-            CopyPatchBackend::generate_rem_const,
-             l, r)
+    fn rem(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<false>(CopyPatchBackend::emit_rem,CopyPatchBackend::emit_rem_const,  l, r)
     }
 
-    fn eq(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<true>(
-            CopyPatchBackend::generate_eq, 
-            CopyPatchBackend::generate_eq_const,
-             l, r)
+    fn eq(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<true>(CopyPatchBackend::emit_eq,CopyPatchBackend::emit_eq_const, l, r)
     }
 
-    fn neq(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<true>(
-            CopyPatchBackend::generate_neq, 
-            CopyPatchBackend::generate_neq_const,
-             l, r)
+    fn neq(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<true>(CopyPatchBackend::emit_neq,CopyPatchBackend::emit_neq_const,  l, r)
     }
+
 
     // TODO: exchange lt/gte and lte/gt here if the first one is a const
-    fn lt(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<false>(
-            CopyPatchBackend::generate_lt, 
-            CopyPatchBackend::generate_lt_const,
-             l, r)
+    fn lt(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<false>(CopyPatchBackend::emit_lt,CopyPatchBackend::emit_lt_const, l, r)
     }
 
-    fn lte(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<false>(
-            CopyPatchBackend::generate_lte, 
-            CopyPatchBackend::generate_lte_const,
-             l, r)
+    fn lte(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<false>(CopyPatchBackend::emit_lte,CopyPatchBackend::emit_lte_const, l, r)
     }
 
-    fn gt(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<false>(
-            CopyPatchBackend::generate_gt, 
-            CopyPatchBackend::generate_gt_const,
-             l, r)
+    fn gt(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<false>(CopyPatchBackend::emit_gt,CopyPatchBackend::emit_gt_const, l, r)
     }
 
-    fn gte(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<false>(
-            CopyPatchBackend::generate_gte, 
-            CopyPatchBackend::generate_gte_const,
-             l, r)
+    fn gte(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<false>(CopyPatchBackend::emit_gte,CopyPatchBackend::emit_gte_const, l, r)
     }
 
-    fn and(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<true>(
-            CopyPatchBackend::generate_and, 
-            CopyPatchBackend::generate_and_const,
-             l, r)
+    fn and(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<true>(CopyPatchBackend::emit_and,CopyPatchBackend::emit_and_const, l, r)
     }
 
-    fn or(&self, l: &CGValueRef, r: &CGValueRef) -> usize {
-        self.gen_arith::<true>(
-            CopyPatchBackend::generate_or, 
-            CopyPatchBackend::generate_or_const,
-             l, r)
+    fn or(&self, l: &mut CGValueRef, r: &CGValueRef) {
+        self.gen_arith::<true>(CopyPatchBackend::emit_or,CopyPatchBackend::emit_or_const, l, r)
+    }
+
+    fn not(&self, l: &mut CGValueRef) {
+        let mut memory_management = self.memory_management.borrow_mut();
+        match l.inner {
+            CGValueRefInner::Value(i) => {
+                memory_management.put_in_reg(0, i);
+                self.inner.emit_not(l.data_type.clone());
+                memory_management.dirty_reg(0).unwrap();
+            },
+            CGValueRefInner::Const(c) => {
+                l.inner = CGValueRefInner::Const(c.bit_not());
+            }
+        }
     }
 
     //--------------------------------------------------------------------------------
     // Control flow
 
-    fn generate_if<THEN: FnMut()>(&self, condition: BoolRef, mut then_branch: THEN) {
+    // TODO: Remember what the current stack_ptr and value array length was
+    //       before calling the closures and restore it afterwards
+
+    // TODO: Create a way to pass ValueRefs that will be used inside the closure
+    //       So that they can then be passed as arguments to the closure and
+    //       mutated directly there. This way we could omit the flush of those
+    //       to the stack if they already are in a register. 
+    pub fn generate_if(&self, mut condition: BoolRef, then_branch: impl Fn()) {
         let mut memory_management = self.memory_management.borrow_mut();
-        memory_management.put_in_reg(0, condition.i);
+        let i = match &condition.0.inner {
+            CGValueRefInner::Value(i) => *i,
+            CGValueRefInner::Const(c) => {
+                let new_i = memory_management.allocate_stack(DataType::Bool);
+                memory_management.init(new_i, *c);
+                condition.0.inner = CGValueRefInner::Value(new_i);
+                new_i
+            }
+        };
+        memory_management.put_in_reg(0, i);
         drop(memory_management);
-        self.inner.generate_if(move || {
+        self.inner.emit_if(move || {
             then_branch();
         });
         let mut memory_management = self.memory_management.borrow_mut();
-        memory_management.free_reg(0);
+        memory_management.lose_reg(0);
+    }
+
+    // TODO: This currently doesn't work with constants because we load them lazily which leads to the
+    //       constant instead of the updated value beeing loaded again in the loop condition
+    //       What we could do as a quick fix is materialize every constant into a variable before we enter a loop
+    pub fn gen_while<'cg>(&self, condition: impl Fn() -> BoolRef<'cg>, body: impl Fn()) {
+        self.memory_management.borrow_mut().flush_regs();
+        self.inner.emit_loop( || {
+            let res = condition();
+            let i = match res.0.inner {
+                CGValueRefInner::Value(i) => i,
+                CGValueRefInner::Const(c) => {
+                    let new_i = self.memory_management.borrow_mut().allocate_stack(DataType::Bool);
+                    self.memory_management.borrow_mut().init(new_i, c);
+                    new_i
+                }
+            };
+            self.memory_management.borrow_mut().put_in_reg(0, i);
+        }, || {
+            body();
+        });
     }
 
     //--------------------------------------------------------------------------------
     // Other operations
 
     fn generate_return(&self, return_value: CGValueRef) {
-        self.memory_management.borrow_mut().put_in_reg(0, return_value.i);
-        self.inner.generate_put_stack(0);
-        self.inner.generate_ret();
+        let i = match return_value.inner {
+            CGValueRefInner::Value(i) => i,
+            CGValueRefInner::Const(c) => {
+                let new_i = self.memory_management.borrow_mut().allocate_stack(c.get_type());
+                self.memory_management.borrow_mut().init(new_i, c);
+                new_i
+            }
+        };
+        self.memory_management.borrow_mut().put_in_reg(0, i);
+        self.inner.emit_put_stack(0);
+        self.inner.emit_ret();
     }
 
     //--------------------------------------------------------------------------------

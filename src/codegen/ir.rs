@@ -5,10 +5,10 @@
 
 use std::fmt::{self, Display, Formatter};
 
-use inkwell::types::{BasicType, IntType};
+use inkwell::types::IntType;
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DataType {
     // Integer Types
     Bool, // Special Case (treated as 1 bit integer type in LLVM)
@@ -23,8 +23,9 @@ pub enum DataType {
     // Floating Point Types
     F32,
     F64,
-    // Pointer Types
-    Ptr(Box<DataType>),
+    // Untyped Pointer. For the semantics of operations on values of this type it's enough.
+    // Upper level code has to tell us how to interpret dereferenced values
+    Ptr,
 }
 
 impl<'a> TryFrom<IntType<'a>> for DataType {
@@ -56,8 +57,11 @@ impl DataType {
             DataType::F32 => context.f32_type().into(),
             DataType::F64 => context.f64_type().into(),
             DataType::Bool => context.bool_type().into(),
-            DataType::Ptr(inner) => {
-                let inner_type = inner.get_llvm_type(context);
+            DataType::Ptr => {
+                // TODO: This is essentially a hack. But should work for now. We should probably
+                //       not use this method for pointer types anyway. And for generic pointer op stencils and
+                //       stuff like that it should be fine.
+                let inner_type = context.i8_type();  
                 inner_type.ptr_type(inkwell::AddressSpace::default()).into()
             }
         }
@@ -107,7 +111,7 @@ impl DataType {
 
     pub fn is_pointer(&self) -> bool {
         match self {
-            DataType::Ptr(_) => true,
+            DataType::Ptr => true,
             _ => false,
         }
     }
@@ -122,7 +126,7 @@ impl DataType {
             DataType::I8 | DataType::U8 => DataType::U8,
             DataType::I16 | DataType::U16 => DataType::U16,
             DataType::I32 | DataType::U32 | DataType::F32 => DataType::U32,
-            DataType::I64 | DataType::U64 | DataType::F64 | DataType::Ptr(_) => DataType::U64, // We assume we run on 64 bit systems
+            DataType::I64 | DataType::U64 | DataType::F64 | DataType::Ptr => DataType::U64, // We assume we run on 64 bit systems
         }
     }
 }
@@ -141,7 +145,7 @@ impl Display for DataType {
             DataType::F32 => write!(f, "f32"),
             DataType::F64 => write!(f, "f64"),
             DataType::Bool => write!(f, "bool"),
-            DataType::Ptr(inner) => write!(f, "{}-ptr", inner),
+            DataType::Ptr => write!(f, "ptr"),
         }
     }
 }
@@ -193,6 +197,20 @@ impl ConstValue {
             ConstValue::F32(f) => f.to_bits() as u64,
             ConstValue::F64(f) => f.to_bits(),
         }
-    
+    }
+
+    pub fn bit_not(&self) -> ConstValue {
+        match self {
+            ConstValue::Bool(b) => ConstValue::Bool(!b),
+            ConstValue::I8(i) => ConstValue::I8(!i),
+            ConstValue::I16(i) => ConstValue::I16(!i),
+            ConstValue::I32(i) => ConstValue::I32(!i),
+            ConstValue::I64(i) => ConstValue::I64(!i),
+            ConstValue::U8(u) => ConstValue::U8(!u),
+            ConstValue::U16(u) => ConstValue::U16(!u),
+            ConstValue::U32(u) => ConstValue::U32(!u),
+            ConstValue::U64(u) => ConstValue::U64(!u),
+            _ => panic!("Bitwise not is not defined for floating point types"),
+        }
     }
 }
