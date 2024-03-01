@@ -1,7 +1,7 @@
-# Beginning of an experimental copy-and-patch like compiler backend written in Rust
+# Experimental Copy-and-Patch compiler backend written in Rust
 
 <p align="center">
-    <img src="ferrisjit.svg" alt="" width="350px"></img>
+    <img src="ferrisjit-portable-min.svg" alt="" width="350px"></img>
 </p>
 
 
