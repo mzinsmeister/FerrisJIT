@@ -1,6 +1,6 @@
 use std::{fmt::Display, ops::Deref};
 
-use crate::{codegen::{CGCmp, CodegenCFunctionSignature, PtrRefByteOffset, Setable, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, expr::{Atom, BuiltIn, Expr}};
+use crate::{codegen::{CGCmp, CodegenCFunctionSignature, IntoBaseRef, PtrRefByteOffset, Setable, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, query::{AggregateFunc, Atom, BuiltIn, Expr, Query}};
 
 #[cfg(feature = "print-asm")]
 use crate::codegen::disassemble;
@@ -31,14 +31,19 @@ pub fn get_type(expr: &Expr) -> DataType {
         Expr::Constant(Atom::Num(_)) => DataType::I64,
         Expr::Constant(Atom::Boolean(_)) => DataType::Bool,
         Expr::Variable(_) => DataType::I64,
-        Expr::Application(fun, _) => {
+        Expr::Application(fun, args) => {
             match fun {
                 BuiltIn::Plus | BuiltIn::Minus | BuiltIn::Times | BuiltIn::Divide => {
                     DataType::I64
                 },
-                BuiltIn::Equal => {
+                BuiltIn::Equal | BuiltIn::NotEqual | BuiltIn::GreaterThan | BuiltIn::GreaterThanOrEqual 
+                | BuiltIn::LessThan | BuiltIn::LessThanOrEqual => {
                     DataType::Bool
-                }
+                },
+                BuiltIn::And | BuiltIn::Or => {
+                    // Get type of first argument
+                    get_type(&args[0])
+                },
             }
         },
     }
@@ -192,7 +197,28 @@ fn generate_int_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: I64Ref<'cg>, rig
         },
         BuiltIn::Equal => {
             left.cg_eq(&right).into()
-        }
+        },
+        BuiltIn::NotEqual => {
+            left.cg_neq(&right).into()
+        },
+        BuiltIn::LessThan => {
+            left.cg_lt(&right).into()
+        },
+        BuiltIn::LessThanOrEqual => {
+            left.cg_lte(&right).into()
+        },
+        BuiltIn::GreaterThan => {
+            left.cg_gt(&right).into()
+        },
+        BuiltIn::GreaterThanOrEqual => {
+            left.cg_gte(&right).into()
+        },
+        BuiltIn::And => {
+            (left & &right).into()
+        },
+        BuiltIn::Or => {
+            (left | &right).into()
+        },
     }
 }
 
@@ -200,8 +226,17 @@ fn generate_bool_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: BoolRef<'cg>, r
     match fun {
         BuiltIn::Equal => {
             left.cg_eq(&right)
-        }
-        _ => todo!("For the moment no bools")
+        },
+        BuiltIn::NotEqual => {
+            left.cg_neq(&right)
+        },
+        BuiltIn::And => {
+            left & &right
+        },
+        BuiltIn::Or => {
+            left | &right
+        },
+        _ => todo!()
     }
 }
 
@@ -257,8 +292,8 @@ fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr]
 
 fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr, input_values: &[I64Ref<'cg>]) -> Result<CGValueRef<'cg>, CodeGenError> {
     Ok(match expr {
-        Expr::Constant(e) => {
-            return Err(CodeGenError::Const(e.clone()));
+        Expr::Constant(a) => {
+            return Ok(generate_atom(cg, a))
         },
         Expr::Variable(n) => {
             input_values[*n].clone().into()
@@ -291,48 +326,19 @@ fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr, input_values: &[I64Re
     })
 }
 
-pub fn generate_code(expr: &Expr, columns: usize, result_consumer: CodegenCFunctionSignature) -> Result<GeneratedCode, CodeGenError> {
+pub fn generate_code(query: &Query, columns: usize, result_consumer: CodegenCFunctionSignature) -> Result<GeneratedCode, CodeGenError> {
 
     // TODO: I64 doesn't make sense for data length. Use U64 as soon as the wrapper is implemented
     let cg = CodeGen::new(&[DataType::Ptr, DataType::I64]);
 
-    // Uncomment this and comment the generate_code_inner to test ifs
-
-    /*let val = cg.get_arg(0);
-
-    let summand = cg.get_arg(0) + 1;
-
-    cg.gen_while(|| {
-        val.clone().cg_lt(10)
-    }, || {
-        val.set(val.clone() + &summand);
-    });
-    let return_value = val.into();
-    */
-
-   
-    /*
-    let b1: BoolRef<'_> = cg.new_bool_const(false);
-    cg.gen_if(b1, || {
-        val.set(val.clone() + 1);
-    });
-    let return_value = val.into();
-    */
-
-    /*let b2 = (cg.get_arg(0) % 2).cg_eq(0);
-
-    let val = cg.get_arg(0);
-
-    cg.gen_if_else(b2, || {
-        val.set(val.clone() + 1);
-    }, || {
-        val.set(val.clone() + 2);
-    });
-    let return_value = val.into();
-    */
-
     let data_ptr = TypedPtrRef::<I64Ref>::from(cg.get_arg(0));
     let i = cg.new_i64_var(0);
+
+    let aggregate_value = if let Some(_) = &query.aggregate {
+        Some(cg.new_i64_var(0))
+    } else {
+        None
+    };
 
    cg.gen_while::<CodeGenError>(|| {
         let num = I64Ref::from(cg.get_arg(1));
@@ -340,15 +346,45 @@ pub fn generate_code(expr: &Expr, columns: usize, result_consumer: CodegenCFunct
     }, || {
         // We assume we actually need the majority of our columns. We could also analyze the expression
         // And only load the columns that are actually used here.
-        let row_ptr = data_ptr.typed_offset(&i);
+        let row_ptr = data_ptr.typed_offset(&(i.clone() * columns as i64));
         let row = (0..columns).map(|j| {
             row_ptr.clone().typed_offset(j as i64).read()
         }).collect::<Vec<_>>();
-        let return_value: CGValueRef = generate_code_inner(&cg, expr, &row)?;
-        cg.call_c_function(result_consumer, UntypedPtrRef::from(return_value));
+        if let Some(filter) = &query.filter {
+            let filter = generate_code_inner(&cg, filter, &row)?;
+            let result = BoolRef::from(filter);
+            cg.gen_if(result, || {
+                let return_value = generate_code_inner(&cg, &query.expr, &row)?;
+                if let Some(aggregate_value) = &aggregate_value {
+                    match query.aggregate.unwrap() {
+                        AggregateFunc::Sum => {
+                            aggregate_value.set(I64Ref::from(return_value) + aggregate_value);
+                        },
+                    }
+                } else {
+                    cg.call_c_function(result_consumer, UntypedPtrRef::from(return_value));
+                }
+                Ok(())
+            })?;
+        } else {
+            let return_value = generate_code_inner(&cg, &query.expr, &row)?;
+            if let Some(aggregate_value) = &aggregate_value {
+                match query.aggregate.unwrap() {
+                    AggregateFunc::Sum => {
+                        aggregate_value.set(I64Ref::from(return_value) + aggregate_value);
+                    },
+                }
+            } else {
+                cg.call_c_function(result_consumer, UntypedPtrRef::from(return_value));
+            }
+        }
         i.set(i.clone() + 1);
         Ok(())
     })?;
+
+    if let Some(aggregate_value) = aggregate_value {
+        cg.call_c_function(result_consumer, UntypedPtrRef::from(aggregate_value.into_base()));
+    }
 
     cg.gen_return(None);
 

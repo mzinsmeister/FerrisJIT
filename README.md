@@ -39,21 +39,38 @@ cargo run -- -c test.csv
 
 If no file is given, the example will be run on a hardcoded sequential element array. Then you can enter expressions in lisp-like syntax. By default you will be in interactive mode and the result per input-line will just be printed. You can also pass `-b` as a flag to be in benchmark mode. Make sure to run with `--release` in this case. This will then print out the timings for compiled vs interpreted (when using generated input the input size will be 1,000,000 in this case, otherwise 10 by default. You can set this number using the `-n` flag). 
 
-#### Currently Supported Expressions
+#### Currently Supported Operations
 
-All constants and variables must be 64 bit signed integers.
+All constants and variables must be 64 bit signed integers or boolean #t/#f for true/false.
+
+For Expressions the following operations are permissible:
 
 Arithmetic Operations:
 * `+` Addition
 * `-` Subtraction
 * `*` Multiplication
 * `/` Division
+
+Integer Comparison Operations:
 * `=` Equality (produces a boolean result)
+* `!=` Inequality (produces a boolean result)
+* `>` Greater than (produces a boolean result)
+* `<` Less than (produces a boolean result)
+* `>=` Greater than or equal (produces a boolean result)
+* `<=` Less than or equal (produces a boolean result)
 
 Boolean Operations:
 * `=` Equality
+* `!=` Inequality
+
+
+To add to that there's also aggregate functions to use before the expression:
+
+* `SUM` Sum of all results
 
 #### Examples
+
+The simplest thing you can do is just evaluate expressions on every row:
 
 Constant result:
 ```lisp
@@ -69,6 +86,32 @@ Expressions can also be nested arbitrarily.
 ```lisp
 (+ (+ 10 2) (* 2 (+ 3 4)))
 ```
+
+You can also filter the rows by adding `WHERE` and a boolean expression after that. For example (works on test.csv):
+
+```lisp
+(+ 2 $0) WHERE (> $1 3)
+```
+
+to add to that you can also aggregate the result (works on test.csv):
+
+```lisp
+SUM $0 where (& (> $3 100) (> $1 15))
+```
+
+or 
+
+```lisp
+SUM (+ 2 $0) where (| (> $3 100) (> $1 15))
+```
+
+or much more complex like this:
+
+```lisp
+ sum (- (+ (+ $0 4) (- 2 10)) (+ (+ (+ (* (+ 1 (+ 6 10)) $0) $0) (+ (+ (+ (* (- 8 9) $0) 3) (- 48 (- 10 7))) $0)) (* (+ (- 3 8) (+ $0 5)) (* (- $0 (- 5 4)) 3)))) where (& (< (- (+ (+ $0 4) (- 2 10)) (+ (+ (+ (* (+ 1 (+ 6 10)) $0) $0) (+ (+ (+ (* (- 8 9) $0) 3) (- 48 (- 10 7))) $0)) (* (+ (- 3 8) (+ $0 5)) (* (- $0 (- 5 4)) 3)))) 10000) (> (* (- (* 1 (- (- 6 8) $0)) $0) (+ $0 (+ 7 (+ $0 10)))) 15))```
+
+
+**Multiple aggregates and more aggregate functions coming soon**
 
 ## Example Results
 

@@ -8,14 +8,16 @@ use std::fmt::{self, Display, Formatter};
 
 use nom::{
   branch::alt,
-  bytes::complete::tag,
-  character::complete::{char, digit1, multispace0, one_of},
-  combinator::{cut, map, map_res},
+  bytes::complete::{tag, tag_no_case},
+  character::complete::{char, digit1, multispace0, multispace1, one_of},
+  combinator::{cut, map, map_res, opt},
   error::{context, VerboseError},
   multi::many0,
-  sequence::{delimited, preceded, tuple},
+  sequence::{delimited, preceded, terminated, tuple},
   IResult, Parser,
 };
+
+use crate::{codegen::ir::DataType, query_codegen::get_type};
 
 /// We start by defining the types that define the shape of data that we want.
 /// In this case, we want something tree-like
@@ -28,6 +30,13 @@ pub enum BuiltIn {
   Times,
   Divide,
   Equal,
+  NotEqual,
+  LessThan,
+  GreaterThan,
+  LessThanOrEqual,
+  GreaterThanOrEqual,
+  And,
+  Or,
   /*Not,*/
 }
 
@@ -38,6 +47,22 @@ pub enum BuiltIn {
 pub enum Atom {
   Num(i64),
   Boolean(bool),
+}
+
+impl Atom {
+  pub fn get_num(&self) -> i64 {
+    match self {
+      Atom::Num(n) => *n,
+      _ => panic!("Not a number"),
+    }
+  }
+
+  pub fn get_bool(&self) -> bool {
+    match self {
+      Atom::Boolean(b) => *b,
+      _ => panic!("Not a boolean"),
+    }
+  }
 }
 
 impl Display for Atom {
@@ -73,24 +98,56 @@ pub enum Expr {
   Quote(Vec<Expr>),*/
 }
 
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub enum AggregateFunc {
+  Sum
+  // TODO: Add more aggregate functions here
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct Query {
+  pub aggregate: Option<AggregateFunc>,
+  pub filter: Option<Expr>, // Must be a boolean expression
+  pub expr: Expr // Must be an integer expression
+}
+
 /// Continuing the trend of starting from the simplest piece and building up,
 /// we start by creating a parser for the built-in operator functions.
 fn parse_builtin_op<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'a str>> {
-  // one_of matches one of the characters we give it
-  // TODO: When reactivating "-/=" uncomment this and remove the next line
-  //let (i, t) = one_of("+-*/=")(i)?;
-  let (i, t) = one_of("+-*/=")(i)?;
+  let (i, t) = terminated(alt((
+    tag("+"),
+    tag("-"),
+    tag("*"),
+    tag("/"),
+    tag("!="),
+    tag("<"),
+    tag(">"),
+    tag("<="),
+    tag(">="),
+    tag("&"),
+    tag("|"),
+    //tag("not"),
+  )), multispace1)(i)?;
 
   // because we are matching single character tokens, we can do the matching logic
   // on the returned value
   Ok((
     i,
     match t {
-      '+' => BuiltIn::Plus,
-      '-' => BuiltIn::Minus,
-      '*' => BuiltIn::Times,
-      '/' => BuiltIn::Divide,
-      '=' => BuiltIn::Equal,
+      "+" => BuiltIn::Plus,
+      "-" => BuiltIn::Minus,
+      "*" => BuiltIn::Times,
+      "/" => BuiltIn::Divide,
+      "=" => BuiltIn::Equal,
+      "!=" => BuiltIn::NotEqual,
+      "<" => BuiltIn::LessThan,
+      ">" => BuiltIn::GreaterThan,
+      "<=" => BuiltIn::LessThanOrEqual,
+      ">=" => BuiltIn::GreaterThanOrEqual,
+      "&" => BuiltIn::And,
+      "|" => BuiltIn::Or,
+      //"not" => BuiltIn::Not,
       _ => unreachable!(),
     },
   ))
@@ -316,7 +373,9 @@ pub fn eval_expression(e: &Expr, vars: &[i64]) -> Option<Atom> {
         .map(|expr| eval_expression(expr, vars))
         .collect::<Option<Vec<Atom>>>()?;
       match op {
-        BuiltIn::Plus | BuiltIn::Times | BuiltIn::Divide | BuiltIn::Minus => {
+        BuiltIn::Plus | BuiltIn::Times | BuiltIn::Divide | BuiltIn::Minus 
+        | BuiltIn::LessThan | BuiltIn::GreaterThan | BuiltIn::LessThanOrEqual 
+        | BuiltIn::GreaterThanOrEqual => {
           // Check that all the tail expressions are numbers
           let nums = reduced_tail.iter().map(|a| if let Atom::Num(n) = a { Some(*n) } else { return None }).collect::<Option<Vec<i64>>>()?;
           match op {
@@ -324,6 +383,10 @@ pub fn eval_expression(e: &Expr, vars: &[i64]) -> Option<Atom> {
             BuiltIn::Times => Some(Atom::Num(nums.iter().product())),
             BuiltIn::Minus => Some(Atom::Num(nums.iter().skip(1).fold(nums[0], |a, f| a - f))),
             BuiltIn::Divide => Some(Atom::Num(nums.iter().skip(1).fold(nums[0], |a, f| a / f))),
+            BuiltIn::LessThan => Some(Atom::Boolean(nums.iter().skip(1).all(|&x| nums[0] < x))),
+            BuiltIn::GreaterThan => Some(Atom::Boolean(nums.iter().skip(1).all(|&x| nums[0] > x))),
+            BuiltIn::LessThanOrEqual => Some(Atom::Boolean(nums.iter().skip(1).all(|&x| nums[0] <= x))),
+            BuiltIn::GreaterThanOrEqual => Some(Atom::Boolean(nums.iter().skip(1).all(|&x| nums[0] >= x))),
             _ => unreachable!(),
           }
         },
@@ -333,6 +396,27 @@ pub fn eval_expression(e: &Expr, vars: &[i64]) -> Option<Atom> {
             .zip(reduced_tail.iter().skip(1))
             .all(|(a, b)| a == b),
         )),
+        BuiltIn::NotEqual => Some(Atom::Boolean(
+          reduced_tail
+            .iter()
+            .zip(reduced_tail.iter().skip(1))
+            .any(|(a, b)| a != b),
+        )),
+        // Bitwise operations on integers and normal and/or with boolean result on booleans
+        BuiltIn::And => {
+          if let Atom::Boolean(_) = &reduced_tail[0] {
+            Some(Atom::Boolean(reduced_tail.iter().all(|a| a.get_bool())))
+          } else {
+            Some(Atom::Num(reduced_tail.iter().fold(-1, |a, b| a & b.get_num())))
+          }
+        },
+        BuiltIn::Or => {
+          if let Atom::Boolean(_) = &reduced_tail[0] {
+            Some(Atom::Boolean(reduced_tail.iter().any(|a| a.get_bool())))
+          } else {
+            Some(Atom::Num(reduced_tail.iter().fold(0, |a, b| a | b.get_num())))
+          }
+        },
         /*BuiltIn::Not => {
           if reduced_tail.len() != 1 {
             return None;
@@ -345,12 +429,45 @@ pub fn eval_expression(e: &Expr, vars: &[i64]) -> Option<Atom> {
   }
 }
 
+pub fn run_query(query: &Query, data: &[i64], columns: usize, mut result_consumer: impl FnMut(Atom)) {
+  let expr = &query.expr;
+  let filter = &query.filter;
+  let aggregate = query.aggregate;
+
+  let mut aggregate_value = 0;
+
+  for row in data.chunks_exact(columns) {
+    if let Some(filter) = filter {
+      if let Atom::Boolean(false) = eval_expression(filter, row).unwrap() {
+        continue;
+      }
+    }
+    let value = if let Atom::Num(n) = eval_expression(expr, row).unwrap() {
+      n
+    } else {
+      panic!("Main expression must produce an integer");
+    };
+    match aggregate {
+      Some(AggregateFunc::Sum) => aggregate_value += value,
+      None => result_consumer(Atom::Num(value)),
+      _ => panic!("Unsupported aggregate function"),
+    }
+  }
+  if let Some(_) = aggregate {
+    result_consumer(Atom::Num(aggregate_value));
+  }
+}
+
+fn err_converter(e: nom::Err<VerboseError<&str>>) -> String {
+  match e {
+    nom::Err::Error(e) | nom::Err::Failure(e) => nom::error::convert_error("", e),
+    nom::Err::Incomplete(_) => "Incomplete input".to_string(),
+  }
+}
+
 pub fn parse_expr_from_str(src: &str) -> Result<Expr, String> {
   parse_expr(src)
-    .map_err(|e: nom::Err<VerboseError<&str>>| match e {
-      nom::Err::Error(e) | nom::Err::Failure(e) => nom::error::convert_error(src, e),
-      nom::Err::Incomplete(_) => "Incomplete input".to_string(),
-    })
+    .map_err( err_converter)
     .map(|(_, exp)| exp)
 }
 /// And we add one more top-level function to tie everything together, letting
@@ -358,6 +475,27 @@ pub fn parse_expr_from_str(src: &str) -> Result<Expr, String> {
 #[allow(dead_code)]
 pub fn eval_from_str(src: &str, vars: &[i64]) -> Result<Atom, String> {
   parse_expr(src)
-    .map_err(|e: nom::Err<VerboseError<&str>>| format!("{:#?}", e))
+    .map_err(err_converter)
     .and_then(|(_, exp)| eval_expression(&exp, vars).ok_or("Eval Error".to_string()))
+}
+
+fn parse_aggregate_func<'a>(i: &'a str) -> IResult<&'a str, AggregateFunc, VerboseError<&'a str>> {
+  alt((
+    map(tag_no_case("sum"), |_| AggregateFunc::Sum),
+  ))(i)
+}
+
+pub fn parse_query_from_str(src: &str) -> Result<Query, String> {
+  let (src, aggregate) = opt(terminated(parse_aggregate_func, multispace1))(src).map_err(err_converter)?;
+  let (src, expr) = parse_expr(src).unwrap();
+  if get_type(&expr) != DataType::I64 {
+    return Err("Expression must be an integer expression".to_string());
+  }
+  let (_, filter) = opt(preceded(tuple((multispace1, tag_no_case("where"), multispace1)), parse_expr))(src).map_err(err_converter)?;
+  if let Some(filter) = &filter {
+    if get_type(filter) != DataType::Bool {
+      return Err("Filter must be a boolean expression".to_string());
+    }
+  }
+  Ok(Query { aggregate, filter, expr })
 }

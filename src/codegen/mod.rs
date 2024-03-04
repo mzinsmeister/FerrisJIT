@@ -63,6 +63,16 @@ trait PtrTarget<'cg>: Into<CGValueRef<'cg>> + From<CGValueRef<'cg>> {
     fn get_inner(&self) -> &CGValueRef<'cg>;
 }
 
+pub trait IntoBaseRef<'cg> {
+    fn into_base(self) -> CGValueRef<'cg>;
+}
+
+impl<'cg, T: Into<CGValueRef<'cg>>> IntoBaseRef<'cg> for T {
+    fn into_base(self) -> CGValueRef<'cg> {
+        self.into()
+    }
+}
+
 // TODO: Evaluate other solutions for this. 
 
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
@@ -406,6 +416,26 @@ impl<'cg> std::ops::Rem<i64> for I64Ref<'cg> {
     }
 }
 
+impl<'cg> std::ops::BitAnd<&Self> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn bitand(mut self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        cg.and(&mut self.0, &rhs.0);
+        self
+    }
+}
+
+impl<'cg> std::ops::BitOr<&Self> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn bitor(mut self, rhs: &Self) -> Self::Output {
+        let cg = self.0.cg;
+        cg.or(&mut self.0, &rhs.0);
+        self
+    }
+}
+
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
 pub struct BoolRef<'cg> (CGValueRef<'cg>);
 
@@ -696,7 +726,7 @@ impl<'cg, PtrType: PtrTarget<'cg>> TypedPtrRefOffset<'cg, PtrType, i64> for Type
 
 impl<'cg, PtrType: PtrTarget<'cg>> TypedPtrRefOffset<'cg, PtrType, &I64Ref<'cg>> for TypedPtrRef<'cg, PtrType> {
     fn typed_offset(&self, offset: &I64Ref<'cg>) -> Self {
-        let ptr = self.ptr.clone().byte_offset(offset);
+        let ptr = self.ptr.clone().byte_offset(&(offset.clone() * get_data_type_size(&PtrType::get_data_type()) as i64));
         TypedPtrRef { ptr, _phantom: std::marker::PhantomData }
     }
 }

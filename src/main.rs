@@ -1,18 +1,18 @@
-mod expr;
+mod query;
 mod codegen;
-mod expr_codegen;
+mod query_codegen;
 
 use std::{error::Error, hint::black_box, ptr};
 
-use expr_codegen::generate_code;
-use expr::parse_expr_from_str;
+use query_codegen::generate_code;
+use query::parse_expr_from_str;
 
 
 use clap::Parser;
 use csv::Reader;
 use rustyline::{error::ReadlineError, history::MemHistory, Config, Editor};
 
-use crate::{codegen::ir::DataType, expr::eval_expression, expr_codegen::get_type};
+use crate::{codegen::ir::DataType, query::{eval_expression, parse_query_from_str, run_query}, query_codegen::get_type};
 
 // Empty consumer for benchmarking
 unsafe extern "C" fn noop_result_consumer(_: *mut u8) -> *mut u8 {
@@ -40,38 +40,27 @@ struct Cli {
     number: Option<u64>
 }
 
-fn eval(expr: &expr::Expr, test_data: (usize, &[i64]), benchmark: bool) {
+fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
     let codegen_start = std::time::Instant::now();
     let result_consumer = if benchmark {
         noop_result_consumer
     } else {
         stdout_result_consumer
     };
-    let code = generate_code(&expr, test_data.0, result_consumer);
+    let code = generate_code(&query, test_data.0, result_consumer);
     let codegen_elapsed = codegen_start.elapsed();
     match code {
         Ok(code) => {
             println!("Generated {} bytes of x86-64 binary in {:?}", code.code_len, codegen_elapsed);
             if benchmark {
-                let elapsed = if get_type(&expr) == DataType::I64 {
-                    let start_time = std::time::Instant::now();
-                    code.call::<i64>(&[test_data.1.as_ptr() as i64, (test_data.1.len() / test_data.0) as i64]);
-                    start_time.elapsed()
-                } else {
-                    let start_time = std::time::Instant::now();
-                    code.call::<i64>(&[test_data.1.as_ptr() as i64, (test_data.1.len() / test_data.0) as i64]);
-                    start_time.elapsed()
-                };
+                let start_time = std::time::Instant::now();
+                code.call::<i64>(&[test_data.1.as_ptr() as i64, (test_data.1.len() / test_data.0) as i64]);
+                let elapsed = start_time.elapsed();
                 
                 let start_interp = std::time::Instant::now();
 
-                for line in test_data.1.chunks(test_data.0) {
-
-                    let interp_result = eval_expression(&expr, line);
-
-                    black_box(interp_result);
-
-                }
+                run_query(&query, test_data.1, test_data.0, |result| {black_box(result);});
+                
                 let elapsed_interp = start_interp.elapsed();
 
                 //let start_hardcoded = std::time::Instant::now();
@@ -92,10 +81,10 @@ fn eval(expr: &expr::Expr, test_data: (usize, &[i64]), benchmark: bool) {
         },
         Err(c) => {
             match c {
-                expr_codegen::CodeGenError::TypeError => {
+                query_codegen::CodeGenError::TypeError => {
                     println!("Type error");
                 }
-                expr_codegen::CodeGenError::Const(n) => {
+                query_codegen::CodeGenError::Const(n) => {
                     println!("Result(const): {}", n);
                 }
             }
@@ -158,8 +147,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             Ok(line) => {
                 rl.add_history_entry(line.as_str()).unwrap();
                 let parse_start = std::time::Instant::now();
-                let expr = parse_expr_from_str(&line);
-                let expr = match expr {
+                let query = parse_query_from_str(&line);
+                let query = match query {
                     Ok(expr) => expr,
                     Err(e) => {
                         println!("Parse-Error: {}", e);
@@ -169,7 +158,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let parse_elapsed = parse_start.elapsed();
                 println!("Parsed in {:?}", parse_elapsed);
 
-                eval(&expr, (test_data.0, &test_data.1), args.benchmark)
+                eval(&query, (test_data.0, &test_data.1), args.benchmark)
             },
             Err(ReadlineError::Interrupted) => {
                 println!("CTRL-C");
@@ -192,7 +181,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod test {
 
-    use self::expr::Atom;
+    use self::query::Atom;
 
     use super::*;
 
