@@ -34,6 +34,7 @@ impl GeneratedCode {
         let mut ghcc_code = wrapper_stencil.code.clone();
 
         let holes_values = vec![(mmap as u64).to_ne_bytes()];
+        debug_assert_eq!(holes_values.len(), 1);
         for (&reloc, val) in wrapper_stencil.holes.iter().zip(holes_values.iter()) {
             debug_assert_eq!(reloc.reloc_type, RelocType::Abs64Fun);
             ghcc_code[reloc.offset..reloc.offset + 8].copy_from_slice(val);

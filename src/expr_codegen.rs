@@ -1,6 +1,6 @@
-use std::fmt::Display;
+use std::{fmt::Display, ops::Deref};
 
-use crate::expr::{Atom, BuiltIn, Expr};
+use crate::{codegen::{CGCmp, CodegenCFunctionSignature, PtrRefByteOffset, Setable, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, expr::{Atom, BuiltIn, Expr}};
 
 #[cfg(feature = "print-asm")]
 use crate::codegen::disassemble;
@@ -205,25 +205,25 @@ fn generate_bool_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: BoolRef<'cg>, r
     }
 }
 
-fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr]) -> Result<CGValueRef<'cg>, CodeGenError> {
+fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr], input_values: &[I64Ref<'cg>]) -> Result<CGValueRef<'cg>, CodeGenError> {
     let first_variable = &args[0];
 
     let mut cur = match first_variable {
         Expr::Variable(n) => {
-            cg.get_arg(*n).into()
+            input_values[*n].clone().into()
         },
         Expr::Constant(n) => {
             generate_atom(cg, n)
         },
         Expr::Application(fun2, args2) => {
-            generate_code_application(cg,&fun2, &args2)?
+            generate_code_application(cg,&fun2, &args2, input_values)?
         },
     };
 
     for arg in args.iter().skip(1) {
         let next: CGValueRef<'cg> = match arg {
             Expr::Variable(n) => {
-                cg.get_arg(*n).into()
+                input_values[*n].clone().into()
             },
             Expr::Constant(n) => {
                 generate_atom(cg, n)
@@ -235,7 +235,7 @@ fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr]
                 } else {
                     return Err(CodeGenError::TypeError);
                 };
-                generate_code_application(cg, &fun2, &folded_args)?
+                generate_code_application(cg, &fun2, &folded_args, input_values)?
             },
         };
         match cur.data_type {
@@ -255,13 +255,13 @@ fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr]
     Ok(cur)
 }
 
-fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr) -> Result<CGValueRef<'cg>, CodeGenError> {
+fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr, input_values: &[I64Ref<'cg>]) -> Result<CGValueRef<'cg>, CodeGenError> {
     Ok(match expr {
         Expr::Constant(e) => {
             return Err(CodeGenError::Const(e.clone()));
         },
         Expr::Variable(n) => {
-            cg.get_arg(*n).into()
+            input_values[*n].clone().into()
         },
         Expr::Application(fun, args) => {
             let folded_args = if let Some(fa) = fold_constants(fun, args) {
@@ -278,24 +278,25 @@ fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr) -> Result<CGValueRef<
                         return Err(CodeGenError::Const(n.clone()));
                     },
                     Expr::Variable(n) => {
-                        cg.get_arg(*n).into()
+                        input_values[*n].clone().into()
                     },
                     _ => {
-                        generate_code_application(cg, fun, &folded_args)?
+                        generate_code_application(cg, fun, &folded_args, input_values)?
                     },
                 }
             } else {
-                generate_code_application(cg, fun, &folded_args)?
+                generate_code_application(cg, fun, &folded_args, input_values)?
             }
         },
     })
 }
 
-pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, CodeGenError> {
+pub fn generate_code(expr: &Expr, columns: usize, result_consumer: CodegenCFunctionSignature) -> Result<GeneratedCode, CodeGenError> {
 
-    let cg = CodeGen::new(args);
+    // TODO: I64 doesn't make sense for data length. Use U64 as soon as the wrapper is implemented
+    let cg = CodeGen::new(&[DataType::Ptr, DataType::I64]);
 
-    // Uncomment this and comment the gnerate_code_inner to test ifs
+    // Uncomment this and comment the generate_code_inner to test ifs
 
     /*let val = cg.get_arg(0);
 
@@ -329,10 +330,27 @@ pub fn generate_code(expr: &Expr, args: usize) -> Result<GeneratedCode, CodeGenE
     });
     let return_value = val.into();
     */
-    
-    let return_value = generate_code_inner(&cg, expr)?;
 
-    cg.generate_return(return_value);
+    let data_ptr = TypedPtrRef::<I64Ref>::from(cg.get_arg(0));
+    let i = cg.new_i64_var(0);
+
+   cg.gen_while::<CodeGenError>(|| {
+        let num = I64Ref::from(cg.get_arg(1));
+        Ok(i.clone().cg_lt(&num))
+    }, || {
+        // We assume we actually need the majority of our columns. We could also analyze the expression
+        // And only load the columns that are actually used here.
+        let row_ptr = data_ptr.typed_offset(&i);
+        let row = (0..columns).map(|j| {
+            row_ptr.clone().typed_offset(j as i64).read()
+        }).collect::<Vec<_>>();
+        let return_value: CGValueRef = generate_code_inner(&cg, expr, &row)?;
+        cg.call_c_function(result_consumer, UntypedPtrRef::from(return_value));
+        i.set(i.clone() + 1);
+        Ok(())
+    })?;
+
+    cg.gen_return(None);
 
     let gc = cg.generate_code();
 

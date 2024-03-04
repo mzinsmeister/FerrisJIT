@@ -1,7 +1,8 @@
 
 
-// Long term we probably need a full blown own IR but for now this houses some data types
-// for identifying stencils
+// Long term we may need a full blown own IR but for now this houses some data types
+// for identifying stencils. For now i will try without my own IR, also because it increases
+// codegen/compile times compared to just emitting binary directly.
 
 use std::fmt::{self, Display, Formatter};
 

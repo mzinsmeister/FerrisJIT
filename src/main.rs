@@ -2,7 +2,7 @@ mod expr;
 mod codegen;
 mod expr_codegen;
 
-use std::{error::Error, fmt::Display, hint::black_box};
+use std::{error::Error, hint::black_box, ptr};
 
 use expr_codegen::generate_code;
 use expr::parse_expr_from_str;
@@ -13,6 +13,18 @@ use csv::Reader;
 use rustyline::{error::ReadlineError, history::MemHistory, Config, Editor};
 
 use crate::{codegen::ir::DataType, expr::eval_expression, expr_codegen::get_type};
+
+// Empty consumer for benchmarking
+unsafe extern "C" fn noop_result_consumer(_: *mut u8) -> *mut u8 {
+    return ptr::null_mut();
+}
+
+unsafe extern "C" fn stdout_result_consumer(args: *mut u8) -> *mut u8 {
+    // Since we only have a single argument, we passed it by value
+    let result = args as i64; 
+    println!("Result: {}", result);
+    return ptr::null_mut();
+}
 
 /// Search for a pattern in a file and display the lines that contain it.
 #[derive(Parser)]
@@ -28,9 +40,14 @@ struct Cli {
     number: Option<u64>
 }
 
-fn eval<T: Display>(expr: &expr::Expr, test_data: &[Vec<i64>], benchmark: bool) {
+fn eval(expr: &expr::Expr, test_data: (usize, &[i64]), benchmark: bool) {
     let codegen_start = std::time::Instant::now();
-    let code = generate_code(&expr, test_data[0].len());
+    let result_consumer = if benchmark {
+        noop_result_consumer
+    } else {
+        stdout_result_consumer
+    };
+    let code = generate_code(&expr, test_data.0, result_consumer);
     let codegen_elapsed = codegen_start.elapsed();
     match code {
         Ok(code) => {
@@ -38,21 +55,17 @@ fn eval<T: Display>(expr: &expr::Expr, test_data: &[Vec<i64>], benchmark: bool) 
             if benchmark {
                 let elapsed = if get_type(&expr) == DataType::I64 {
                     let start_time = std::time::Instant::now();
-                    for line in test_data.iter() {
-                        code.call::<i64>(line);
-                    }
+                    code.call::<i64>(&[test_data.1.as_ptr() as i64, (test_data.1.len() / test_data.0) as i64]);
                     start_time.elapsed()
                 } else {
                     let start_time = std::time::Instant::now();
-                    for line in test_data.iter() {
-                        code.call::<bool>(line);
-                    }
+                    code.call::<i64>(&[test_data.1.as_ptr() as i64, (test_data.1.len() / test_data.0) as i64]);
                     start_time.elapsed()
                 };
                 
                 let start_interp = std::time::Instant::now();
 
-                for line in test_data.iter() {
+                for line in test_data.1.chunks(test_data.0) {
 
                     let interp_result = eval_expression(&expr, line);
 
@@ -74,15 +87,7 @@ fn eval<T: Display>(expr: &expr::Expr, test_data: &[Vec<i64>], benchmark: bool) 
                 println!("Compiled is {:.2}x {}", factor, if factor > 1.0 { "faster" } else { "slower" });
 
             } else {
-                for line in test_data.iter() {
-                    if get_type(&expr) == DataType::Bool {
-                        let result = code.call::<bool>(line);
-                        println!("Result: {}", result);
-                    } else {
-                        let result = code.call::<i64>(line);
-                        println!("Result: {}", result);
-                    }
-                }
+                code.call::<i64>(&[test_data.1.as_ptr() as i64, (test_data.1.len() / test_data.0) as i64]);
             }
         },
         Err(c) => {
@@ -107,10 +112,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // If the user specified a csv (no header, comma separated) file we will read the data from there
     // otherwise we will generate a sequential range of numbers 0..10_000_000
 
-    let test_data: Vec<Vec<i64>> = if let Some(csv_path) = args.csv {
+    let test_data: (usize, Vec<i64>) = if let Some(csv_path) = args.csv {
         println!("Reading data from csv file: {:?}", csv_path);
         let mut rdr = Reader::from_path(csv_path)?;
-        rdr.records()
+        let rows: Vec<Vec<i64>> = rdr.records()
             .map(|record| {
                 let record = record.unwrap();
                 let mut vec = Vec::new();
@@ -119,7 +124,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
                 vec
             })
-            .collect()
+            .collect();
+        if rows.len() == 0 {
+            println!("No data to process");
+            return Ok(());
+        }
+        let n = rows[0].len();
+        (n, rows.concat())
     } else {
         println!("No csv file specified, using default dummy data");
         let default_n = if args.benchmark {
@@ -127,14 +138,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         } else {
             10
         };
+        if let Some(0) = args.number {
+            println!("Number of elements must be greater than 0");
+            return Ok(());
+        }
         let n = args.number.map_or(default_n, |n| n as i64);
-        (0..n).map(|x| vec![x]).collect()
+        (1, (0..n).collect())
     };
-
-    if test_data.len() == 0 {
-        println!("No data to process");
-        return Ok(());
-    }
 
     codegen::init_stencils();
 
@@ -158,13 +168,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 };
                 let parse_elapsed = parse_start.elapsed();
                 println!("Parsed in {:?}", parse_elapsed);
-                let result_type = expr_codegen::get_type(&expr);
 
-                match result_type {
-                    DataType::I64 => eval::<i64>(&expr, &test_data, args.benchmark),
-                    DataType::Bool => eval::<bool>(&expr, &test_data, args.benchmark),
-                    _ => unreachable!()
-                }            
+                eval(&expr, (test_data.0, &test_data.1), args.benchmark)
             },
             Err(ReadlineError::Interrupted) => {
                 println!("CTRL-C");
@@ -195,7 +200,7 @@ mod test {
     fn test_codegen_1() {
         let expr_str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1, noop_result_consumer).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
@@ -211,7 +216,7 @@ mod test {
     fn test_codegen_2() {
         let expr_str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1, noop_result_consumer).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
@@ -228,7 +233,7 @@ mod test {
         let expr_str = "(+ (+ $0 $0) (* (/ $0 2) (- (* 9 4) $0)))";
 
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1, noop_result_consumer).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
@@ -245,7 +250,7 @@ mod test {
     fn test_codegen_4() {
         let expr_str = "(= (= $0 5) (= (- (+ $0 $0) (* -2 $0)) 20)))";
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1, noop_result_consumer).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call::<bool>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
@@ -261,7 +266,7 @@ mod test {
     fn test_codegen_5() {
         let expr_str = "(- (/ $0 2) (* -2 $0))";
         let expr = parse_expr_from_str(expr_str).unwrap();
-        let code = generate_code(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1, noop_result_consumer).unwrap();
         for i in [0, 1, 5, 10, 100, 1000].iter() {
             let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();
@@ -278,7 +283,7 @@ mod test {
     #[test]
     fn test_codegen_very_complex_1() {
         let expr = parse_expr_from_str(VERY_COMPLEX_EXPR_1).unwrap();
-        let code = generate_code(&expr, 1).unwrap();
+        let code = generate_code(&expr, 1, noop_result_consumer).unwrap();
         for i in [0, 1, 5].iter() {
             let result = code.call::<i64>(&[*i]);
             let interp_result = eval_expression(&expr, &[*i]).unwrap();

@@ -399,7 +399,7 @@ impl CopyPatchBackend {
         self.copy_and_patch(stencil, holes_values);
     }
 
-    pub fn emit_if<THEN: FnOnce()>(&self, then: THEN) {
+    pub fn emit_if<E>(&self, then: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
         let cond_stencil = STENCILS.get(&StencilType::new(StencilOperation::CondBr, None)).unwrap();
         let then_hole = cond_stencil.holes[0];
         if then_hole.reloc_type == RelocType::Rel32 && then_hole.offset + 4 == cond_stencil.code.len() {
@@ -409,7 +409,7 @@ impl CopyPatchBackend {
             code.extend_from_slice(&code_without_jump);
             // drop the borrow so that the closure can borrow self again
             drop(code);
-            then();
+            then()?;
             let mut code = self.code.borrow_mut();
             let else_hole_ofs = start_len + cond_stencil.holes[1].offset;
             let end_ofs = code.len();
@@ -419,6 +419,7 @@ impl CopyPatchBackend {
             // TODO: Just implement this in case some other LLVM version produces some other code
             panic!("LLVM has produced some unexpected output it seems. Fix this case! {}:{}", file!(), line!())
         }
+        Ok(())
     }
 
     /// The offset is the offset from the current code length
@@ -471,14 +472,15 @@ impl CopyPatchBackend {
     }
 
     /// Important!: don't assume anything about the state of the registers in either the condition or the body
-    pub fn emit_loop(&self, cond: impl FnOnce(), body: impl FnOnce()) {
+    pub fn emit_loop<E>(&self, cond: impl FnOnce() -> Result<(), E>, body: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
         let start_ofs = self.code.borrow().len();
-        cond();
+        cond()?;
         self.emit_if(|| {
-            body();
+            body()?;
             let ofs = start_ofs as i32 - (self.code.borrow().len() as i32);
             self.emit_uncond_branch(ofs);
-        });
+            Ok(())
+        })
     }
 
     pub fn generate_code(&self, stack_size: usize) -> GeneratedCode {

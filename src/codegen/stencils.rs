@@ -506,7 +506,9 @@ impl<'ctx> StencilCodeGen<'ctx> {
         // We can then put our arguments somewhere in memory and pass a pointer to that
         // We also get back a single pointer to the result
         let c_function_type = uint8_ptr.fn_type(&[uint8_ptr.into()], false);
-        let c_function = self.module.add_function("PH1F", c_function_type, Some(Linkage::External));
+        let c_function = self.module.add_function("PH1", c_function_type, Some(Linkage::Internal));
+        self.ph_counter.set(self.ph_counter.get() + 1);
+
         c_function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMCCallConv as u32);
 
         let call = self.builder.build_indirect_call(c_function_type, c_function.as_global_value().as_pointer_value(), &[arg.into()], "call").unwrap();
@@ -735,7 +737,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
 
         let funptr_type = then_tailcallfun.get_type().ptr_type(AddressSpace::default());
-        let phi = self.builder.build_phi(funptr_type, "phi").unwrap();
+        let i = self.builder.build_phi(funptr_type, "phi").unwrap();
         phi.add_incoming(&[(&then_tailcallfun.as_global_value(), then_block), (&else_tailcallfun.as_global_value(), else_block)]);
 
         let call = self.builder.build_indirect_call(then_tailcallfun.get_type(), phi.as_basic_value().into_pointer_value(), &[stackptr.into()], "call").unwrap();
@@ -1023,6 +1025,21 @@ fn compile_all_int_op() -> BTreeMap<StencilType, Stencil> {
         stencils.insert(stencil_type, stencil);
     }
 
+    // Get all stencils for u64 and add them for DataType::Ptr
+
+    let mut new_stencils = Vec::new();
+    for (s_type, stencil) in stencils.iter() {
+        if let Some(ty) = s_type.data_type.as_ref() {
+            if *ty == DataType::U64 {
+                let new_s_type = StencilType::new(s_type.operation, Some(DataType::Ptr));
+                new_stencils.push((new_s_type, stencil.clone()));
+            }
+        }
+    }
+    for (s_type, stencil) in new_stencils {
+        stencils.insert(s_type, stencil);
+    }
+
     stencils
 }
 
@@ -1067,27 +1084,30 @@ fn compile_all_load_store() -> BTreeMap<StencilType, Stencil>{
         let s_type = StencilType::new(op, Some(ty.clone()));
         let codegen = StencilCodeGen::new(&context);
         let stencil = codegen.compile_load(ty.clone());
-        result.insert(s_type.clone(), stencil);
+        result.insert(s_type.clone(), stencil.clone());
+        if let Some(flipped) = ty.flip_signed() {
+            let s_type = StencilType::new(op, Some(flipped));
+            result.insert(s_type.clone(), stencil.clone());
+        }
+        if ty == &DataType::U64 {
+            let s_type = StencilType::new(op, Some(DataType::Ptr));
+            result.insert(s_type.clone(), stencil);
+        }
     }
     let op = StencilOperation::Store;
     for ty in types {
         let s_type = StencilType::new(op, Some(ty.clone()));
         let codegen = StencilCodeGen::new(&context);
         let stencil = codegen.compile_store(ty.clone());
-        result.insert(s_type.clone(), stencil);
-    }
-    // insert the unsigned stencils again for signed types
-    let mut new_stencils = Vec::new();
-    for (s_type, stencil) in result.iter() {
-        if let Some(ty) = s_type.data_type.as_ref() {
-            if let Some(new_ty) = ty.flip_signed() {
-                let new_s_type = StencilType::new(s_type.operation, Some(new_ty));
-                new_stencils.push((new_s_type, stencil.clone()));
-            }
+        result.insert(s_type.clone(), stencil.clone());
+        if let Some(flipped) = ty.flip_signed() {
+            let s_type = StencilType::new(op, Some(flipped));
+            result.insert(s_type.clone(), stencil.clone());
         }
-    }
-    for (s_type, stencil) in new_stencils {
-        result.insert(s_type, stencil);
+        if ty == &DataType::U64 {
+            let s_type = StencilType::new(op, Some(DataType::Ptr));
+            result.insert(s_type.clone(), stencil);
+        }
     }
     result
 }
