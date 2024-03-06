@@ -1,6 +1,6 @@
 use std::{fmt::Display, ops::Deref};
 
-use crate::{codegen::{CGCmp, CodegenCFunctionSignature, IntoBaseRef, PtrRefByteOffset, Setable, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, query::{AggregateFunc, Atom, BuiltIn, Expr, Query}};
+use crate::{codegen::{CGCmp, CodegenCFunctionSignature, IntoBaseRef, Setable, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, query::{AggregateFunc, Atom, BuiltIn, Expr, Query}};
 
 #[cfg(feature = "print-asm")]
 use crate::codegen::disassemble;

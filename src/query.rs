@@ -9,7 +9,7 @@ use std::fmt::{self, Display, Formatter};
 use nom::{
   branch::alt,
   bytes::complete::{tag, tag_no_case},
-  character::complete::{char, digit1, multispace0, multispace1, one_of},
+  character::complete::{char, digit1, multispace0, multispace1},
   combinator::{cut, map, map_res, opt},
   error::{context, VerboseError},
   multi::many0,
@@ -469,6 +469,7 @@ fn err_converter(e: nom::Err<VerboseError<&str>>) -> String {
   }
 }
 
+#[allow(dead_code)]
 pub fn parse_expr_from_str(src: &str) -> Result<Expr, String> {
   parse_expr(src)
     .map_err( err_converter)
