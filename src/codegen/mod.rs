@@ -321,16 +321,20 @@ impl<'cg> std::ops::Add<i64> for I64Ref<'cg> {
     }
 }
 
-// TODO: Think about what to do with the assign traits. Could probably work like this:
-/*impl<'cg> std::ops::AddAssign<&Self> for I64Ref<'cg> {
+impl<'cg> std::ops::AddAssign<&Self> for I64Ref<'cg> {
     fn add_assign(&mut self, rhs: &Self) {
         let cg = self.0.cg;
-        let cgvref = cg.add(&self.0, &rhs.0);
-        if cgvref != self.0.i {
-            self.0 = CGValueRef::new(cgvref, cg, self.0.data_type.clone());
-        }
+        cg.add(&mut self.0, &rhs.0);
     }
-}*/
+}
+
+impl<'cg> std::ops::AddAssign<i64> for I64Ref<'cg> {
+    fn add_assign(&mut self, rhs: i64) {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.add(&mut self.0, &rhs);
+    }
+}
 
 impl<'cg> std::ops::Mul<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
@@ -350,6 +354,21 @@ impl<'cg> std::ops::Mul<i64> for I64Ref<'cg> {
         let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
         cg.mul(&mut self.0, &rhs);
         self
+    }
+}
+
+impl<'cg> std::ops::MulAssign<&Self> for I64Ref<'cg> {
+    fn mul_assign(&mut self, rhs: &Self) {
+        let cg = self.0.cg;
+        cg.mul(&mut self.0, &rhs.0);
+    }
+}
+
+impl<'cg> std::ops::MulAssign<i64> for I64Ref<'cg> {
+    fn mul_assign(&mut self, rhs: i64) {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.mul(&mut self.0, &rhs);
     }
 }
 
@@ -374,6 +393,21 @@ impl<'cg> std::ops::Sub<i64> for I64Ref<'cg> {
     }
 }
 
+impl<'cg> std::ops::SubAssign<&Self> for I64Ref<'cg> {
+    fn sub_assign(&mut self, rhs: &Self) {
+        let cg = self.0.cg;
+        cg.sub(&mut self.0, &rhs.0);
+    }
+}
+
+impl<'cg> std::ops::SubAssign<i64> for I64Ref<'cg> {
+    fn sub_assign(&mut self, rhs: i64) {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.sub(&mut self.0, &rhs);
+    }
+}
+
 impl<'cg> std::ops::Div<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
 
@@ -392,6 +426,21 @@ impl<'cg> std::ops::Div<i64> for I64Ref<'cg> {
         let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
         cg.div(&mut self.0, &rhs);
         self
+    }
+}
+
+impl<'cg> std::ops::DivAssign<&Self> for I64Ref<'cg> {
+    fn div_assign(&mut self, rhs: &Self) {
+        let cg = self.0.cg;
+        cg.div(&mut self.0, &rhs.0);
+    }
+}
+
+impl<'cg> std::ops::DivAssign<i64> for I64Ref<'cg> {
+    fn div_assign(&mut self, rhs: i64) {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.div(&mut self.0, &rhs);
     }
 }
 
@@ -416,6 +465,21 @@ impl<'cg> std::ops::Rem<i64> for I64Ref<'cg> {
     }
 }
 
+impl<'cg> std::ops::RemAssign<&Self> for I64Ref<'cg> {
+    fn rem_assign(&mut self, rhs: &Self) {
+        let cg = self.0.cg;
+        cg.rem(&mut self.0, &rhs.0);
+    }
+}
+
+impl<'cg> std::ops::RemAssign<i64> for I64Ref<'cg> {
+    fn rem_assign(&mut self, rhs: i64) {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.rem(&mut self.0, &rhs);
+    }
+}
+
 impl<'cg> std::ops::BitAnd<&Self> for I64Ref<'cg> {
     type Output = I64Ref<'cg>;
 
@@ -423,6 +487,32 @@ impl<'cg> std::ops::BitAnd<&Self> for I64Ref<'cg> {
         let cg = self.0.cg;
         cg.and(&mut self.0, &rhs.0);
         self
+    }
+}
+
+impl<'cg> std::ops::BitAnd<i64> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn bitand(mut self, rhs: i64) -> Self::Output {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.and(&mut self.0, &rhs);
+        self
+    }
+}
+
+impl<'cg> std::ops::BitAndAssign<&Self> for I64Ref<'cg> {
+    fn bitand_assign(&mut self, rhs: &Self) {
+        let cg = self.0.cg;
+        cg.and(&mut self.0, &rhs.0);
+    }
+}
+
+impl<'cg> std::ops::BitAndAssign<i64> for I64Ref<'cg> {
+    fn bitand_assign(&mut self, rhs: i64) {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.and(&mut self.0, &rhs);
     }
 }
 
@@ -435,6 +525,33 @@ impl<'cg> std::ops::BitOr<&Self> for I64Ref<'cg> {
         self
     }
 }
+
+impl<'cg> std::ops::BitOr<i64> for I64Ref<'cg> {
+    type Output = I64Ref<'cg>;
+
+    fn bitor(mut self, rhs: i64) -> Self::Output {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.or(&mut self.0, &rhs);
+        self
+    }
+}
+
+impl<'cg> std::ops::BitOrAssign<&Self> for I64Ref<'cg> {
+    fn bitor_assign(&mut self, rhs: &Self) {
+        let cg = self.0.cg;
+        cg.or(&mut self.0, &rhs.0);
+    }
+}
+
+impl<'cg> std::ops::BitOrAssign<i64> for I64Ref<'cg> {
+    fn bitor_assign(&mut self, rhs: i64) {
+        let cg = self.0.cg;
+        let rhs = CGValueRef::new_const(ConstValue::I64(rhs), self.cg);
+        cg.or(&mut self.0, &rhs);
+    }
+}
+
 
 #[derive(Debug, PartialEq, PartialOrd, Eq)]
 pub struct BoolRef<'cg> (CGValueRef<'cg>);
@@ -579,7 +696,7 @@ impl<'cg> PtrRefByteOffset<'cg, &I64Ref<'cg>> for UntypedPtrRef<'cg> {
 }
 
 impl<'cg> PtrRefByteOffset<'cg, i64> for UntypedPtrRef<'cg> {
-    fn byte_offset(mut self, byte_offset: i64) -> Self {
+    fn byte_offset(self, byte_offset: i64) -> Self {
         let byte_offset = self.cg.new_i64_const(byte_offset);
         self.byte_offset(&byte_offset)
     }
@@ -594,7 +711,7 @@ impl<'cg> CGEq<'cg, &Self> for UntypedPtrRef<'cg> {
 
     fn cg_neq(mut self, other: &Self) -> BoolRef<'cg> {
         let cg = self.0.cg;
-        let neq = cg.neq(&mut self.0, &other.0);
+        cg.neq(&mut self.0, &other.0);
         BoolRef(self.0)
     }
 }
@@ -634,15 +751,18 @@ impl<'cg> UntypedPtrRef<'cg> {
         new_var
     }
 
+    #[allow(dead_code)]
     pub fn write_to(&self, value: &CGValueRef<'cg>) {
         self.cg.write_to_ptr(self.inner.into_value_i(), &value);
     }
 }
 
+#[allow(private_bounds)]
 pub trait TypedPtrRefOffset<'cg, PtrType: PtrTarget<'cg>, Other> {
     fn typed_offset(&self, offset: Other) -> Self;
 }
 
+#[allow(private_bounds)]
 pub struct TypedPtrRef<'cg, PtrType: PtrTarget<'cg>> {
     ptr: UntypedPtrRef<'cg>,
     _phantom: std::marker::PhantomData<PtrType>
@@ -706,12 +826,14 @@ impl<'cg, PtrType: PtrTarget<'cg>> Setable<'cg, &Self> for TypedPtrRef<'cg, PtrT
     }
 }
 
+#[allow(private_bounds)]
 impl<'cg, PtrType: PtrTarget<'cg>> TypedPtrRef<'cg, PtrType> {
     pub fn read(&self) -> PtrType {
         let value = self.ptr.load_from(PtrType::get_data_type());
         PtrType::from(value)
     }
 
+    #[allow(dead_code)]
     pub fn write(&self, value: &PtrType) {
         self.ptr.write_to(&value.get_inner());
     }
@@ -1049,13 +1171,13 @@ impl MemoryManagement {
     fn init(&mut self, i: usize, c: ConstValue) {
         self.free_reg(0);
         self.cp_backend.emit_take_1_const(c);
-        self.reg_state[0] = Some((i, false));
+        self.reg_state[0] = Some((i, true));
     }
 
     fn bitcast(&mut self, i: usize, data_type: DataType) {
         let value = &mut self.values[i];
         match value {
-            CGValue::Variable{stack_pos, data_type: old_data_type,..} => {
+            CGValue::Variable{data_type: old_data_type,..} => {
                 if old_data_type == &data_type {
                     return;
                 }

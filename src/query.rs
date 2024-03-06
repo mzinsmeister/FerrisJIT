@@ -101,7 +101,11 @@ pub enum Expr {
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum AggregateFunc {
-  Sum
+  Sum,
+  Prod,
+  Avg,
+  Max,
+  Min
   // TODO: Add more aggregate functions here
 }
 
@@ -482,6 +486,10 @@ pub fn eval_from_str(src: &str, vars: &[i64]) -> Result<Atom, String> {
 fn parse_aggregate_func<'a>(i: &'a str) -> IResult<&'a str, AggregateFunc, VerboseError<&'a str>> {
   alt((
     map(tag_no_case("sum"), |_| AggregateFunc::Sum),
+    map(tag_no_case("prod"), |_| AggregateFunc::Prod),
+    map(tag_no_case("avg"), |_| AggregateFunc::Avg),
+    map(tag_no_case("max"), |_| AggregateFunc::Max),
+    map(tag_no_case("min"), |_| AggregateFunc::Min),
   ))(i)
 }
 

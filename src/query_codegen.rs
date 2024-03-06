@@ -326,6 +326,46 @@ fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr, input_values: &[I64Re
     })
 }
 
+fn generate_aggregation_code<'cg>(cg: &'cg CodeGen, query: &Query, result: CGValueRef<'cg>, aggregate_values: &[I64Ref<'cg>], result_consumer: CodegenCFunctionSignature){
+    match query.aggregate {
+        Some(AggregateFunc::Sum) => {
+            let aggregate_value = &aggregate_values[0];
+            aggregate_value.set(I64Ref::from(result) + aggregate_value);
+        },
+        Some(AggregateFunc::Prod) => {
+            let aggregate_value = &aggregate_values[0];
+            aggregate_value.set(I64Ref::from(result) * aggregate_value);
+        },
+        Some(AggregateFunc::Avg) => {
+            let aggregate_value = &aggregate_values[0];
+            let aggregate_count = &aggregate_values[1];
+            aggregate_value.set(I64Ref::from(result) + aggregate_value);
+            aggregate_count.set(aggregate_count.clone() + 1);
+        },
+        Some(AggregateFunc::Max) => {
+            let aggregate_value = &aggregate_values[0];
+            let result = I64Ref::from(result);
+            let cmp = aggregate_value.clone().cg_lt(&result);
+            cg.gen_if::<()>(cmp, || {
+                aggregate_value.set(result.deref());
+                Ok(())
+            }).unwrap();
+        },
+        Some(AggregateFunc::Min) => {
+            let aggregate_value = &aggregate_values[0];
+            let result = I64Ref::from(result);
+            let cmp = aggregate_value.clone().cg_gt(&result);
+            cg.gen_if::<()>(cmp, || {
+                aggregate_value.set(result.deref());
+                Ok(())
+            }).unwrap();
+        },
+        None => {
+            cg.call_c_function(result_consumer, UntypedPtrRef::from(result));
+        },
+    }
+}
+
 pub fn generate_code(query: &Query, columns: usize, result_consumer: CodegenCFunctionSignature) -> Result<GeneratedCode, CodeGenError> {
 
     // TODO: I64 doesn't make sense for data length. Use U64 as soon as the wrapper is implemented
@@ -334,10 +374,14 @@ pub fn generate_code(query: &Query, columns: usize, result_consumer: CodegenCFun
     let data_ptr = TypedPtrRef::<I64Ref>::from(cg.get_arg(0));
     let i = cg.new_i64_var(0);
 
-    let aggregate_value = if let Some(_) = &query.aggregate {
-        Some(cg.new_i64_var(0))
-    } else {
-        None
+
+    let mut aggregate_values: Vec<I64Ref> = match query.aggregate {
+        Some(AggregateFunc::Avg) => vec![cg.new_i64_var(0), cg.new_i64_var(0)],
+        Some(AggregateFunc::Prod) => vec![cg.new_i64_var(1)],
+        Some(AggregateFunc::Max) => vec![cg.new_i64_var(i64::MIN)],
+        Some(AggregateFunc::Min) => vec![cg.new_i64_var(i64::MAX)],
+        Some(_) => vec![cg.new_i64_var(0)],
+        None => Vec::new(),
     };
 
    cg.gen_while::<CodeGenError>(|| {
@@ -355,35 +399,28 @@ pub fn generate_code(query: &Query, columns: usize, result_consumer: CodegenCFun
             let result = BoolRef::from(filter);
             cg.gen_if(result, || {
                 let return_value = generate_code_inner(&cg, &query.expr, &row)?;
-                if let Some(aggregate_value) = &aggregate_value {
-                    match query.aggregate.unwrap() {
-                        AggregateFunc::Sum => {
-                            aggregate_value.set(I64Ref::from(return_value) + aggregate_value);
-                        },
-                    }
-                } else {
-                    cg.call_c_function(result_consumer, UntypedPtrRef::from(return_value));
-                }
+                generate_aggregation_code(&cg, query, return_value, &aggregate_values, result_consumer);
                 Ok(())
             })?;
         } else {
             let return_value = generate_code_inner(&cg, &query.expr, &row)?;
-            if let Some(aggregate_value) = &aggregate_value {
-                match query.aggregate.unwrap() {
-                    AggregateFunc::Sum => {
-                        aggregate_value.set(I64Ref::from(return_value) + aggregate_value);
-                    },
-                }
-            } else {
-                cg.call_c_function(result_consumer, UntypedPtrRef::from(return_value));
-            }
+            generate_aggregation_code(&cg, query, return_value, &aggregate_values, result_consumer);
         }
         i.set(i.clone() + 1);
         Ok(())
     })?;
 
-    if let Some(aggregate_value) = aggregate_value {
-        cg.call_c_function(result_consumer, UntypedPtrRef::from(aggregate_value.into_base()));
+    match query.aggregate {
+        Some(AggregateFunc::Avg) => {
+            let aggregate_count = aggregate_values.pop().unwrap();
+            let aggregate_value = aggregate_values.pop().unwrap();
+            let avg = aggregate_value / &aggregate_count;
+            cg.call_c_function(result_consumer, UntypedPtrRef::from(avg.into_base()));
+        },
+        Some(_) => {
+            cg.call_c_function(result_consumer, UntypedPtrRef::from(aggregate_values.pop().unwrap().into_base()));
+        },
+        _ => {},
     }
 
     cg.gen_return(None);
