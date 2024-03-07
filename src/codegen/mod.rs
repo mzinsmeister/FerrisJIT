@@ -15,7 +15,7 @@ use self::{copy_patch::CopyPatchBackend, ir::ConstValue};
 pub use generated_code::GeneratedCode;
 use libc::c_void;
 
-pub type CodegenCFunctionSignature = unsafe extern "C" fn(*mut u8) -> *mut u8;
+pub type CodegenCFunctionSignature = unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8; // (state, arg1, arg2) -> result Some can be unused depending on the usecase
 
 pub(crate) fn init_stencils() {
     // Dummy access to initialize stencils
@@ -897,7 +897,7 @@ struct MemoryManagement {
     reg_state: [Option<(usize, bool)>; 2], 
     stack_ptr: usize, // TODO: Use actual byte sizes. For now we just use 8 bytes for everything
     stack_size: usize,
-    cp_backend: Rc<CopyPatchBackend>
+    cp_backend: Rc<CopyPatchBackend>,
 }
 
 impl MemoryManagement {
@@ -1188,13 +1188,13 @@ impl MemoryManagement {
     }
 }
 
-fn get_fn_ptr(f: unsafe extern "C" fn(*mut u8) -> *mut u8) -> *const c_void {
-    f as unsafe extern "C" fn(*mut u8) -> *mut u8 as *const c_void
+fn get_fn_ptr(f: CodegenCFunctionSignature) -> *const c_void {
+    f as unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8 as *const c_void
 }
 
 pub struct CodeGen {
     inner: Rc<CopyPatchBackend>,
-    memory_management: RefCell<MemoryManagement>
+    memory_management: RefCell<MemoryManagement>,
 }
 
 #[allow(dead_code)]
@@ -1205,7 +1205,8 @@ impl CodeGen {
         let memory_management = MemoryManagement::new(cp_backend.clone(), arg_types);
         Self {
             inner: cp_backend,
-            memory_management: RefCell::new(memory_management)
+            memory_management: RefCell::new(memory_management),
+
         }
     }
 
@@ -1583,7 +1584,6 @@ impl CodeGen {
                 }
             };
             self.memory_management.borrow_mut().put_in_reg(0, i);
-            self.inner.emit_put_stack(0);
         }
         self.inner.emit_ret();
     }
@@ -1593,7 +1593,7 @@ impl CodeGen {
         let mut memory_management = self.memory_management.borrow_mut();
         memory_management.put_in_reg(0, args_ptr.inner.into_value_i());
         // Allocate a stack region large enough to hold the input arguments
-        self.inner.emit_call_c_func(get_fn_ptr(func)); 
+        self.inner.emit_call_c_func(get_fn_ptr(func), 0);
         // Put first register into a new value
         memory_management.lose_reg(0);
         memory_management.lose_reg(1);

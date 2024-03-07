@@ -81,14 +81,14 @@ impl GeneratedCode {
         }
     }
     
-    pub fn call<T: Sized>(&self, args: &[i64]) -> T {
+    pub fn call(&self, args: &[usize]) -> *mut u8 {
             // cast the memory region to a function pointer
-        let f: extern "C" fn(*mut u8) = unsafe { std::mem::transmute(self.ghcc_code) };
+        let f: extern "C" fn(*mut u8) -> *mut u8 = unsafe { std::mem::transmute(self.ghcc_code) };
 
         // Copy args to the stack
         for (i, item) in args.iter().enumerate() {
             unsafe {
-                std::ptr::write_unaligned((self.stack as *mut i64).offset(i as isize), *item);
+                std::ptr::write_unaligned((self.stack as *mut usize).offset(i as isize), *item);
             }
         }
 
@@ -97,16 +97,12 @@ impl GeneratedCode {
         // a "root stencil" that unpacks all of our arguments from our custom stack into
         // the registers that the other stencils expect but that is only done once per 
         // call so it should be fine
-        f(self.stack);
-        // get the result from the stack;
-
-        unsafe {
-            let value = std::ptr::read_unaligned(self.stack as *const u64);
-            std::mem::transmute_copy(&value)
-        }
+        f(self.stack)
     }
-}
 
+    // TODO: We have partial support for having 
+
+}
 impl Drop for GeneratedCode {
     fn drop(&mut self) {
         unsafe {

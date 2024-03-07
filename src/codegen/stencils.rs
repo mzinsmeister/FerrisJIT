@@ -458,12 +458,13 @@ impl<'ctx> StencilCodeGen<'ctx> {
         self.module.set_name(&format!("{}", s_type));
         let i8_type = self.context.i8_type();
         let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
-        let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[i8_ptr_type.into()], false);
+        let fn_type = i8_ptr_type.fn_type(&[i8_ptr_type.into()], false);
         let function = self.module.add_function("__GHC_CC-CONVERTER__", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
 
-        let fun = self.init_fn_placeholder(&[i8_ptr_type.into()]);
+        let fun = self.module.add_function(format!("PH{}F", self.ph_counter.get()).as_str(), fn_type, Some(Linkage::External));
+        fun.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
+        self.ph_counter.set(self.ph_counter.get() + 1);
 
         self.builder.position_at_end(basic_block);
 
@@ -474,7 +475,9 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         call.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
 
-        self.builder.build_return(None).unwrap();
+        let return_value = call.try_as_basic_value().left().unwrap();
+
+        self.builder.build_return(Some(&return_value)).unwrap();
 
         self.code_model.set(CodeModel::Large);
 
@@ -491,7 +494,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
         self.module.set_name(&format!("{}", StencilType::new(StencilOperation::CallCFunction, None)));
         let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[uint8_ptr.into(), uint8_ptr.into()], false);
+        let fn_type = void_type.fn_type(&[uint8_ptr.into(), uint8_ptr.into(), uint8_ptr.into()], false);
         let function = self.module.add_function("call-c-func", fn_type, None);
         function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMGHCCallConv as u32);
         let basic_block = self.context.append_basic_block(function, "entry");
@@ -499,19 +502,23 @@ impl<'ctx> StencilCodeGen<'ctx> {
         self.builder.position_at_end(basic_block);
 
         let stackptr = function.get_nth_param(0).unwrap().into_pointer_value();
-        let arg = function.get_nth_param(1).unwrap().into_pointer_value();
-
+        let arg1 = function.get_nth_param(1).unwrap().into_pointer_value();
+        let arg2 = function.get_nth_param(2).unwrap().into_pointer_value();
 
         // We go with a function that passes a single pointer as an argument
         // We can then put our arguments somewhere in memory and pass a pointer to that
         // We also get back a single pointer to the result
-        let c_function_type = uint8_ptr.fn_type(&[uint8_ptr.into()], false);
+        let c_function_type = uint8_ptr.fn_type(&[uint8_ptr.into(), uint8_ptr.into(), uint8_ptr.into()], false);
         let c_function = self.module.add_function("PH1", c_function_type, Some(Linkage::Internal));
         self.ph_counter.set(self.ph_counter.get() + 1);
 
+        // Get state to pass into the function as a first parameter from the stack
+        let state_offset = self.init_placeholder(self.context.i64_type());
+        let state_ptr = unsafe { self.builder.build_gep(self.context.i8_type(), stackptr, &[state_offset], "stateptr").unwrap() };
+
         c_function.set_call_conventions(inkwell::llvm_sys::LLVMCallConv::LLVMCCallConv as u32);
 
-        let call = self.builder.build_indirect_call(c_function_type, c_function.as_global_value().as_pointer_value(), &[arg.into()], "call").unwrap();
+        let call = self.builder.build_indirect_call(c_function_type, c_function.as_global_value().as_pointer_value(), &[state_ptr.into(), arg1.into(), arg2.into()], "call").unwrap();
         call.set_call_convention(inkwell::llvm_sys::LLVMCallConv::LLVMCCallConv as u32);
 
         let return_value = call.try_as_basic_value().left().unwrap().into_pointer_value();
@@ -878,8 +885,8 @@ impl<'ctx> StencilCodeGen<'ctx> {
     pub fn compile_ret_stencil(&self) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Ret, None);
         self.module.set_name(&format!("{}", s_type));
-        let void_type = self.context.void_type();
-        let fn_type = void_type.fn_type(&[], false);
+        let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        let fn_type = i8_ptr_type.fn_type(&[i8_ptr_type.into()], false);
         let function = self.module.add_function("ret", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
 
@@ -887,7 +894,9 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
         self.builder.position_at_end(basic_block);
 
-        self.builder.build_return(None).unwrap();
+        let ret_value = function.get_nth_param(0).unwrap().into_pointer_value();
+
+        self.builder.build_return(Some(&ret_value)).unwrap();
                 
         let elf = self.compile();
     

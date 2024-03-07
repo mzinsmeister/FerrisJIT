@@ -369,10 +369,10 @@ impl CopyPatchBackend {
         self.copy_and_patch(stencil, holes_values);
     }
 
-    pub fn emit_call_c_func(&self, func: *const c_void) {
+    pub fn emit_call_c_func(&self, func: *const c_void, state_stack_pos: usize) {
         let s_type = StencilType::new(StencilOperation::CallCFunction, None);
         let stencil = STENCILS.get(&s_type).unwrap();
-        let holes_values = vec![func as u64];
+        let holes_values = vec![func as u64, state_stack_pos as u64];
         self.copy_and_patch(stencil, holes_values);
     }
 
