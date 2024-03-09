@@ -1,11 +1,11 @@
-use std::{fmt::Display, ops::Deref};
+use std::fmt::Display;
 
-use crate::{codegen::{CGCmp, CodegenCFunctionSignature, IntoBaseRef, Setable, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, query::{AggregateFunc, Atom, BuiltIn, Expr, Query}};
+use crate::{codegen::{types::{BoolRef, CGCmp, CGEq, I64Ref, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, CodeGenContext, CodegenCFunctionSignature, IntoBaseRef, Setable}, query::{AggregateFunc, Atom, BuiltIn, Expr, Query}};
 
 #[cfg(feature = "print-asm")]
 use crate::codegen::disassemble;
 
-use crate::codegen::{ir::DataType, BoolRef, CGEq, CGValueRef, CodeGen, GeneratedCode, I64Ref};
+use crate::codegen::{ir::DataType, CGValueRef, CodeGen, GeneratedCode};
 
 fn fold_op(fun: &BuiltIn, l: Atom, r: Atom) -> Option<Atom> {
     match (fun, l, r) {
@@ -170,7 +170,7 @@ impl Display for CodeGenError {
     }
 }
 
-fn generate_atom<'cg>(cg: &'cg CodeGen, atom: &Atom) -> CGValueRef<'cg> {
+fn generate_atom<'ctx, 'cg>(cg: &'cg CodeGen<'ctx>, atom: &Atom) -> CGValueRef<'cg, 'ctx> {
     match atom {
         Atom::Num(n) => {
             cg.new_i64_const(*n).into()
@@ -181,7 +181,7 @@ fn generate_atom<'cg>(cg: &'cg CodeGen, atom: &Atom) -> CGValueRef<'cg> {
     }
 }
 
-fn generate_int_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: I64Ref<'cg>, right: I64Ref<'cg>) -> CGValueRef<'cg> {
+fn generate_int_op<'ctx, 'cg>(_cg: &'cg CodeGen<'ctx>, fun: &BuiltIn, left: I64Ref<'cg, 'ctx>, right: I64Ref<'cg, 'ctx>) -> CGValueRef<'cg, 'ctx> {
     match fun {
         BuiltIn::Plus => {
             (left + &right).into()
@@ -222,7 +222,7 @@ fn generate_int_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: I64Ref<'cg>, rig
     }
 }
 
-fn generate_bool_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: BoolRef<'cg>, right: BoolRef<'cg>) -> BoolRef<'cg> {
+fn generate_bool_op<'ctx ,'cg>(_cg: &'cg CodeGen<'ctx>, fun: &BuiltIn, left: BoolRef<'cg, 'ctx>, right: BoolRef<'cg, 'ctx>) -> BoolRef<'cg, 'ctx> {
     match fun {
         BuiltIn::Equal => {
             left.cg_eq(&right)
@@ -240,7 +240,7 @@ fn generate_bool_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: BoolRef<'cg>, r
     }
 }
 
-fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr], input_values: &[I64Ref<'cg>]) -> Result<CGValueRef<'cg>, CodeGenError> {
+fn generate_code_application<'ctx, 'cg>(cg: &'cg CodeGen<'ctx>, fun: &BuiltIn, args: &[Expr], input_values: &[I64Ref<'cg, 'ctx>]) -> Result<CGValueRef<'cg, 'ctx>, CodeGenError> {
     let first_variable = &args[0];
 
     let mut cur = match first_variable {
@@ -256,7 +256,7 @@ fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr]
     };
 
     for arg in args.iter().skip(1) {
-        let next: CGValueRef<'cg> = match arg {
+        let next: CGValueRef<'cg, 'ctx> = match arg {
             Expr::Variable(n) => {
                 input_values[*n].clone().into()
             },
@@ -290,7 +290,7 @@ fn generate_code_application<'cg>(cg: &'cg CodeGen, fun: &BuiltIn, args: &[Expr]
     Ok(cur)
 }
 
-fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr, input_values: &[I64Ref<'cg>]) -> Result<CGValueRef<'cg>, CodeGenError> {
+fn generate_code_inner<'ctx, 'cg>(cg: &'cg CodeGen<'ctx>, expr: &Expr, input_values: &[I64Ref<'cg, 'ctx>]) -> Result<CGValueRef<'cg, 'ctx>, CodeGenError> {
     Ok(match expr {
         Expr::Constant(a) => {
             return Ok(generate_atom(cg, a))
@@ -326,7 +326,7 @@ fn generate_code_inner<'cg>(cg: &'cg CodeGen, expr: &Expr, input_values: &[I64Re
     })
 }
 
-fn generate_aggregation_code<'cg>(cg: &'cg CodeGen, query: &Query, result: CGValueRef<'cg>, aggregate_values: &[I64Ref<'cg>], result_consumer: CodegenCFunctionSignature){
+fn generate_aggregation_code<'ctx, 'cg>(cg: &'cg CodeGen<'ctx>, query: &Query, result: CGValueRef<'cg, 'ctx>, aggregate_values: &[I64Ref<'cg, 'ctx>], result_consumer: CodegenCFunctionSignature){
     match query.aggregate {
         Some(AggregateFunc::Sum) => {
             let aggregate_value = &aggregate_values[0];
@@ -347,7 +347,7 @@ fn generate_aggregation_code<'cg>(cg: &'cg CodeGen, query: &Query, result: CGVal
             let result = I64Ref::from(result);
             let cmp = aggregate_value.clone().cg_lt(&result);
             cg.gen_if::<()>(cmp, || {
-                aggregate_value.set(result.deref());
+                aggregate_value.set(&result);
                 Ok(())
             }).unwrap();
         },
@@ -356,7 +356,7 @@ fn generate_aggregation_code<'cg>(cg: &'cg CodeGen, query: &Query, result: CGVal
             let result = I64Ref::from(result);
             let cmp = aggregate_value.clone().cg_gt(&result);
             cg.gen_if::<()>(cmp, || {
-                aggregate_value.set(result.deref());
+                aggregate_value.set(&result);
                 Ok(())
             }).unwrap();
         },
@@ -368,12 +368,12 @@ fn generate_aggregation_code<'cg>(cg: &'cg CodeGen, query: &Query, result: CGVal
 
 pub fn generate_code(query: &Query, columns: usize, result_consumer: CodegenCFunctionSignature) -> Result<GeneratedCode, CodeGenError> {
 
+    let mut ctx = CodeGenContext::new();
     // TODO: I64 doesn't make sense for data length. Use U64 as soon as the wrapper is implemented
-    let cg = CodeGen::new(&[DataType::Ptr, DataType::I64]);
+    let cg = ctx.create_codegen(&[DataType::Ptr, DataType::I64]);
 
     let data_ptr = TypedPtrRef::<I64Ref>::from(cg.get_arg(0));
     let i = cg.new_i64_var(0);
-
 
     let mut aggregate_values: Vec<I64Ref> = match query.aggregate {
         Some(AggregateFunc::Avg) => vec![cg.new_i64_var(0), cg.new_i64_var(0)],
@@ -422,6 +422,7 @@ pub fn generate_code(query: &Query, columns: usize, result_consumer: CodegenCFun
         },
         _ => {},
     }
+
 
     cg.gen_return(None);
 

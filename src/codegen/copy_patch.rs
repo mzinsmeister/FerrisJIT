@@ -1,11 +1,9 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
-use crate::codegen::stencils::{compile_all_stencils, Stencil, RelocType};
-
 #[cfg(feature = "print-asm")]
 use super::disassemble;
 
-use super::{ir::{ConstValue, DataType}, stencils::{StencilOperation, StencilType}, GeneratedCode};
+use super::{ir::{ConstValue, DataType}, llvm::stencils::{StencilOperation, StencilType, compile_all_stencils, Stencil, RelocType}, GeneratedCode};
 use lazy_static::lazy_static;
 use libc::c_void;
 

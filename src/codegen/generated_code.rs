@@ -4,9 +4,7 @@
 
 use std::os::raw::c_void;
 
-use crate::codegen::stencils::RelocType;
-
-use super::stencils::Stencil;
+use super::llvm::stencils::{Stencil, RelocType};
 
 pub struct GeneratedCode {
     pub stack: *mut u8,

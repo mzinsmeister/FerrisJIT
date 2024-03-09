@@ -17,7 +17,8 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-use super::ir::DataType;
+use super::super::ir::DataType;
+use super::*;
 
 // We make sure that normal stencils preserve at least this amount of arguments
 // after the call if they are unused in the result (e.g. second arg for add will be preserved)
@@ -178,6 +179,10 @@ impl Display for StencilType {
         }
     }
 }
+
+
+// TODO: We can probably put the function that did the core LLVM operation of the stencil 
+// into the stencil struct to be able to generate the LLVM IR for the stencils operation
 
 #[derive(Debug, Clone)]
 pub struct Stencil {
@@ -347,7 +352,7 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool) -> Stencil {
         code,
         s_type,
         holes,
-        tail_holes,
+        tail_holes
     }
 }
 
@@ -907,85 +912,6 @@ impl<'ctx> StencilCodeGen<'ctx> {
 fn compile_all_int_op() -> BTreeMap<StencilType, Stencil> {
     // TODO: This should be some kind of operations in a codegen layer that should
     //       should then be able to be reused for stencil generation
-    fn int_add<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_int_add(x, y, "add").unwrap()
-    }
-    fn int_sub<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_int_sub(x, y, "sub").unwrap()
-    }
-    fn int_mul<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_int_mul(x, y, "mul").unwrap()
-    }
-    fn int_div<'ctx>(builder: &Builder<'ctx>, d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        if d_type.is_signed() {
-            builder.build_int_signed_div(x, y, "div").unwrap()
-        } else {
-            builder.build_int_unsigned_div(x, y, "div").unwrap()
-        }
-    }
-    fn int_rem<'ctx>(builder: &Builder<'ctx>, d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        if d_type.is_signed() {
-            builder.build_int_signed_rem(x, y, "rem").unwrap()
-        } else {
-            builder.build_int_unsigned_rem(x, y, "rem").unwrap()
-        }
-    }
-    fn int_and<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_and(x, y, "and").unwrap()
-    }
-    fn int_or<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_or(x, y, "or").unwrap()
-    }
-    fn int_xor<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_xor(x, y, "xor").unwrap()
-    }
-    fn int_shl<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_left_shift(x, y, "shl").unwrap()
-    }
-    fn int_shr<'ctx>(builder: &Builder<'ctx>, d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        if d_type.is_signed() {
-            builder.build_right_shift(x, y, true, "ashr").unwrap()
-        } else {
-            builder.build_right_shift(x, y, false, "lshr").unwrap()
-        }
-    }
-    fn int_eq<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_int_compare(inkwell::IntPredicate::EQ, x, y, "eq").unwrap()
-    }
-    fn int_ne<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_int_compare(inkwell::IntPredicate::NE, x, y, "ne").unwrap()
-    }
-    fn int_gt<'ctx>(builder: &Builder<'ctx>, d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        if d_type.is_signed() {
-            builder.build_int_compare(inkwell::IntPredicate::SGT, x, y, "sgt").unwrap()
-        } else {
-            builder.build_int_compare(inkwell::IntPredicate::UGT, x, y, "ugt").unwrap()
-        }
-    }
-    fn int_ge<'ctx>(builder: &Builder<'ctx>, d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        if d_type.is_signed() {
-            builder.build_int_compare(inkwell::IntPredicate::SGE, x, y, "sge").unwrap()
-        } else {
-            builder.build_int_compare(inkwell::IntPredicate::UGE, x, y, "uge").unwrap()
-        }
-    }
-    fn int_lt<'ctx>(builder: &Builder<'ctx>, d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        if d_type.is_signed() {
-            builder.build_int_compare(inkwell::IntPredicate::SLT, x, y, "slt").unwrap()
-        } else {
-            builder.build_int_compare(inkwell::IntPredicate::ULT, x, y, "ult").unwrap()
-        }
-    }
-    fn int_le<'ctx>(builder: &Builder<'ctx>, d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
-        if d_type.is_signed() {
-            builder.build_int_compare(inkwell::IntPredicate::SLE, x, y, "sle").unwrap()
-        } else {
-            builder.build_int_compare(inkwell::IntPredicate::ULE, x, y, "ule").unwrap()
-        }
-    }
-    fn int_not<'ctx>(builder: &Builder<'ctx>, x: IntValue<'ctx>) -> IntValue<'ctx> {
-        builder.build_not(x, "not").unwrap()
-    }
     let context = Context::create();
     let ops: Vec<(StencilOperation, StencilOperation, for<'a> fn(& Builder<'a>, DataType, IntValue<'a>, IntValue<'a>) -> IntValue<'a>)> = vec![
         (StencilOperation::Add, StencilOperation::AddConst, int_add),  
@@ -1001,9 +927,9 @@ fn compile_all_int_op() -> BTreeMap<StencilType, Stencil> {
         (StencilOperation::Eq, StencilOperation::EqConst, int_eq), 
         (StencilOperation::Ne, StencilOperation::NeConst, int_ne), 
         (StencilOperation::Gt, StencilOperation::GtConst, int_gt), 
-        (StencilOperation::Gte, StencilOperation::GteConst, int_ge), 
+        (StencilOperation::Gte, StencilOperation::GteConst, int_gte), 
         (StencilOperation::Lt, StencilOperation::LtConst, int_lt), 
-        (StencilOperation::Lte, StencilOperation::LteConst, int_le), 
+        (StencilOperation::Lte, StencilOperation::LteConst, int_lte), 
     ];
     let types = vec![DataType::Bool, DataType::U8, DataType::U16, DataType::U32, DataType::U64, DataType::I8, DataType::I16, DataType::I32, DataType::I64];
 
