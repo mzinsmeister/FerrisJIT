@@ -1,20 +1,20 @@
 pub mod ir;
 pub mod disassemble;
 mod copy_patch;
-mod generated_code;
+mod result;
 mod llvm;
 mod memory_management;
 pub mod types;
 
 use core::panic;
-use std::{cell::RefCell, collections::BTreeMap, hint::black_box, mem, ops::Deref, ptr};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, hint::black_box, mem, ops::Deref, ptr};
 
 use crate::codegen::{copy_patch::STENCILS, ir::DataType};
 
 use self::{copy_patch::CopyPatchBackend, ir::ConstValue, memory_management::{CGValue, MemoryManagement}, types::{BoolRef, I64Ref, UntypedPtrRef}};
 
-pub use generated_code::GeneratedCode;
-use inkwell::{builder::Builder, context::Context, values::{BasicValueEnum, IntValue}};
+pub use result::{CodeGenResult, GeneratedCode};
+use inkwell::{builder::Builder, context::Context, llvm_sys::LLVMCallConv, values::BasicValueEnum, AddressSpace};
 use libc::c_void;
 
 pub type CodegenCFunctionSignature = unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8; // (state, arg1, arg2) -> result (all can be unused depending on the usecase)
@@ -200,49 +200,156 @@ fn get_fn_ptr(f: CodegenCFunctionSignature) -> *const c_void {
 }
 
 struct LLVMState<'ctx> {
+    context: &'ctx Context,
     builder: inkwell::builder::Builder<'ctx>,
     module: inkwell::module::Module<'ctx>,
     function: inkwell::values::FunctionValue<'ctx>,
     current_block: usize,
+    // TODO: Maybe use rpds or some other persistent data structure crate to 
+    //       Get Copy on write data structures instead of having to clone the maps all the time
+    current_value_mapping: BTreeMap<usize, BasicValueEnum<'ctx>>,
     // Mapping from (basic block, value) to llvm value
     // Control flow operations need to make sure to merge values that were sets inside the blocks they
     // created back with a phi block
-    value_mapping: BTreeMap<(usize, usize), BasicValueEnum<'ctx>>,
-    value_set_in_block: BTreeMap<usize, Vec<usize>>,
-    basic_block_counter: usize
+    value_mapping: BTreeMap<usize, BTreeMap<usize, BasicValueEnum<'ctx>>>,
+    value_set_in_block: BTreeMap<usize, BTreeSet<usize>>,
+    basic_blocks: Vec<inkwell::basic_block::BasicBlock<'ctx>>,
 }
 
 impl<'ctx> LLVMState<'ctx> {
     fn new(context: &'ctx Context, arg_types: &[DataType]) -> Self {
         let module = context.create_module("main");
+        let i8_type = context.i8_type();
         let i8_ptr = context.i8_type().ptr_type(inkwell::AddressSpace::default());
         let llvm_arg_types = arg_types.iter().map(|t| t.get_llvm_type(context).into()).collect::<Vec<_>>();
-        let function = module.add_function("main", i8_ptr.fn_type( &llvm_arg_types, false), None);
+        let function = module.add_function("main", i8_ptr.fn_type( &[i8_ptr.into()], false), None);
         let entry_block = context.append_basic_block(function, "entry");
         let builder = context.create_builder();
         builder.position_at_end(entry_block);
-        // Let's create values for the arguments and add them to the value mapping already
-        let mut value_mapping = BTreeMap::new();
+        let inner_function = module.add_function("inner", i8_ptr.fn_type( &llvm_arg_types, false), None);
+        // Unpack the arguments with the given types from the pointer given 
+        let mut inner_args = vec![];
+        let mut offset = 0;
+        let args_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
         for (i, arg_type) in arg_types.iter().enumerate() {
-            let arg = function.get_nth_param(i as u32).unwrap();
-            value_mapping.insert((0, i), arg.into());
+            let llvm_arg_type = arg_type.get_llvm_type(context);
+            let offset_llvm_value = context.i64_type().const_int(offset as u64, false);
+            let arg_ptr = unsafe { builder.build_in_bounds_gep(i8_type, args_ptr, &[offset_llvm_value.into()], "arg_ptr") }.unwrap();
+            let value = builder.build_load(arg_type.get_llvm_type(context), arg_ptr, &format!("val{}", i)).unwrap();
+            let casted_value = builder.build_bitcast(value, llvm_arg_type, &format!("casted_val{}", i)).unwrap();
+            inner_args.push(casted_value.into());
+            offset += get_data_type_size(arg_type) as u32;
         }
+        let inner_call = builder.build_call(inner_function, &inner_args, "inner_call").unwrap();
+        inner_call.set_tail_call(true);
+        let ret_val = inner_call.try_as_basic_value().left().unwrap();
+        builder.build_return(Some(&ret_val)).unwrap();
+        let inner_entry = context.append_basic_block(inner_function, "entry");
+        builder.position_at_end(inner_entry);
         Self {
+            context,
             builder,
             module,
-            function,
-            current_block: 0,
-            value_mapping,
+            function: inner_function,
+            current_block: 1,
+            current_value_mapping: BTreeMap::new(),
+            value_mapping: BTreeMap::new(),
             value_set_in_block: BTreeMap::new(),
-            basic_block_counter: 1
+            basic_blocks: vec![entry_block, inner_entry],
         }
-    }    
+    }
+
+    fn map_arg(&mut self, arg_i: usize, i: usize) {
+        let arg = self.function.get_nth_param(arg_i as u32).unwrap();
+        self.current_value_mapping.insert(i, arg.into());
+    }
+
+    fn get_llvm_value(&self, basic_block: usize, i: usize) -> BasicValueEnum<'ctx> {
+        if basic_block == self.current_block {
+            self.current_value_mapping.get(&i).unwrap().clone()
+        } else {
+            self.value_mapping.get(&basic_block).unwrap().get(&i).unwrap().clone()
+        }
+    }
+
+    fn get_current_llvm_value(&self, i: usize) -> BasicValueEnum<'ctx> {
+        self.current_value_mapping.get(&i).unwrap().clone()
+    }
+
+    fn get_llvm_const(&self, const_val: ConstValue) -> BasicValueEnum<'ctx> {
+        let data_type = const_val.get_type();
+        let llvm_type = data_type.get_llvm_type(self.context);
+        match const_val {
+            ConstValue::I64(v) => llvm_type.into_int_type().const_int(v as u64, true).into(),
+            ConstValue::I32(v) => llvm_type.into_int_type().const_int(v as u64, true).into(),
+            ConstValue::I16(v) => llvm_type.into_int_type().const_int(v as u64, true).into(),
+            ConstValue::I8(v) => llvm_type.into_int_type().const_int(v as u64, true).into(),
+            ConstValue::U64(v) => llvm_type.into_int_type().const_int(v, false).into(),
+            ConstValue::U32(v) => llvm_type.into_int_type().const_int(v as u64, false).into(),
+            ConstValue::U16(v) => llvm_type.into_int_type().const_int(v as u64, false).into(),
+            ConstValue::U8(v) => llvm_type.into_int_type().const_int(v as u64, false).into(),
+            ConstValue::Bool(v) => llvm_type.into_int_type().const_int(v as u64, false).into(),
+            ConstValue::F64(v) => llvm_type.into_float_type().const_float(v).into(),
+            _ => unimplemented!()
+        }
+    }
+
+    fn init_value(&mut self, i: usize, init_value: ConstValue) {
+        let data_type = init_value.get_type();
+        let llvm_type = data_type.get_llvm_type(self.context);
+        let llvm_value = match init_value {
+            ConstValue::I64(_) | ConstValue::I32(_) | ConstValue::I16(_) | ConstValue::I8(_) => 
+                llvm_type.into_int_type().const_int(init_value.bitcast_to_u64(), true).into(),
+            ConstValue::U64(_) | ConstValue::U32(_) | ConstValue::U16(_) | ConstValue::U8(_) | ConstValue::Bool(_) => 
+                llvm_type.into_int_type().const_int(init_value.bitcast_to_u64(), false).into(),
+            ConstValue::F64(v) => llvm_type.into_float_type().const_float(v).into(),
+            _ => unimplemented!()
+        };
+        self.current_value_mapping.insert(i, llvm_value);
+    }
+
+    fn copy_value(&mut self, src_i: usize, dest_i: usize) {
+        let src = self.get_current_llvm_value(src_i);
+        self.current_value_mapping.insert(dest_i, src);
+        self.value_set_in_block.entry(self.current_block).or_insert_with(|| BTreeSet::new()).insert(dest_i);
+    }
+
+    fn set_value(&mut self, i: usize, value: BasicValueEnum<'ctx>) {
+        self.current_value_mapping.insert(i, value);
+        self.value_set_in_block.entry(self.current_block).or_insert_with(|| BTreeSet::new()).insert(i);
+    }
+
+    /// Creates a new basic_block
+    fn new_basic_block(&mut self) -> usize {
+        let id = self.basic_blocks.len();
+        let block = self.context.append_basic_block(self.function, &format!("block{}", id));
+        self.basic_blocks.push(block);
+        id
+    }
+
+    /// It sets the current block to the given block while assuming we branched to it from the current block
+    fn set_current_block(&mut self, block: usize) {
+        let next_block_mapping = if let Some(v) = self.value_mapping.remove_entry(&block) {
+            v.1
+        } else {
+            self.current_value_mapping.clone()
+        };
+        let old_block_mapping = std::mem::replace(&mut self.current_value_mapping, next_block_mapping);
+        self.value_mapping.insert(self.current_block, old_block_mapping);
+        self.current_block = block;
+        self.builder.position_at_end(self.basic_blocks[block]);
+    }
+
+    fn free_value(&mut self, i: usize) {
+        self.current_value_mapping.remove(&i);
+        self.value_set_in_block.get_mut(&self.current_block).map(|s| s.remove(&i));
+    }
 }
 
 pub struct CodeGen<'ctx> {
     ctx: &'ctx CodeGenContext,
     memory_management: RefCell<MemoryManagement<'ctx>>,
-    llvm_state: LLVMState<'ctx>
+    llvm_state: RefCell<LLVMState<'ctx>>
 }
 
 #[allow(dead_code)]
@@ -250,11 +357,10 @@ impl<'ctx> CodeGen<'ctx> {
 
     fn new(ctx: &'ctx CodeGenContext, arg_types: &[DataType]) -> Self {
         let memory_management = MemoryManagement::new(&ctx.cp_backend, arg_types);
-
         Self {
             ctx,
             memory_management: RefCell::new(memory_management),
-            llvm_state: LLVMState::new(&ctx.llvm_ctx, arg_types)
+            llvm_state: RefCell::new(LLVMState::new(&ctx.llvm_ctx, arg_types))
         }
     }
 
@@ -264,6 +370,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         let mut memory_management = self.memory_management.borrow_mut();
         let i = memory_management.clone_value(n);
+        self.llvm_state.borrow_mut().map_arg(n, i);
         CGValueRef::new(i, self, memory_management.values[n].get_type())
 
         //I64Ref(CGValueRef::new_readonly(n, self, DataType::I64))
@@ -281,14 +388,16 @@ impl<'ctx> CodeGen<'ctx> {
 
     /// Create a new i64 constant. Note that `set` cannot be called on constants!
     pub fn new_i64_const(&self, n: i64) -> I64Ref<'_, 'ctx>{
-        I64Ref(self.new_const(ConstValue::I64(n)))
+        let c = self.new_const(ConstValue::I64(n));
+        I64Ref(c)
     }
 
     /// Create a new i64 variable. If you don't need to change the value, use a constant instead.
     pub fn new_i64_var(&self, init: i64) -> I64Ref<'_, 'ctx>{
         let var = self.new_var(DataType::I64);
-        let init = self.new_i64_const(init);
-        self.copy_value(&init, &var);
+        let init_val = self.new_i64_const(init);
+        self.copy_value(&init_val, &var);
+        self.llvm_state.borrow_mut().init_value(var.inner.into_value_i(), ConstValue::I64(init));
         I64Ref(var)
     }
 
@@ -300,8 +409,9 @@ impl<'ctx> CodeGen<'ctx> {
     /// Create a new bool variable. If you don't need to change the value, use a constant instead.
     pub fn new_bool_var(&self, init: bool) -> BoolRef<'_, 'ctx>{
         let var = self.new_var(DataType::Bool);
-        let init = self.new_bool_const(init);
-        self.copy_value(&init, &var);
+        let init_val = self.new_bool_const(init);
+        self.copy_value(&init_val, &var);
+        self.llvm_state.borrow_mut().init_value(var.inner.into_value_i(), ConstValue::Bool(init));
         BoolRef(var)
     }
 
@@ -309,11 +419,15 @@ impl<'ctx> CodeGen<'ctx> {
     fn load_const(&self, v: usize, c: ConstValue) {
         let mut memory_management = self.memory_management.borrow_mut();
         memory_management.init(v, c);
+        self.llvm_state.borrow_mut().init_value(v, c);
     }
 
     fn free_value(&self, v: &CGValueRef) {
         match v.inner {
-            CGValueRefInner::Value(i) => self.memory_management.borrow_mut().free_value(i),
+            CGValueRefInner::Value(i) => {
+                self.memory_management.borrow_mut().free_value(i);
+                self.llvm_state.borrow_mut().free_value(i);
+            },
             CGValueRefInner::Const(_) => {/* We don't have to do anything here */}
         }
     }
@@ -325,8 +439,9 @@ impl<'ctx> CodeGen<'ctx> {
             },
             CGValueRefInner::Value(i) => {
                 let mut memory_management = self.memory_management.borrow_mut();
-                let i = memory_management.clone_value(i);
-                CGValueRef::new(i, self, v.data_type.clone())
+                let new = memory_management.clone_value(i);
+                self.llvm_state.borrow_mut().copy_value(i, new);
+                CGValueRef::new(new, self, v.data_type.clone())
             }
         }
     }
@@ -353,30 +468,31 @@ impl<'ctx> CodeGen<'ctx> {
                 memory_management.put_in_reg(0, i);
                 self.ctx.cp_backend.emit_put_1_stack(dest_ptr);
                 memory_management.put_in_reg(1, dest_i);
+                self.llvm_state.borrow_mut().copy_value(dest_i, i);
             },
             CGValueRefInner::Const(c) => {
                self.memory_management.borrow_mut().init(dest_i, c);
+                self.llvm_state.borrow_mut().init_value(dest_i, c);
             }
 
         }
     
     }
 
-    #[allow(dead_code)]
-    fn reset(&mut self) {
-        self.memory_management.borrow_mut().reset();
-        self.ctx.cp_backend.reset();
-    }
-
     //--------------------------------------------------------------------------------
     // Arithmetic operations
+    fn gen_arith<const COMMUTATIVE: bool, const RETURNS_BOOL: bool, LLVMF>(&self,  gen_op: fn(&CopyPatchBackend, DataType), gen_op_const: fn(&CopyPatchBackend, ConstValue), gen_llvm: LLVMF, l: &mut CGValueRef, r: &CGValueRef) 
+            where LLVMF: Fn(&LLVMState<'ctx>, DataType, BasicValueEnum<'ctx>, BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
 
-    fn gen_arith<const COMMUTATIVE: bool, const RETURNS_BOOL: bool>(&self,  gen_op: fn(&CopyPatchBackend, DataType), gen_op_const: fn(&CopyPatchBackend, ConstValue), gen_llvm: fn(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx>, l: &mut CGValueRef, r: &CGValueRef) {
         let mut memory_management = self.memory_management.borrow_mut();
         match (l.inner, r.inner) {
             (CGValueRefInner::Value(li), CGValueRefInner::Value(ri)) => {
                 memory_management.put_in_regs(li, ri);
                 gen_op(&self.ctx.cp_backend, l.data_type.clone());
+                let llvm_l = self.llvm_state.borrow().get_current_llvm_value(li);
+                let llvm_r = self.llvm_state.borrow().get_current_llvm_value(ri);
+                let new_llvm_l = gen_llvm(&self.llvm_state.borrow(), l.data_type, llvm_l, llvm_r);
+                self.llvm_state.borrow_mut().set_value(li, new_llvm_l);
             },
             (CGValueRefInner::Value(li), CGValueRefInner::Const(c)) => {
                 let vl = memory_management.values[li].clone();
@@ -384,21 +500,30 @@ impl<'ctx> CodeGen<'ctx> {
                     CGValue::Variable{..} => {
                         memory_management.put_in_reg(0, li);
                         gen_op_const(&self.ctx.cp_backend, c);
+                        let llvm_l = self.llvm_state.borrow().get_current_llvm_value(li);
+                        let llvm_r = self.llvm_state.borrow().get_llvm_const(c);
+                        let new_llvm_l = gen_llvm(&self.llvm_state.borrow(), l.data_type, llvm_l, llvm_r);
+                        self.llvm_state.borrow_mut().set_value(li, new_llvm_l);
                     },
                     CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
                 }
             },
             (CGValueRefInner::Const(c), CGValueRefInner::Value(ri)) => {
+                let new_li = memory_management.allocate_stack(c.get_type());
                 if COMMUTATIVE {
                     memory_management.put_in_reg(0, ri);
                     gen_op_const(&self.ctx.cp_backend, c);
+                    memory_management.reg_state[0] = Some((new_li, true));
                 } else {
-                    let new_l = memory_management.allocate_stack(c.get_type());
-                    memory_management.init(new_l, c);
-                    memory_management.put_in_regs(new_l, ri);
+                    memory_management.init(new_li, c);
+                    memory_management.put_in_regs(new_li, ri);
                     gen_op(&self.ctx.cp_backend, c.get_type());
-                    l.inner = CGValueRefInner::Value(new_l);
+                    l.inner = CGValueRefInner::Value(new_li);
                 }
+                let llvm_l = self.llvm_state.borrow().get_llvm_const(c);
+                let llvm_r = self.llvm_state.borrow().get_current_llvm_value(ri);
+                let new_llvm_l = gen_llvm(&self.llvm_state.borrow(), l.data_type, llvm_l, llvm_r);
+                self.llvm_state.borrow_mut().set_value(new_li, new_llvm_l);
             },
             (CGValueRefInner::Const(c1), CGValueRefInner::Const(c2)) => {
                 let new_l = memory_management.allocate_stack(c1.get_type());
@@ -406,6 +531,10 @@ impl<'ctx> CodeGen<'ctx> {
                 memory_management.put_in_reg(0, new_l);
                 gen_op_const(&self.ctx.cp_backend, c2);
                 l.inner = CGValueRefInner::Value(new_l);
+                let llvm_l = self.llvm_state.borrow().get_llvm_const(c1);
+                let llvm_r = self.llvm_state.borrow().get_llvm_const(c2);
+                let new_llvm_l = gen_llvm(&self.llvm_state.borrow(), l.data_type, llvm_l, llvm_r);
+                self.llvm_state.borrow_mut().set_value(new_l, new_llvm_l);
             }
         }
         memory_management.dirty_reg(0);
@@ -415,56 +544,65 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn add(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, false>(CopyPatchBackend::emit_add,CopyPatchBackend::emit_add_const, llvm::int_add, l, r)
+        self.gen_arith::<true, false, _>(CopyPatchBackend::emit_add,CopyPatchBackend::emit_add_const, |ls, t, l, r| llvm::int_sub(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn sub(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, false>(CopyPatchBackend::emit_sub,CopyPatchBackend::emit_sub_const,  llvm::int_sub, l, r)
+        self.gen_arith::<false, false, _>(CopyPatchBackend::emit_sub,CopyPatchBackend::emit_sub_const,  |ls, t, l, r| llvm::int_sub(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l , r)
     }
 
     fn mul(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, false>(CopyPatchBackend::emit_mul,CopyPatchBackend::emit_mul_const,  llvm::int_mul, l, r)
+        self.gen_arith::<true, false, _>(CopyPatchBackend::emit_mul,CopyPatchBackend::emit_mul_const,  |ls, t, l, r| llvm::int_mul(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn div(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, false>(CopyPatchBackend::emit_div,CopyPatchBackend::emit_div_const,  llvm::int_div,  l, r)
+        self.gen_arith::<false, false, _>(CopyPatchBackend::emit_div,CopyPatchBackend::emit_div_const,  |ls, t, l, r| llvm::int_div(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn rem(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, false>(CopyPatchBackend::emit_rem,CopyPatchBackend::emit_rem_const,  llvm::int_rem,  l, r)
+        self.gen_arith::<false, false, _>(CopyPatchBackend::emit_rem,CopyPatchBackend::emit_rem_const,  |ls, t, l, r| llvm::int_rem(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn eq(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, true>(CopyPatchBackend::emit_eq,CopyPatchBackend::emit_eq_const,  llvm::int_eq, l, r)
+        self.gen_arith::<true, true, _>(CopyPatchBackend::emit_eq,CopyPatchBackend::emit_eq_const,  |ls, t, l, r| llvm::int_eq(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn neq(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, true>(CopyPatchBackend::emit_neq,CopyPatchBackend::emit_neq_const,  llvm::int_ne,  l, r)
+        self.gen_arith::<true, true, _>(CopyPatchBackend::emit_neq,CopyPatchBackend::emit_neq_const,  |ls, t, l, r| llvm::int_ne(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     // TODO: exchange lt/gte and lte/gt here if the first one is a const
     fn lt(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, true>(CopyPatchBackend::emit_lt,CopyPatchBackend::emit_lt_const,  llvm::int_lt, l, r)
+        self.gen_arith::<false, true, _>(CopyPatchBackend::emit_lt,CopyPatchBackend::emit_lt_const,  |ls, t, l, r| llvm::int_lt(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn lte(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, true>(CopyPatchBackend::emit_lte,CopyPatchBackend::emit_lte_const,  llvm::int_lte, l, r)
+        self.gen_arith::<false, true, _>(CopyPatchBackend::emit_lte,CopyPatchBackend::emit_lte_const,  |ls, t, l, r| llvm::int_lte(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn gt(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, true>(CopyPatchBackend::emit_gt,CopyPatchBackend::emit_gt_const,  llvm::int_gt, l, r)
+        self.gen_arith::<false, true, _>(CopyPatchBackend::emit_gt,CopyPatchBackend::emit_gt_const,  |ls, t, l, r| llvm::int_gt(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn gte(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, true>(CopyPatchBackend::emit_gte,CopyPatchBackend::emit_gte_const, llvm::int_gte, l, r)
+        self.gen_arith::<false, true, _>(CopyPatchBackend::emit_gte,CopyPatchBackend::emit_gte_const, |ls, t, l, r| llvm::int_gte(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn and(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, true>(CopyPatchBackend::emit_and,CopyPatchBackend::emit_and_const, llvm::int_and, l, r)
+        self.gen_arith::<true, true, _>(CopyPatchBackend::emit_and,CopyPatchBackend::emit_and_const, |ls, t, l, r| llvm::int_and(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn or(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, true>(CopyPatchBackend::emit_or,CopyPatchBackend::emit_or_const, llvm::int_or, l, r)
+        self.gen_arith::<true, true, _>(CopyPatchBackend::emit_or,CopyPatchBackend::emit_or_const, |ls, t, l, r| llvm::int_or(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
+    }
+
+    fn gep(&self, pointee_type: DataType, ptr: &mut CGValueRef, index: &CGValueRef) {
+        self.gen_arith::<true,true, _>(CopyPatchBackend::emit_add, CopyPatchBackend::emit_add_const, |ls, t, l, r| {
+            let l = l.into_pointer_value();
+            let r = r.into_int_value();
+            let gep = unsafe { ls.builder.build_gep(pointee_type.get_llvm_type(ls.context), l, &[r], "gep") }.unwrap();
+            gep.into()
+        }, ptr, index)
     }
 
     fn not(&self, l: &mut CGValueRef) {
@@ -479,6 +617,9 @@ impl<'ctx> CodeGen<'ctx> {
                 l.inner = CGValueRefInner::Const(c.bit_not());
             }
         }
+        let llvm_val = self.llvm_state.borrow().get_current_llvm_value(l.inner.into_value_i()).into_int_value();
+        let new_llvm_val = llvm::int_not(&self.llvm_state.borrow().builder, llvm_val);
+        self.llvm_state.borrow_mut().set_value(l.inner.into_value_i(), new_llvm_val.into());
     }
 
     //--------------------------------------------------------------------------------
@@ -550,7 +691,17 @@ impl<'ctx> CodeGen<'ctx> {
     /// Use the `set` function instead.
     pub fn gen_while<'cg, E>(&self, condition: impl Fn() -> Result<BoolRef<'cg, 'ctx>, E>, body: impl Fn() -> Result<(), E>) -> Result<(), E> where 'ctx: 'cg {
         self.memory_management.borrow_mut().flush_regs();
+        let mut llvm_state = self.llvm_state.borrow_mut();
+        let previous_bb = llvm_state.current_block;
+        let body_bb = llvm_state.new_basic_block();
+        let cond_bb = llvm_state.new_basic_block();
+        let after_bb = llvm_state.new_basic_block();
+        let mut after_cond_bb: usize = cond_bb;
+        // insert an unconditional branch from previous to cond
+        llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[cond_bb]).unwrap();
         self.ctx.cp_backend.emit_loop( || {
+            llvm_state.set_current_block(cond_bb);
+            drop(llvm_state);
             let res = condition()?;
             let i = match res.0.inner {
                 CGValueRefInner::Value(i) => i,
@@ -561,11 +712,31 @@ impl<'ctx> CodeGen<'ctx> {
                 }
             };
             self.memory_management.borrow_mut().put_in_reg(0, i);
+            let mut llvm_state = self.llvm_state.borrow_mut();
+            llvm_state.builder.build_conditional_branch(llvm_state.get_current_llvm_value(i).into_int_value(), llvm_state.basic_blocks[body_bb], llvm_state.basic_blocks[after_bb]).unwrap();
+            after_cond_bb = llvm_state.current_block;
+            llvm_state.set_current_block(body_bb);
             Ok(())
         }, || {
             body()
         })?;
         self.memory_management.borrow_mut().flush_regs();
+        let mut llvm_state = self.llvm_state.borrow_mut();
+        llvm_state.set_current_block(cond_bb);
+        llvm_state.set_current_block(after_cond_bb);
+        llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[after_bb]).unwrap();
+        llvm_state.set_current_block(cond_bb);
+        llvm_state.builder.position_before(&llvm_state.basic_blocks[cond_bb].get_first_instruction().unwrap());
+        for i in llvm_state.value_set_in_block.get(&body_bb).unwrap_or(&BTreeSet::new()).clone() {
+            let llvm_value = llvm_state.get_llvm_value(previous_bb, i);
+            let phi = llvm_state.builder.build_phi(llvm_value.get_type(), &format!("phi_{}", i)).unwrap();
+            let before_value = llvm_state.value_mapping.get(&previous_bb).unwrap().get(&i).unwrap().clone();
+            phi.add_incoming(&[(&llvm_value, llvm_state.basic_blocks[after_cond_bb]), (&before_value, llvm_state.basic_blocks[cond_bb])]);
+            llvm_state.set_value(i, phi.as_basic_value());
+            llvm_state.value_set_in_block.entry(after_bb).or_insert_with(|| BTreeSet::new()).insert(i);
+        }
+        llvm_state.set_current_block(after_cond_bb); 
+        llvm_state.set_current_block(after_bb);
         Ok(())
     }
 
@@ -621,18 +792,22 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     pub fn gen_return(&self, return_value: Option<CGValueRef>) {
-        if let Some(return_value) = return_value {
+        let llvm_return_val = if let Some(return_value) = return_value {
             let i = match return_value.inner {
                 CGValueRefInner::Value(i) => i,
                 CGValueRefInner::Const(c) => {
                     let new_i = self.memory_management.borrow_mut().allocate_stack(c.get_type());
                     self.memory_management.borrow_mut().init(new_i, c);
+                    self.llvm_state.borrow_mut().init_value(new_i, c);
                     new_i
                 }
             };
             self.memory_management.borrow_mut().put_in_reg(0, i);
-        }
+            // TODO: bitcast to pointer here before returning for all other types
+            self.llvm_state.borrow().get_current_llvm_value(return_value.inner.into_value_i().into()).into_pointer_value()
+        } else { self.llvm_state.borrow().context.i8_type().ptr_type(AddressSpace::default()).get_undef() };
         self.ctx.cp_backend.emit_ret();
+        self.llvm_state.borrow_mut().builder.build_return(Some(&llvm_return_val)).unwrap();
     }
 
     pub fn call_c_function(&self, func: CodegenCFunctionSignature, args_ptr: UntypedPtrRef) -> UntypedPtrRef<'_, 'ctx> {
@@ -647,13 +822,32 @@ impl<'ctx> CodeGen<'ctx> {
         drop(memory_management);
         let new_var = self.new_var(DataType::Ptr);
         self.memory_management.borrow_mut().reg_state[0] = Some((new_var.inner.into_value_i(), true));
+
+        let llvm_i8_ptr_type = self.ctx.llvm_ctx.i8_type().ptr_type(inkwell::AddressSpace::default());
+        let func_type = llvm_i8_ptr_type.fn_type(&[llvm_i8_ptr_type.into(), llvm_i8_ptr_type.into(), llvm_i8_ptr_type.into()], false);
+
+        let const_fn_ptr_int = self.ctx.llvm_ctx.i64_type().const_int(get_fn_ptr(func) as u64, false);
+        let const_fn_ptr = self.llvm_state.borrow().builder.build_int_to_ptr(const_fn_ptr_int, func_type.ptr_type(AddressSpace::default()), "const_fn_ptr").unwrap();
+
+        let undef_value = llvm_i8_ptr_type.get_undef();
+
+        // TODO: Handle constant arguments
+        let arg_llvm_value = self.llvm_state.borrow().get_current_llvm_value(args_ptr.inner.into_value_i()).into_pointer_value();
+        
+        let call = self.llvm_state.borrow().builder.build_indirect_call(func_type, const_fn_ptr, &[undef_value.into(), arg_llvm_value.into(), undef_value.into()], "c_call").unwrap();
+        call.set_call_convention(LLVMCallConv::LLVMCCallConv as u32);
+        self.llvm_state.borrow_mut().set_value(new_var.inner.into_value_i(), call.try_as_basic_value().unwrap_left().into());
+
         new_var.into()
     }
 
     //--------------------------------------------------------------------------------
+    // Code generation results
 
-    pub fn generate_code(&self) -> GeneratedCode {
-        self.ctx.cp_backend.generate_code(self.memory_management.borrow().stack_size)
+    pub fn finalize(&self) -> CodeGenResult<'ctx> {
+        let code = self.ctx.cp_backend.generate_code(self.memory_management.borrow().stack_size);
+        let llvm_module = self.llvm_state.borrow().module.clone();
+        CodeGenResult { code, llvm_module }
     }
 }
 

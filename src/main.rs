@@ -4,6 +4,7 @@ mod query_codegen;
 
 use std::{error::Error, hint::black_box, ptr};
 
+use codegen::CodeGenContext;
 use query_codegen::generate_code;
 
 
@@ -47,14 +48,19 @@ fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
     } else {
         stdout_result_consumer
     };
-    let code = generate_code(&query, test_data.0, result_consumer);
+    let mut context = CodeGenContext::new();
+    // Generate x86 through the Copy&Patch backend and LLVM-IR in a single go
+    let cgresult = generate_code(&mut context, &query, test_data.0, result_consumer);
     let codegen_elapsed = codegen_start.elapsed();
-    match code {
-        Ok(code) => {
-            println!("Generated {} bytes of x86-64 binary in {:?}", code.code_len, codegen_elapsed);
+    match cgresult {
+        Ok(cgresult) => {
+            println!("Generated {} bytes of x86-64 binary (+ equivalent LLVM-IR) in {:?}", cgresult.code.code_len, codegen_elapsed);
+            // Now we compile the LLVM-IR to machine code, first with optimization "None" (-O0), then with "Aggressive" (-03)
+            let o0_start = std::time::Instant::now();
+
             if benchmark {
                 let start_time = std::time::Instant::now();
-                code.call(&[test_data.1.as_ptr() as usize, (test_data.1.len() / test_data.0) as usize]);
+                cgresult.code.call(&[test_data.1.as_ptr() as usize, (test_data.1.len() / test_data.0) as usize]);
                 let elapsed = start_time.elapsed();
                 
                 let start_interp = std::time::Instant::now();
@@ -76,7 +82,7 @@ fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
                 println!("Compiled is {:.2}x {}", factor, if factor > 1.0 { "faster" } else { "slower" });
 
             } else {
-                code.call(&[test_data.1.as_ptr() as usize, (test_data.1.len() / test_data.0) as usize]);
+                cgresult.code.call(&[test_data.1.as_ptr() as usize, (test_data.1.len() / test_data.0) as usize]);
             }
         },
         Err(c) => {
@@ -181,7 +187,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod test {
 
-    use crate::{query::{parse_query_from_str, run_query, Atom}, query_codegen::generate_code, test::results::Results};
+    use crate::{codegen::CodeGenContext, query::{parse_query_from_str, run_query, Atom}, query_codegen::generate_code, test::results::Results};
 
     mod results {
         use std::{cell::RefCell, mem, ops::DerefMut, ptr};
@@ -232,9 +238,10 @@ mod test {
         let results = Results();
         let expr_str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 4) $0)))";
         let query = parse_query_from_str(expr_str).unwrap();
-        let code = generate_code(&query, 1, results.consumer()).unwrap();
+        let mut ctx = CodeGenContext::new();
+        let code = generate_code(&mut ctx, &query, 1, results.consumer()).unwrap();
         let data = vec![0i64, 1, 5, 10, 100, 1000];
-        code.call(&[data.as_ptr() as usize, data.len()]);
+        code.code.call(&[data.as_ptr() as usize, data.len()]);
         let mut interp_result = vec![];
         run_query(&query, &data, 1, |r| match r {
             Atom::Num(n) => interp_result.push(n),
@@ -249,9 +256,10 @@ mod test {
         let results = Results();
         let expr_str = "(+ (+ $0 $0) (* (+ $0 $0) (+ (* 9 (+ 1 4)) $0)))";
         let query = parse_query_from_str(expr_str).unwrap();
-        let code = generate_code(&query, 1, results.consumer()).unwrap();
+        let mut ctx = CodeGenContext::new();
+        let code = generate_code(&mut ctx, &query, 1, results.consumer()).unwrap();
         let data = vec![0i64, 1, 5, 10, 100, 1000];
-        code.call(&[data.as_ptr() as usize, data.len()]);
+        code.code.call(&[data.as_ptr() as usize, data.len()]);
         let mut interp_result = vec![];
         run_query(&query, &data, 1, |r| match r {
             Atom::Num(n) => interp_result.push(n),
@@ -266,9 +274,10 @@ mod test {
         let results = Results();
         let expr_str = "(+ (+ $0 $0) (* (/ $0 2) (- (* 9 4) $0)))";
         let query = parse_query_from_str(expr_str).unwrap();
-        let code = generate_code(&query, 1, results.consumer()).unwrap();
+        let mut ctx = CodeGenContext::new();
+        let code = generate_code(&mut ctx, &query, 1, results.consumer()).unwrap();
         let data = vec![0, 1, 5, 10, 100, 1000];
-        code.call(&[data.as_ptr() as usize, data.len()]);
+        code.code.call(&[data.as_ptr() as usize, data.len()]);
         let mut interp_result = vec![];
         run_query(&query, &data, 1, |r| match r {
             Atom::Num(n) => interp_result.push(n),
@@ -285,9 +294,10 @@ mod test {
         let results = Results();
         let expr_str = "(- (/ $0 2) (* -2 $0))";
         let query = parse_query_from_str(expr_str).unwrap();
-        let code = generate_code(&query, 1, results.consumer()).unwrap();
+        let mut ctx = CodeGenContext::new();
+        let code = generate_code(&mut ctx, &query, 1, results.consumer()).unwrap();
         let data = vec![0, 1, 5, 10, 100, 1000];
-        code.call(&[data.as_ptr() as usize, data.len()]);
+        code.code.call(&[data.as_ptr() as usize, data.len()]);
         let mut interp_result = vec![];
         run_query(&query, &data, 1, |r| match r {
             Atom::Num(n) => interp_result.push(n),
@@ -303,9 +313,10 @@ mod test {
     fn test_codegen_very_complex_1() {
         let results = Results();
         let query = parse_query_from_str(VERY_COMPLEX_EXPR_1).unwrap();
-        let code = generate_code(&query, 1, results.consumer()).unwrap();
+        let mut ctx = CodeGenContext::new();
+        let code = generate_code(&mut ctx, &query, 1, results.consumer()).unwrap();
         let data = vec![0, 1, 5];
-        code.call(&[data.as_ptr() as usize, data.len()]);
+        code.code.call(&[data.as_ptr() as usize, data.len()]);
         let mut interp_result = vec![];
         run_query(&query, &data, 1, |r| match r {
             Atom::Num(n) => interp_result.push(n),

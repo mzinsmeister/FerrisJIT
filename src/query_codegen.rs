@@ -1,11 +1,11 @@
 use std::fmt::Display;
 
-use crate::{codegen::{types::{BoolRef, CGCmp, CGEq, I64Ref, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, CodeGenContext, CodegenCFunctionSignature, IntoBaseRef, Setable}, query::{AggregateFunc, Atom, BuiltIn, Expr, Query}};
+use crate::{codegen::{types::{BoolRef, CGCmp, CGEq, I64Ref, TypedPtrRef, TypedPtrRefOffset, UntypedPtrRef}, CodeGenContext, CodeGenResult, CodegenCFunctionSignature, IntoBaseRef, Setable}, query::{AggregateFunc, Atom, BuiltIn, Expr, Query}};
 
 #[cfg(feature = "print-asm")]
 use crate::codegen::disassemble;
 
-use crate::codegen::{ir::DataType, CGValueRef, CodeGen, GeneratedCode};
+use crate::codegen::{ir::DataType, CGValueRef, CodeGen};
 
 fn fold_op(fun: &BuiltIn, l: Atom, r: Atom) -> Option<Atom> {
     match (fun, l, r) {
@@ -366,11 +366,10 @@ fn generate_aggregation_code<'ctx, 'cg>(cg: &'cg CodeGen<'ctx>, query: &Query, r
     }
 }
 
-pub fn generate_code(query: &Query, columns: usize, result_consumer: CodegenCFunctionSignature) -> Result<GeneratedCode, CodeGenError> {
+pub fn generate_code<'ctx>(context: &'ctx mut CodeGenContext, query: &Query, columns: usize, result_consumer: CodegenCFunctionSignature) -> Result<CodeGenResult<'ctx>, CodeGenError> {
 
-    let mut ctx = CodeGenContext::new();
     // TODO: I64 doesn't make sense for data length. Use U64 as soon as the wrapper is implemented
-    let cg = ctx.create_codegen(&[DataType::Ptr, DataType::I64]);
+    let cg = context.create_codegen(&[DataType::Ptr, DataType::I64]);
 
     let data_ptr = TypedPtrRef::<I64Ref>::from(cg.get_arg(0));
     let i = cg.new_i64_var(0);
@@ -426,7 +425,7 @@ pub fn generate_code(query: &Query, columns: usize, result_consumer: CodegenCFun
 
     cg.gen_return(None);
 
-    let gc = cg.generate_code();
-
-    Ok(gc)
+    let result = cg.finalize();
+    
+    Ok(result)
 }

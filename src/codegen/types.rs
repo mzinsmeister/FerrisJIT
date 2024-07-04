@@ -561,7 +561,7 @@ impl<'cg, 'ctx> UntypedPtrRef<'cg, 'ctx> {
 impl<'cg, 'ctx> PtrRefByteOffset<&I64Ref<'cg, 'ctx>> for UntypedPtrRef<'cg, 'ctx> {
     fn byte_offset(mut self, byte_offset: &I64Ref<'cg, 'ctx>) -> Self {
         let cg = self.0.cg;
-        cg.add(&mut self.0, &byte_offset.0);
+        cg.gep(DataType::U8, &mut self.0, &byte_offset.0);
         self
     }
 }
@@ -570,7 +570,7 @@ impl<'cg, 'ctx> PtrRefByteOffset<i64> for UntypedPtrRef<'cg, 'ctx>  {
     fn byte_offset(mut self, byte_offset: i64) -> Self {
         let byte_offset = self.cg.new_i64_const(byte_offset);
         let cg = self.0.cg;
-        cg.add(&mut self.0, &byte_offset.0);
+        cg.gep(DataType::U8, &mut self.0, &byte_offset.0);
         self
     }
 }

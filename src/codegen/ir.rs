@@ -6,7 +6,7 @@
 
 use std::fmt::{self, Display, Formatter};
 
-use inkwell::types::IntType;
+use inkwell::{types::IntType, AddressSpace};
 
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -64,6 +64,22 @@ impl DataType {
                 //       stuff like that it should be fine.
                 let inner_type = context.i8_type();  
                 inner_type.ptr_type(inkwell::AddressSpace::default()).into()
+            }
+        }
+    }
+
+    pub fn get_llvm_ptr_type<'ctx>(&self, context: &'ctx inkwell::context::Context) -> inkwell::types::PointerType<'ctx> {
+        match self {
+            DataType::I8 | DataType::U8 => context.i8_type().ptr_type(inkwell::AddressSpace::default()),
+            DataType::I16 | DataType::U16 => context.i16_type().ptr_type(inkwell::AddressSpace::default()),
+            DataType::I32 | DataType::U32 => context.i32_type().ptr_type(inkwell::AddressSpace::default()),
+            DataType::I64 | DataType::U64 => context.i64_type().ptr_type(inkwell::AddressSpace::default()),
+            DataType::F32 => context.f32_type().ptr_type(inkwell::AddressSpace::default()),
+            DataType::F64 => context.f64_type().ptr_type(inkwell::AddressSpace::default()),
+            DataType::Bool => context.bool_type().ptr_type(inkwell::AddressSpace::default()),
+            DataType::Ptr => {
+                let inner_type = context.i8_type().ptr_type(AddressSpace::default());
+                inner_type.ptr_type(inkwell::AddressSpace::default())
             }
         }
     }

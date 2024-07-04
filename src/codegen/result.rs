@@ -4,13 +4,50 @@
 
 use std::os::raw::c_void;
 
+use inkwell::execution_engine::JitFunction;
+
 use super::llvm::stencils::{Stencil, RelocType};
+
+type JITFunctionType = unsafe extern "C" fn(*const u8) -> *mut u8;
+
+pub struct CodeGenResult<'ctx> {
+    pub code: GeneratedCode,
+    pub llvm_module: inkwell::module::Module<'ctx>,
+}
+
+impl<'ctx> CodeGenResult<'ctx> {
+    pub fn new(code: GeneratedCode, llvm_module: inkwell::module::Module<'ctx>) -> Self {
+        Self {
+            code,
+            llvm_module,
+        }
+    }
+
+    pub fn compile_llvm(&self, opt_level: inkwell::OptimizationLevel) -> LLVMGeneratedCode<'ctx> {
+        let exec_engine = self.llvm_module.create_jit_execution_engine(opt_level).unwrap();
+        let func = unsafe { exec_engine.get_function::<JITFunctionType>("main").unwrap() };
+        LLVMGeneratedCode {
+            func
+        }
+    }
+}
+
+pub struct LLVMGeneratedCode<'ctx> {
+    func: JitFunction<'ctx, JITFunctionType>
+}
+
+impl<'ctx> LLVMGeneratedCode<'ctx> {
+
+    pub fn call(&self, args: &[usize]) -> *mut u8 {
+        unsafe{ self.func.call(args.as_ptr() as *const u8) }
+    }
+}
 
 pub struct GeneratedCode {
     pub stack: *mut u8,
     pub code: *const c_void,
     pub code_len: usize,
-    pub ghcc_code: *const c_void,
+    pub ghcc_code: *const c_void
 }
 
 impl GeneratedCode {
@@ -81,7 +118,7 @@ impl GeneratedCode {
     
     pub fn call(&self, args: &[usize]) -> *mut u8 {
             // cast the memory region to a function pointer
-        let f: extern "C" fn(*mut u8) -> *mut u8 = unsafe { std::mem::transmute(self.ghcc_code) };
+        let f: JITFunctionType = unsafe { std::mem::transmute(self.ghcc_code) };
 
         // Copy args to the stack
         for (i, item) in args.iter().enumerate() {
@@ -95,7 +132,7 @@ impl GeneratedCode {
         // a "root stencil" that unpacks all of our arguments from our custom stack into
         // the registers that the other stencils expect but that is only done once per 
         // call so it should be fine
-        f(self.stack)
+        unsafe { f(self.stack) }
     }
 
     // TODO: We have partial support for having 

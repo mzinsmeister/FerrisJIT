@@ -57,15 +57,6 @@ impl<'ctx> MemoryManagement<'ctx> {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        self.reg_state = [None, None];
-        self.values.clear();
-        self.free_slots.clear();
-        self.stack_ptr = self.args_size * 8;
-        self.stack_size = self.args_size * 8;
-    }
-
     pub fn alloc_stack(&mut self, size: usize) -> usize {
         if let Some(next) = self.free_stack_pos.get_mut(&size) {
             let pos = next.pop().unwrap();
