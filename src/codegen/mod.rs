@@ -722,8 +722,6 @@ impl<'ctx> CodeGen<'ctx> {
         })?;
         self.memory_management.borrow_mut().flush_regs();
         let mut llvm_state = self.llvm_state.borrow_mut();
-        llvm_state.set_current_block(cond_bb);
-        llvm_state.set_current_block(after_cond_bb);
         llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[after_bb]).unwrap();
         llvm_state.set_current_block(cond_bb);
         llvm_state.builder.position_before(&llvm_state.basic_blocks[cond_bb].get_first_instruction().unwrap());
@@ -752,6 +750,10 @@ impl<'ctx> CodeGen<'ctx> {
         memory_management.put_in_reg(0, ptr_i);
         self.ctx.cp_backend.emit_load(data_type);
         memory_management.reg_state[0] = Some((target_i, true));
+        let mut llvm_state = self.llvm_state.borrow_mut();
+        let llvm_ptr = llvm_state.get_current_llvm_value(ptr_i).into_pointer_value();
+        let llvm_value = llvm_state.builder.build_load(data_type.get_llvm_type(&llvm_state.context), llvm_ptr, "load").unwrap();
+        llvm_state.set_value(target_i, llvm_value);
     }
 
     fn get_ptr(&self, value_i: usize) -> UntypedPtrRef<'_, 'ctx>{
@@ -832,9 +834,15 @@ impl<'ctx> CodeGen<'ctx> {
         let undef_value = llvm_i8_ptr_type.get_undef();
 
         // TODO: Handle constant arguments
-        let arg_llvm_value = self.llvm_state.borrow().get_current_llvm_value(args_ptr.inner.into_value_i()).into_pointer_value();
+        // Bitcast everything into a pointer value
+        let arg_llvm_value = self.llvm_state.borrow().get_current_llvm_value(args_ptr.inner.into_value_i());
+        let arg_llvm_value_as_ptr = match arg_llvm_value {
+            BasicValueEnum::PointerValue(p) => p,
+            BasicValueEnum::IntValue(i) => self.llvm_state.borrow_mut().builder.build_int_to_ptr(i, llvm_i8_ptr_type, "arg_llvm_value_as_ptr").unwrap(),
+            _ => panic!("Unsupported arg type")
+        };
         
-        let call = self.llvm_state.borrow().builder.build_indirect_call(func_type, const_fn_ptr, &[undef_value.into(), arg_llvm_value.into(), undef_value.into()], "c_call").unwrap();
+        let call = self.llvm_state.borrow().builder.build_indirect_call(func_type, const_fn_ptr, &[undef_value.into(), arg_llvm_value_as_ptr.into(), undef_value.into()], "c_call").unwrap();
         call.set_call_convention(LLVMCallConv::LLVMCCallConv as u32);
         self.llvm_state.borrow_mut().set_value(new_var.inner.into_value_i(), call.try_as_basic_value().unwrap_left().into());
 
@@ -846,6 +854,8 @@ impl<'ctx> CodeGen<'ctx> {
 
     pub fn finalize(&self) -> CodeGenResult<'ctx> {
         let code = self.ctx.cp_backend.generate_code(self.memory_management.borrow().stack_size);
+        // dump llvm ir
+        self.llvm_state.borrow().module.print_to_stderr();
         let llvm_module = self.llvm_state.borrow().module.clone();
         CodeGenResult { code, llvm_module }
     }

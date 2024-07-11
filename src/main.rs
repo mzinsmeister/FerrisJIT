@@ -232,6 +232,24 @@ mod test {
         }    
 
     }
+
+    #[test]
+    fn test_codegen_0() {
+        let results = Results();
+        let expr_str = "(+ $0 1)";
+        let query = parse_query_from_str(expr_str).unwrap();
+        let mut ctx = CodeGenContext::new();
+        let code = generate_code(&mut ctx, &query, 1, results.consumer()).unwrap();
+        let data = vec![0i64, 1, 5, 10, 100, 1000];
+        code.code.call(&[data.as_ptr() as usize, data.len()]);
+        let mut interp_result = vec![];
+        run_query(&query, &data, 1, |r| match r {
+            Atom::Num(n) => interp_result.push(n),
+            _ => unreachable!()
+        });
+        let result = results.take();
+        assert_eq!(result, interp_result);
+    }
     
     #[test]
     fn test_codegen_1() {
