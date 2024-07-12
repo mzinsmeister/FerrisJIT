@@ -19,4 +19,5 @@ rustyline = "14.0.0"
 [features]
 dump-stencils = []
 print-asm = []
+print-llvm = []
 

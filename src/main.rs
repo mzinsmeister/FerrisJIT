@@ -56,7 +56,6 @@ fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
         Ok(cgresult) => {
             println!("Generated {} bytes of x86-64 binary (+ equivalent LLVM-IR) in {:?}", cgresult.code.code_len, codegen_elapsed);
             // Now we compile the LLVM-IR to machine code, first with optimization "None" (-O0), then with "Aggressive" (-03)
-            let o0_start = std::time::Instant::now();
 
             if benchmark {
                 let start_time = std::time::Instant::now();
@@ -187,6 +186,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod test {
 
+    use std::{borrow::Borrow, ptr::null};
+
+    use inkwell::execution_engine::{self, ExecutionEngine};
+
     use crate::{codegen::CodeGenContext, query::{parse_query_from_str, run_query, Atom}, query_codegen::generate_code, test::results::Results};
 
     mod results {
@@ -247,6 +250,13 @@ mod test {
             Atom::Num(n) => interp_result.push(n),
             _ => unreachable!()
         });
+        let result = results.take();
+        assert_eq!(result, interp_result);
+
+        let results = Results();
+        // Compile LLVM
+        let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
+        llvm_func.call(&[data.as_ptr() as usize, data.len()]);
         let result = results.take();
         assert_eq!(result, interp_result);
     }

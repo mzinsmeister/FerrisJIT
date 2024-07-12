@@ -193,6 +193,7 @@ impl CodeGenContext {
         self.cg_created = true;
         CodeGen::new(self, arg_types)
     }
+
 }
 
 fn get_fn_ptr(f: CodegenCFunctionSignature) -> *const c_void {
@@ -468,7 +469,7 @@ impl<'ctx> CodeGen<'ctx> {
                 memory_management.put_in_reg(0, i);
                 self.ctx.cp_backend.emit_put_1_stack(dest_ptr);
                 memory_management.put_in_reg(1, dest_i);
-                self.llvm_state.borrow_mut().copy_value(dest_i, i);
+                self.llvm_state.borrow_mut().copy_value(i, dest_i);
             },
             CGValueRefInner::Const(c) => {
                self.memory_management.borrow_mut().init(dest_i, c);
@@ -544,7 +545,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn add(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, false, _>(CopyPatchBackend::emit_add,CopyPatchBackend::emit_add_const, |ls, t, l, r| llvm::int_sub(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
+        self.gen_arith::<true, false, _>(CopyPatchBackend::emit_add,CopyPatchBackend::emit_add_const, |ls, t, l, r| llvm::int_add(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
     }
 
     fn sub(&self, l: &mut CGValueRef, r: &CGValueRef) {
@@ -694,14 +695,23 @@ impl<'ctx> CodeGen<'ctx> {
         let mut llvm_state = self.llvm_state.borrow_mut();
         let previous_bb = llvm_state.current_block;
         let body_bb = llvm_state.new_basic_block();
+        let mut after_body_bb = body_bb;
         let cond_bb = llvm_state.new_basic_block();
         let after_bb = llvm_state.new_basic_block();
-        let mut after_cond_bb: usize = cond_bb;
+        let mut after_cond_bb = cond_bb;
         // insert an unconditional branch from previous to cond
         llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[cond_bb]).unwrap();
+        llvm_state.set_current_block(cond_bb);
+        let mut cond_phis = BTreeMap::new();
+        // insert "empty" phi nodes 
+        for i in llvm_state.value_mapping.get(&previous_bb).unwrap().keys().cloned().collect::<Vec<_>>() {
+            let llvm_type = llvm_state.get_current_llvm_value(i).get_type();
+            let phi = llvm_state.builder.build_phi(llvm_type, &format!("phi_{}", i)).unwrap();
+            cond_phis.insert(i, phi);
+            llvm_state.set_value(i, phi.as_basic_value());
+        }
+        drop(llvm_state);
         self.ctx.cp_backend.emit_loop( || {
-            llvm_state.set_current_block(cond_bb);
-            drop(llvm_state);
             let res = condition()?;
             let i = match res.0.inner {
                 CGValueRefInner::Value(i) => i,
@@ -718,20 +728,23 @@ impl<'ctx> CodeGen<'ctx> {
             llvm_state.set_current_block(body_bb);
             Ok(())
         }, || {
-            body()
+            let body_out = body();
+            after_body_bb = self.llvm_state.borrow().current_block;
+            body_out
         })?;
         self.memory_management.borrow_mut().flush_regs();
         let mut llvm_state = self.llvm_state.borrow_mut();
-        llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[after_bb]).unwrap();
-        llvm_state.set_current_block(cond_bb);
-        llvm_state.builder.position_before(&llvm_state.basic_blocks[cond_bb].get_first_instruction().unwrap());
-        for i in llvm_state.value_set_in_block.get(&body_bb).unwrap_or(&BTreeSet::new()).clone() {
-            let llvm_value = llvm_state.get_llvm_value(previous_bb, i);
-            let phi = llvm_state.builder.build_phi(llvm_value.get_type(), &format!("phi_{}", i)).unwrap();
+        llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[cond_bb]).unwrap();
+        for (i, phi) in cond_phis {
             let before_value = llvm_state.value_mapping.get(&previous_bb).unwrap().get(&i).unwrap().clone();
-            phi.add_incoming(&[(&llvm_value, llvm_state.basic_blocks[after_cond_bb]), (&before_value, llvm_state.basic_blocks[cond_bb])]);
+            let body_value = if llvm_state.value_set_in_block.contains_key(&body_bb) && llvm_state.value_set_in_block[&body_bb].contains(&i) {
+                llvm_state.value_set_in_block.entry(cond_bb).or_insert_with(|| BTreeSet::new()).insert(i);
+                llvm_state.get_llvm_value(after_body_bb, i)
+            } else {
+                before_value.clone()
+            };
+            phi.add_incoming(&[(&body_value, llvm_state.basic_blocks[after_body_bb]), (&before_value, llvm_state.basic_blocks[previous_bb])]);
             llvm_state.set_value(i, phi.as_basic_value());
-            llvm_state.value_set_in_block.entry(after_bb).or_insert_with(|| BTreeSet::new()).insert(i);
         }
         llvm_state.set_current_block(after_cond_bb); 
         llvm_state.set_current_block(after_bb);
@@ -854,7 +867,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     pub fn finalize(&self) -> CodeGenResult<'ctx> {
         let code = self.ctx.cp_backend.generate_code(self.memory_management.borrow().stack_size);
-        // dump llvm ir
+        #[cfg(feature = "print-llvm")]
         self.llvm_state.borrow().module.print_to_stderr();
         let llvm_module = self.llvm_state.borrow().module.clone();
         CodeGenResult { code, llvm_module }
