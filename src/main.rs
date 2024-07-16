@@ -53,7 +53,7 @@ fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
         Ok(code) => {
             println!("Generated {} bytes of x86-64 binary in {:?}", code.code_len, codegen_elapsed);
             if benchmark {
-                let start_time = std::time::Instant::now();
+                /*let start_time = std::time::Instant::now();
                 code.call(&[test_data.1.as_ptr() as usize, (test_data.1.len() / test_data.0) as usize]);
                 let elapsed = start_time.elapsed();
                 
@@ -74,7 +74,7 @@ fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
                 let factor = elapsed_interp.as_secs_f64() / elapsed.as_secs_f64();
 
                 println!("Compiled is {:.2}x {}", factor, if factor > 1.0 { "faster" } else { "slower" });
-
+*/
             } else {
                 code.call(&[test_data.1.as_ptr() as usize, (test_data.1.len() / test_data.0) as usize]);
             }
