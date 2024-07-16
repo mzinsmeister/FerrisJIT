@@ -14,7 +14,7 @@ use crate::codegen::{copy_patch::STENCILS, ir::DataType};
 use self::{copy_patch::CopyPatchBackend, ir::ConstValue, memory_management::{CGValue, MemoryManagement}, types::{BoolRef, I64Ref, UntypedPtrRef}};
 
 pub use result::{CodeGenResult, GeneratedCode};
-use inkwell::{builder::Builder, context::Context, llvm_sys::LLVMCallConv, values::BasicValueEnum, AddressSpace};
+use inkwell::{context::Context, llvm_sys::LLVMCallConv, values::{self, BasicValueEnum}, AddressSpace};
 use libc::c_void;
 
 pub type CodegenCFunctionSignature = unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8; // (state, arg1, arg2) -> result (all can be unused depending on the usecase)
@@ -330,6 +330,7 @@ impl<'ctx> LLVMState<'ctx> {
 
     /// It sets the current block to the given block while assuming we branched to it from the current block
     fn set_current_block(&mut self, block: usize) {
+        // TODO: Change this behaviour to require a specific "init" before 
         let next_block_mapping = if let Some(v) = self.value_mapping.remove_entry(&block) {
             v.1
         } else {
@@ -598,7 +599,7 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn gep(&self, pointee_type: DataType, ptr: &mut CGValueRef, index: &CGValueRef) {
-        self.gen_arith::<true,true, _>(CopyPatchBackend::emit_add, CopyPatchBackend::emit_add_const, |ls, t, l, r| {
+        self.gen_arith::<true,true, _>(CopyPatchBackend::emit_add, CopyPatchBackend::emit_add_const, |ls, _, l, r| {
             let l = l.into_pointer_value();
             let r = r.into_int_value();
             let gep = unsafe { ls.builder.build_gep(pointee_type.get_llvm_type(ls.context), l, &[r], "gep") }.unwrap();
@@ -650,10 +651,31 @@ impl<'ctx> CodeGen<'ctx> {
         };
         memory_management.put_in_reg(0, i);
         drop(memory_management);
+        let mut llvm_state = self.llvm_state.borrow_mut();
+        let previous_bb = llvm_state.current_block;
+        let body_bb = llvm_state.new_basic_block();
+        let after_bb = llvm_state.new_basic_block();
+        let llvm_cond = llvm_state.get_current_llvm_value(i).into_int_value();
+        llvm_state.builder.build_conditional_branch(llvm_cond, llvm_state.basic_blocks[body_bb], llvm_state.basic_blocks[after_bb]).unwrap();
+        llvm_state.set_current_block(body_bb);
+        drop(llvm_state);
         self.ctx.cp_backend.emit_if(|| {
             self.memory_management.borrow_mut().lose_reg(0);
             then_branch()
         })?;
+        let after_body_bb = self.llvm_state.borrow().current_block;
+        let mut llvm_state = self.llvm_state.borrow_mut();
+        llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[after_bb]).unwrap();
+        llvm_state.set_current_block(previous_bb);
+        llvm_state.set_current_block(after_bb);
+        for i in llvm_state.value_set_in_block[&after_body_bb].clone().iter() {
+            if let Some(before_value) = llvm_state.value_mapping.get(&previous_bb).unwrap().get(i).cloned() {
+                let body_value = llvm_state.get_llvm_value(after_body_bb, *i);
+                let phi = llvm_state.builder.build_phi(body_value.get_type(), &format!("phi_{}", i)).unwrap();
+                phi.add_incoming(&[(&body_value, llvm_state.basic_blocks[after_body_bb]), (&before_value, llvm_state.basic_blocks[previous_bb])]);
+                llvm_state.set_value(*i, phi.as_basic_value());
+            }
+        }
         let mut memory_management = self.memory_management.borrow_mut();
         memory_management.flush_regs();
         Ok(())
@@ -675,16 +697,60 @@ impl<'ctx> CodeGen<'ctx> {
         };
         memory_management.put_in_reg(0, i);
         drop(memory_management);
+        let mut llvm_state = self.llvm_state.borrow_mut();
+        let previous_bb = llvm_state.current_block;
+        let then_body_bb = llvm_state.new_basic_block();
+        let mut then_after_bb = then_body_bb;
+        let else_body_bb = llvm_state.new_basic_block();
+        let mut else_after_bb = else_body_bb;
+        let after_bb = llvm_state.new_basic_block();
+        let llvm_cond = llvm_state.get_current_llvm_value(i).into_int_value();
+        llvm_state.builder.build_conditional_branch(llvm_cond, llvm_state.basic_blocks[then_body_bb], llvm_state.basic_blocks[else_body_bb]).unwrap();
+        drop(llvm_state);
         self.ctx.cp_backend.emit_if_else(|| {
+            self.llvm_state.borrow_mut().set_current_block(then_body_bb);
             self.memory_management.borrow_mut().lose_reg(0);
             then_branch();
             let mut memory_management = self.memory_management.borrow_mut();
             memory_management.flush_regs();
+            let llvm_state = self.llvm_state.borrow();
+            then_after_bb = llvm_state.current_block;
+            llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[after_bb]).unwrap();
         }, || {
+            self.llvm_state.borrow_mut().set_current_block(else_body_bb);
             else_branch();
             let mut memory_management = self.memory_management.borrow_mut();
             memory_management.flush_regs();
+            let llvm_state = self.llvm_state.borrow();
+            else_after_bb = self.llvm_state.borrow().current_block;
+            llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[after_bb]).unwrap();
         });
+        let mut llvm_state = self.llvm_state.borrow_mut();
+        llvm_state.set_current_block(previous_bb);
+        llvm_state.set_current_block(after_bb);
+        // Calculate the set of values set in either of the two branches that have been present before the if else
+        let mut values_set_in_either = BTreeSet::new();
+        for i in llvm_state.value_set_in_block[&then_after_bb].iter().chain(llvm_state.value_set_in_block[&else_after_bb].iter()) {
+            if llvm_state.value_mapping.contains_key(&previous_bb) && llvm_state.value_mapping[&previous_bb].contains_key(i) {
+                values_set_in_either.insert(*i);
+            }
+        }
+        // Generate phi nodes
+        for value in values_set_in_either {
+            let then_value = if llvm_state.value_set_in_block.contains_key(&then_after_bb) && llvm_state.value_set_in_block[&then_after_bb].contains(&value) {
+                llvm_state.get_llvm_value(then_after_bb, value)
+            } else {
+                llvm_state.value_mapping[&previous_bb][&value].clone()
+            };
+            let else_value = if llvm_state.value_set_in_block.contains_key(&else_after_bb) && llvm_state.value_set_in_block[&else_after_bb].contains(&value) {
+                llvm_state.get_llvm_value(else_after_bb, value)
+            } else {
+                llvm_state.value_mapping[&previous_bb][&value].clone()
+            };
+            let phi = llvm_state.builder.build_phi(then_value.get_type(), &format!("phi_{}", value)).unwrap();
+            phi.add_incoming(&[(&then_value, llvm_state.basic_blocks[then_after_bb]), (&else_value, llvm_state.basic_blocks[else_after_bb])]);
+            llvm_state.set_value(value, phi.as_basic_value());
+        }
     }
 
     /// Generate a while loop. You cannot assign to variables declared outside the closure passed as
@@ -737,7 +803,7 @@ impl<'ctx> CodeGen<'ctx> {
         llvm_state.builder.build_unconditional_branch(llvm_state.basic_blocks[cond_bb]).unwrap();
         for (i, phi) in cond_phis {
             let before_value = llvm_state.value_mapping.get(&previous_bb).unwrap().get(&i).unwrap().clone();
-            let body_value = if llvm_state.value_set_in_block.contains_key(&body_bb) && llvm_state.value_set_in_block[&body_bb].contains(&i) {
+            let body_value = if llvm_state.value_set_in_block.contains_key(&after_body_bb) && llvm_state.value_set_in_block[&after_body_bb].contains(&i) {
                 llvm_state.value_set_in_block.entry(cond_bb).or_insert_with(|| BTreeSet::new()).insert(i);
                 llvm_state.get_llvm_value(after_body_bb, i)
             } else {

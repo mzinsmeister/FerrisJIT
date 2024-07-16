@@ -2,7 +2,7 @@ mod query;
 mod codegen;
 mod query_codegen;
 
-use std::{error::Error, hint::black_box, ptr};
+use std::{error::Error, hint::black_box, ptr, time::Duration};
 
 use codegen::CodeGenContext;
 use query_codegen::generate_code;
@@ -41,6 +41,21 @@ struct Cli {
     number: Option<u64>
 }
 
+fn format_time_comparison(duration1: Duration, duration2: Duration) -> String {
+    if duration1 > duration2 {
+        let factor = duration1.as_secs_f64() / duration2.as_secs_f64();
+        format!("{:.2}x slower", factor)
+    } else if duration2 > duration1 {
+        let factor = duration2.as_secs_f64() / duration1.as_secs_f64();
+        format!("{:.2}x faster", factor)
+    } else {
+        "equaly fast".to_string()
+    
+    }
+}
+
+const LLVM_LEVELS: [(inkwell::OptimizationLevel, &str); 2] = [(inkwell::OptimizationLevel::None, "O0"), (inkwell::OptimizationLevel::Aggressive, "O3")];
+
 fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
     let codegen_start = std::time::Instant::now();
     let result_consumer = if benchmark {
@@ -68,6 +83,21 @@ fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
                 
                 let elapsed_interp = start_interp.elapsed();
 
+                let mut llvm_results = Vec::new();
+
+
+
+                for (level, name) in  LLVM_LEVELS.iter() {
+                    let compile_start_time = std::time::Instant::now();
+                    let llvm_func = cgresult.compile_llvm(*level);
+                    let compile_elapsed = compile_start_time.elapsed();
+                    let exec_start_time = std::time::Instant::now();
+                    llvm_func.call(&[test_data.1.as_ptr() as usize, (test_data.1.len() / test_data.0) as usize]);
+                    let exec_elapsed = exec_start_time.elapsed();
+                    llvm_results.push((name, compile_elapsed, exec_elapsed));
+                }
+
+
                 //let start_hardcoded = std::time::Instant::now();
                 //--- INSERT YOUR HARDCODED EXPRESSION EVALUATION HERE ---
                 //let elapsed_hardcoded = start_hardcoded.elapsed();
@@ -76,10 +106,14 @@ fn eval(query: &query::Query, test_data: (usize, &[i64]), benchmark: bool) {
                 println!("Interpreted: {:?}", elapsed_interp);
                 println!("Compiled: {:?}", elapsed);
 
-                let factor = elapsed_interp.as_secs_f64() / elapsed.as_secs_f64();
 
-                println!("Compiled is {:.2}x {}", factor, if factor > 1.0 { "faster" } else { "slower" });
+                println!("Compiled is {}", format_time_comparison(elapsed, elapsed_interp));
 
+                println!("LLVM Results: ");
+                for (name, compile_elapsed, exec_elapsed) in llvm_results {
+                    println!("{}: Compile: {:?}({} than C&P), Exec: {:?} ({} than C&P)", name, compile_elapsed, 
+                        format_time_comparison(compile_elapsed, codegen_elapsed), exec_elapsed, format_time_comparison(exec_elapsed, elapsed));
+                }
             } else {
                 cgresult.code.call(&[test_data.1.as_ptr() as usize, (test_data.1.len() / test_data.0) as usize]);
             }
@@ -253,7 +287,6 @@ mod test {
         let result = results.take();
         assert_eq!(result, interp_result);
 
-        let results = Results();
         // Compile LLVM
         let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
         llvm_func.call(&[data.as_ptr() as usize, data.len()]);
@@ -277,6 +310,12 @@ mod test {
         });
         let result = results.take();
         assert_eq!(result, interp_result);
+
+        // Compile LLVM
+        let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
+        llvm_func.call(&[data.as_ptr() as usize, data.len()]);
+        let result = results.take();
+        assert_eq!(result, interp_result);
     }
 
     #[test]
@@ -295,6 +334,12 @@ mod test {
         });
         let result = results.take();
         assert_eq!(result, interp_result);
+
+        // Compile LLVM
+        let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
+        llvm_func.call(&[data.as_ptr() as usize, data.len()]);
+        let result = results.take();
+        assert_eq!(result, interp_result);
     }
 
     #[test]
@@ -311,6 +356,12 @@ mod test {
             Atom::Num(n) => interp_result.push(n),
             _ => unreachable!()
         });
+        let result = results.take();
+        assert_eq!(result, interp_result);
+
+        // Compile LLVM
+        let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
+        llvm_func.call(&[data.as_ptr() as usize, data.len()]);
         let result = results.take();
         assert_eq!(result, interp_result);
     }
@@ -333,6 +384,60 @@ mod test {
         });
         let result = results.take();
         assert_eq!(result, interp_result);
+
+        // Compile LLVM
+        let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
+        llvm_func.call(&[data.as_ptr() as usize, data.len()]);
+        let result = results.take();
+        assert_eq!(result, interp_result);
+    }
+
+    #[test]
+    fn test_codegen_sum() {
+        let results = Results();
+        let expr_str = "SUM $0";
+        let query = parse_query_from_str(expr_str).unwrap();
+        let mut ctx = CodeGenContext::new();
+        let code = generate_code(&mut ctx, &query, 1, results.consumer()).unwrap();
+        let data = vec![0, 1, 5, 10, 100, 1000];
+        code.code.call(&[data.as_ptr() as usize, data.len()]);
+        let mut interp_result = vec![];
+        run_query(&query, &data, 1, |r| match r {
+            Atom::Num(n) => interp_result.push(n),
+            _ => unreachable!()
+        });
+        let result = results.take();
+        assert_eq!(result, interp_result);
+
+        // Compile LLVM
+        let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
+        llvm_func.call(&[data.as_ptr() as usize, data.len()]);
+        let result = results.take();
+        assert_eq!(result, interp_result);
+    }
+
+    #[test]
+    fn test_codegen_where() {
+        let results = Results();
+        let expr_str = "$0 WHERE (> $0 10)";
+        let query = parse_query_from_str(expr_str).unwrap();
+        let mut ctx = CodeGenContext::new();
+        let code = generate_code(&mut ctx, &query, 1, results.consumer()).unwrap();
+        let data = vec![0, 1, 5, 10, 100, 1000];
+        code.code.call(&[data.as_ptr() as usize, data.len()]);
+        let mut interp_result = vec![];
+        run_query(&query, &data, 1, |r| match r {
+            Atom::Num(n) => interp_result.push(n),
+            _ => unreachable!()
+        });
+        let result = results.take();
+        assert_eq!(result, interp_result);
+
+        // Compile LLVM
+        let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
+        llvm_func.call(&[data.as_ptr() as usize, data.len()]);
+        let result = results.take();
+        assert_eq!(result, interp_result);
     }
 
     const VERY_COMPLEX_EXPR_1: &str = include_str!("complex_expr.txt");
@@ -350,6 +455,12 @@ mod test {
             Atom::Num(n) => interp_result.push(n),
             _ => unreachable!()
         });
+        let result = results.take();
+        assert_eq!(result, interp_result);
+
+        // Compile LLVM
+        let llvm_func = code.compile_llvm(inkwell::OptimizationLevel::None);
+        llvm_func.call(&[data.as_ptr() as usize, data.len()]);
         let result = results.take();
         assert_eq!(result, interp_result);
     }

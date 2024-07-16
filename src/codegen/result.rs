@@ -16,15 +16,9 @@ pub struct CodeGenResult<'ctx> {
 }
 
 impl<'ctx> CodeGenResult<'ctx> {
-    pub fn new(code: GeneratedCode, llvm_module: inkwell::module::Module<'ctx>) -> Self {
-        Self {
-            code,
-            llvm_module,
-        }
-    }
 
     pub fn compile_llvm(&self, opt_level: inkwell::OptimizationLevel) -> LLVMGeneratedCode<'ctx> {
-        let exec_engine = self.llvm_module.create_jit_execution_engine(opt_level).unwrap();
+        let exec_engine = self.llvm_module.clone().create_jit_execution_engine(opt_level).unwrap();
         let func = unsafe { exec_engine.get_function::<JITFunctionType>("main").unwrap() };
         LLVMGeneratedCode {
             func

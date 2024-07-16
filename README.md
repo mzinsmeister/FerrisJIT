@@ -132,9 +132,7 @@ Compiled is 75.49x faster
 
 ### Very long examples
 
-I'm pretty sure the majority of the time is actually not even the evaluation but just writing the input into the stack and the function calls, e.g. for the ghc-calling-convention wrapper. My experiments showed that just the two function calls (to the ghc-cc wrapper and the generated function) cost 2/3s of the time for a simple expression like `(+ 2 $0)`. Once we have control flow constructs we can just put a pointer to the input onto the stack and loop through it inside the generated code. 
-
-For now we can just use very large expressions to get a better idea of the relative performance. Large expressions can be generated with the gen_expr.py (enter a number for complexity as first argument). This result is also not necessarily the newest version. Note that my Laptop goes into thermal throttling after a few seconds of 100% CPU usage so the real difference will be less. Although i think between 80-150x is realistic.
+Large expressions can be generated with the gen_expr.py (enter a number for complexity as first argument). This result is also not necessarily the newest version. Note that my Laptop goes into thermal throttling after a few seconds of 100% CPU usage so the real difference will be less. Although i think between 80-150x is realistic.
 
 For example (complexity 1000; this will overflow and therefore only work on `--release` mode):
 

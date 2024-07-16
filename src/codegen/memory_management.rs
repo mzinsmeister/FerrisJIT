@@ -27,7 +27,6 @@ impl CGValue {
 }
 
 pub(super) struct MemoryManagement<'ctx> {
-    args_size: usize,
     pub values: Vec<CGValue>,
     free_slots: Vec<usize>,
     free_stack_pos: BTreeMap<usize, Vec<usize>>,
@@ -46,7 +45,6 @@ impl<'ctx> MemoryManagement<'ctx> {
             .map(|(i, dt)| CGValue::Variable{ data_type: *dt, stack_pos: i * 8, readonly: true})
             .collect();
         Self {
-            args_size: arg_types.len(),
             values,
             free_slots: Vec::new(),
             free_stack_pos: BTreeMap::new(),
