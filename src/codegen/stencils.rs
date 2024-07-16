@@ -306,10 +306,10 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool) -> Stencil {
                 let offset = section.sh_offset as usize;
                 let size = section.sh_size as usize;
                 // print code as hex bytes
-                for _i in 0..size {
+                //for _i in 0..size {
                     //print!("{:02x} ", res.as_slice()[offset + i]);
-                    code = Some(&elf[offset..offset + size]);
-                }
+                //}
+                code = Some(&elf[offset..offset + size]);
             }
         }
     }
