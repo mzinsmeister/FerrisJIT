@@ -7,15 +7,15 @@
 
 This is supposed to become an experimental compiler backend based on [Copy and Patch](https://fredrikbk.com/publications/copy-and-patch.pdf) to be (maybe) later used in my OxidSQL Database for a compiling query engine. It might be the first copy and patch experiments (at least in a public repo) in Rust. I will try to use LLVM directly for generating the stencils instead of going through the kind of ugly C++ templates described in the original paper. The idea would be to use the existing codegen primitives in your database system that can already generate LLVM IR and use those to generate stencils. One could then also copy and patch these stencils together using those same primitives.
 
-As a first step i will try to generate a few simple addition stencils and patch those together. As soon as that works, the hardest part should be done and it should just be a matter of adding more stencils and patching them together correctly (famous last words maybe).
-
 ## Current state
 
-Automatic stencil generation for integer-types and integer-operations should be working. Even control-flow should be working (commented out examples in expr_codegen.rs inside the generate_code method) now but generates a lot of stack/register movements that are somewhat unnecessary. A conditional move stencil and the corresponding abstractions around it could massively speed this up. The abstraction created is already quite nice i think. There's stuff like operator overloading so that you can add two codegen Values together and so on.
+Automatic stencil generation for integer-types and integer-operations aswell as pointers on them should be working. Even control-flow should be working now but generates a lot of stack/register movements that are somewhat unnecessary. A conditional move stencil and the corresponding abstractions around it could massively speed this up. The abstraction created is already quite nice i think. There's stuff like operator overloading so that you can add two codegen Values together and so on.
+
+The *llvm-gen* branch contains a version that should be able to generate LLVM IR with identical semantics on the fly too. This was not merged into main because it massively slows down the codegen time and there's currently no way to measure the copy and patch compilation time separately from the LLVM IR generation time or the general code generation time. You can, however, roughly assume that between 50 and 80% of the time the tool outputs for codegen is not actually spent on the copy and patch stuff. You can get a rough idea about this by using the *mocked_out_codegen* branch.
 
 ## Next steps
 
-Next steps would generating llvm ir on the fly while copy-patching for the entire expressions using the same code that generates the stencils. Note that we would only need to generate the actual operation stencils (arithmetic/boolean/control-flow/...) here and not the helper stencils that are just used to move stuff around to/from/between registers.
+Next steps would be to refactor stuff a bit and create a generic interface for backends such that you can add and remove new backends more easily and, more importantly, also decide which ones you actually want to use for a single compilation step.
 
 ## Try it!
 
