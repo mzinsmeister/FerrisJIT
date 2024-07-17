@@ -14,7 +14,7 @@ use crate::codegen::{copy_patch::STENCILS, ir::DataType};
 use self::{copy_patch::CopyPatchBackend, ir::ConstValue, memory_management::{CGValue, MemoryManagement}, types::{BoolRef, I64Ref, UntypedPtrRef}};
 
 pub use result::{CodeGenResult, GeneratedCode};
-use inkwell::{context::Context, llvm_sys::LLVMCallConv, values::{self, BasicValueEnum}, AddressSpace};
+use inkwell::{context::Context, llvm_sys::LLVMCallConv, values::BasicValueEnum, AddressSpace};
 use libc::c_void;
 
 pub type CodegenCFunctionSignature = unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8; // (state, arg1, arg2) -> result (all can be unused depending on the usecase)

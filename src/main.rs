@@ -219,11 +219,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod test {
-
-    use std::{borrow::Borrow, ptr::null};
-
-    use inkwell::execution_engine::{self, ExecutionEngine};
-
     use crate::{codegen::CodeGenContext, query::{parse_query_from_str, run_query, Atom}, query_codegen::generate_code, test::results::Results};
 
     mod results {
