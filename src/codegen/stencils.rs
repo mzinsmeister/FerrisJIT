@@ -302,9 +302,9 @@ fn get_stencil(s_type: StencilType, elf: &[u8], cut_jmp: bool) -> Stencil {
     for section in gobj.section_headers {
         let name = &strtab.get_at(section.sh_name);
         if let Some(name) = name {
-            if name == &".text" {
-                let offset = section.sh_offset as usize;
-                let size = section.sh_size as usize;
+            let offset = section.sh_offset as usize;
+            let size = section.sh_size as usize;
+            if name == &".text" || name == &".ltext" && size > 0  {
                 // print code as hex bytes
                 //for _i in 0..size {
                     //print!("{:02x} ", res.as_slice()[offset + i]);
