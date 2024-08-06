@@ -1,221 +1,212 @@
-pub mod ir;
-pub mod disassemble;
-mod result;
-mod memory_management;
-pub mod types;
-pub mod generator;
-
-use core::panic;
-use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, hint::black_box, mem, ops::Deref, ptr};
-
-
-use self::{generator::copy_patch::CopyPatchBackend, ir::ConstValue, memory_management::{CGValue, MemoryManagement}, types::{BoolRef, I64Ref, UntypedPtrRef}};
-
-use generator::{copy_patch::STENCILS, Generator};
-use ir::DataType;
-pub use result::{CodeGenResult, GeneratedCode};
-use libc::c_void;
-
-pub type CodegenCFunctionSignature = unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8; // (state, arg1, arg2) -> result (all can be unused depending on the usecase)
-
-pub(crate) fn init_stencils() {
-    // Dummy access to initialize stencils
-    let compile_start = std::time::Instant::now();
-    black_box(STENCILS.len());
-    let compile_elapsed = compile_start.elapsed();
-    println!("Stencil initialization: {:?}", compile_elapsed);
+struct RegisterManagement<'ctx> {
+    // We save whether a register is potentially dirty
+    // one value can only be in one register at a time unless it's a readonly/const value
+    // as soon as a readonly/const value is dirtied it becomes a different mutable variable
+    pub reg_state: [Option<(usize, bool)>; 2], 
+    stack_ptr: usize, // TODO: Use actual byte sizes. For now we just use 8 bytes for everything
+    pub stack_size: usize,
+    cp_backend: &'ctx CopyPatchBackend,
 }
 
-
-pub trait Setable<Other> {
-    fn set(&self, other: Other);
-}
-
-trait PtrTarget<'cg: 'cg>: Into<CGValueRef<'cg>> + From<CGValueRef<'cg>> {
-    fn get_data_type() -> DataType;
-    fn get_inner(&self) -> &CGValueRef<'cg>;
-}
-
-pub trait IntoBaseRef<'cg: 'cg> {
-    fn into_base(self) -> CGValueRef<'cg>;
-}
-
-impl<'cg: 'cg,  T: Into<CGValueRef<'cg>>> IntoBaseRef<'cg> for T {
-    fn into_base(self) -> CGValueRef<'cg> {
-        self.into() 
-    }
-}
-// TODO: Evaluate other solutions for this. 
-
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
-enum CGValueRefInner {
-    Value(usize),
-    Const(ConstValue)
-}
-
-impl CGValueRefInner {
-    fn into_value_i(&self) -> usize {
-        match self {
-            CGValueRefInner::Value(i) => *i,
-            CGValueRefInner::Const(_) => unreachable!(),
+impl<'ctx> RegisterManagement<'ctx> {
+    /// Frees a register, saving its content to the stack if necessary
+    pub fn free_reg(&mut self, reg: usize) {
+        if let Some((i, dirty)) = &mut self.reg_state[reg] {
+            if *dirty {
+                let cur_value = &self.values[*i];
+                match cur_value {
+                    CGValue::Variable{readonly, stack_pos,..} => {
+                        if *readonly {
+                            panic!("We should have allocated a stack slot before dirtying a readonly value");
+                        }
+                        // Save it to its designated stack location
+                        match reg {
+                            0 => self.cp_backend.emit_put_1_stack(*stack_pos),
+                            1 => self.cp_backend.emit_put_2_stack(*stack_pos),
+                            _ => unreachable!(),
+                        }
+                        self.reg_state[reg].as_mut().unwrap().1 = false;
+                    },
+                    CGValue::Free => { /* User doesn't need this anymore so we can just throw it away without writing it back. */},
+                }
+            }
         }
     }
-}
 
-pub struct CGValueRef<'cg: 'cg> {
-    inner: CGValueRefInner,
-    cg: &'cg CodeGen,
-    pub data_type: DataType,
-}
-
-
-impl<'cg> Clone for CGValueRef<'cg> {
-    fn clone(&self) -> Self {
-        self.cg.clone_value(self)
-    }
-}
-
-impl<'cg> Drop for CGValueRef<'cg> {
-    fn drop(&mut self) {
-        self.cg.free_value(self);
-    }
-}
-
-impl<'cg: 'cg> CGValueRef<'cg> {
-    fn new(i: usize, cg: &'cg CodeGen, data_type: DataType) -> Self {
-        CGValueRef { inner: CGValueRefInner::Value(i), cg, data_type }
-    }
-
-    fn new_const(c: ConstValue, cg: &'cg CodeGen) -> Self {
-        CGValueRef { inner: CGValueRefInner::Const(c), cg, data_type: c.get_type() }
-    }
-}
-
-impl<'cg: 'cg, T: Deref<Target=CGValueRef<'cg>> + Into<CGValueRef<'cg>>> Setable<T> for T {
-    fn set(&self, other: T) {
-        if self.deref() != other.deref() {
-            self.cg.copy_value(&other, self);
+    pub fn flush_regs(&mut self) {
+        for reg in 0..2 {
+            self.lose_reg(reg);
         }
     }
-}
 
-impl<'cg: 'cg, T: Deref<Target=CGValueRef<'cg>> + Into<CGValueRef<'cg>>> Setable<&T> for T {
-    fn set(&self, other: &T) {
-        if self.deref() != other.deref() {
-            self.cg.copy_value(&other, self);
+    /// Put a single value into a single register. Use "put_in_regs" if you want to set both registers
+    /// This might change the state of the other register!
+    pub fn put_in_reg(&mut self, reg: usize, v: usize) {
+                // Do we already have the correct value?
+        if let Some((i, _)) = &self.reg_state[reg] {
+            if *i == v {
+                return;
+            }
         }
+        let value = &self.values[v];
+        // Is our value in the other register? if so we can just swap the registers
+        let other_reg_n = (reg + 1) % 2;
+        let other_reg_state = self.reg_state[other_reg_n].clone();
+        if let Some((i, _)) = other_reg_state {
+            if i == v {
+                if let CGValue::Variable{readonly, ..} = &value {
+                    if *readonly {
+                        // We can just duplicate the value
+                        self.free_reg(reg);
+                        match other_reg_n {
+                            0 => self.cp_backend.emit_duplex1(),
+                            1 => self.cp_backend.emit_duplex2(),
+                            _ => unreachable!(),
+                        }
+                        self.reg_state[reg] = self.reg_state[other_reg_n].clone();
+                        return;
+                    }
+                }
+                // We just swap the registers so that we don't have to move anything
+                self.cp_backend.emit_swap12();
+                self.reg_state.swap(0, 1);
+                return;
+            }
+        }
+        // We have to go to memory, therefore spill the current value if necessary
+        self.free_reg(reg);
+        let value: &CGValue = &self.values[v];
+        // Load the value to the register
+        match value {
+            CGValue::Variable{stack_pos, ..} => {
+                // TODO: do take stack with datatype
+                match reg {
+                    0 => self.cp_backend.emit_take_1_stack(*stack_pos),
+                    1 => self.cp_backend.emit_take_2_stack(*stack_pos),
+                    _ => unreachable!(),
+                }
+            },
+            CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
+        }
+        self.reg_state[reg] = Some((v, false));
     }
-}
 
-impl<'cg> PartialEq for CGValueRef<'cg> {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner == other.inner && ptr::eq(self.cg, other.cg)
-    }
-}
+    // Get two values into registers in the most efficient way possible
+    pub fn put_in_regs(&mut self, reg0_v: usize, reg1_v: usize) {
+        let v0_reg_n = self.reg_state.iter()
+            .enumerate()
+            .find(|(_, r)| r.as_ref().map(|r| r.0 == reg0_v).unwrap_or(false))
+            .map(|(i, _)| i);
+        let v1_reg_n = self.reg_state.iter()
+            .enumerate()
+            .find(|(_, r)| r.as_ref().map(|r| r.0 == reg1_v).unwrap_or(false))
+            .map(|(i, _)| i);
 
-impl<'cg> Eq for CGValueRef<'cg> {}
+        // Depending on the different constellations we might have here we can do different things
+        // Both values are already in the correct (!) registers
+        if v0_reg_n == Some(0) && v1_reg_n == Some(1) {
+            return;
+        }
+        // Both want the same value and it already is in a register
+        if v0_reg_n.is_some() && v0_reg_n == v1_reg_n {
+            // just duplicate the value
+            if let Some(0) = v0_reg_n {
+                self.free_reg(1);
+                self.cp_backend.emit_duplex1();
+                self.reg_state[1] = self.reg_state[0].clone();
+            } else {
+                self.free_reg(0);
+                self.cp_backend.emit_duplex2();
+                self.reg_state[0] = self.reg_state[1].clone();
+            }
+            return;
+        }
 
-impl<'cg> PartialOrd for CGValueRef<'cg> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        if !ptr::eq(self.cg, other.cg) {
-            None
+        // registers are swapped
+        if matches!(v0_reg_n, Some(1)) && matches!(v1_reg_n, Some(0)) {
+            self.cp_backend.emit_swap12();
+            self.reg_state.swap(0, 1);
+            return;
+        }
+
+        if let Some(0) = v1_reg_n {
+            // v2 is in register 0
+            // Make sure to get that value into register 1 first
+            self.put_in_reg(1, reg1_v);
+            self.put_in_reg(0, reg0_v);
         } else {
-            self.inner.partial_cmp(&other.inner)
+            // In any other case this will be the most efficient way
+            // Either v1 is in register 1 or we have to go to memory for both anyway
+            self.put_in_reg(0, reg0_v);
+            self.put_in_reg(1, reg1_v);
+        }
+    }
+
+    pub fn dirty_reg(&mut self, reg: usize) {
+        let reg_state = self.reg_state[reg].clone();
+        if let Some((i, _)) = reg_state {
+            // Check whether the value is readonly and if it is we allocate a new value
+            self.reg_state[reg].as_mut().unwrap().1 = true;
+            match &self.values[i] {
+                CGValue::Variable{readonly,..} => {
+                    if *readonly {
+                        panic!("tried to dirty a readonly value");
+                    }
+                },
+                _ => unreachable!(),
+            }
+        } else {
+            panic!("tried to dirty a register that is not in use");
+        }
+    }
+
+    pub fn lose_reg(&mut self, reg: usize) {
+        self.free_reg(reg);
+        self.reg_state[reg] = None;
+    }
+
+    pub fn init(&mut self, i: usize, c: ConstValue) {
+        self.free_reg(0);
+        self.cp_backend.emit_take_1_const(c);
+        self.reg_state[0] = Some((i, true));
+    }
+
+    pub fn free_value(&mut self, v: usize) {
+        let value = &self.values[v];
+        match value {
+            CGValue::Variable{readonly, stack_pos, data_type} => {
+                if *readonly {
+                    return;
+                }
+                self.free_slots.push(v);
+                self.free_stack(*stack_pos, get_data_type_size(data_type));
+                self.values[v] = CGValue::Free;
+                // Check reg slots and free them if necessary
+                for reg in self.reg_state.iter_mut() {
+                    if let Some((i, _)) = reg {
+                        if *i == v {
+                            *reg = None;
+                        }
+                    }
+                }
+            }
+            CGValue::Free => {/* TODO: Make sure double frees cannot happen, even internally */},
         }
     }
 }
 
-impl<'cg> std::fmt::Debug for CGValueRef<'cg> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CGValueRef({:?}, {:x})", self.inner, ptr::addr_of!(self.cg) as usize)
-    }
-}
-
-// How this works is that we have "values" which are roughly equivalent to 
-// variables in a high level language. Note that we don't do SSA here. I
-// don't think it's really beneficial for Copy and patch as it would probably
-// make it harder to detect whether we can reuse a value in a register or not
-// However keep the invariant that all mutable values (which for now are all
-// values except for the arguments) are only referenced exactly once. The borrow checker
-// helps us with this. We also keep the state of our registers, most notably what values
-// are currently in them and whether they are dirty or not. Even Constants can be in registers
-// however once they become dirty we change their type to variable and allocate stack space for them.
-// The same is true for readonly values. We also manage free slots (as soon as the reference to a value)
-// is droppped, it is actually freed through RAII (Drop trait).
-//
-// Operations have to make sure to call the dirty_reg0/2 (only dirty_reg0 is implemented for now)
-// function whenever they change the value in a register. This function will then make sure that
-// the value is marked dirty and spilled to the stack if necessary. We load values into registers
-// lazily. Just because you create a constant, that doesn't mean there will be any code generated
-// for it. We only load it into a register when we actually need it. We also try to move between
-// registers and stack as little as possible. 
-
-/// Convenience layer around copy and patch compilation backend
-/// so that you don't have to think about registers anymore
-
-fn get_data_type_size(data_type: &DataType) -> usize {
-    match data_type {
-        DataType::I64 | DataType::U64 | DataType::F64 => 8,
-        DataType::I32 | DataType::U32 | DataType::F32 => 4,
-        DataType::I16 | DataType::U16 => 2,
-        DataType::I8 | DataType::U8 | DataType::Bool => 1,
-        DataType::Ptr => mem::size_of::<usize>(),
-    }
-}
-
-// We pull out some context. This will make sure that the CopyPatchBackend and the LLVM Context
-// live longer than our CodeGen which makes a lot of stuff easier
-
-pub struct CodeGenContext {
-    cp_backend: CopyPatchBackend,
-    llvm_ctx: inkwell::context::Context,
-    cg_created: bool
-}
-
-impl CodeGenContext {
-    pub fn new() -> Self {
-        let cp_backend = CopyPatchBackend::new();
-        let llvm_ctx = inkwell::context::Context::create();
-        Self {
-            cp_backend,
-            llvm_ctx,
-            cg_created: false,
-        }
-    }
-
-    // We borrow mutable here to make sure there's always only just one CodeGen at a time
-    // Destroying this and recreating it would also lead to undefined behaviour
-    pub fn create_codegen(&mut self, arg_types: &[DataType]) -> CodeGen {
-        if self.cg_created {
-            panic!("CodeGen can only be created once per context!");
-        }
-        self.cg_created = true;
-        CodeGen::new(self, arg_types)
-    }
-
-}
-
-fn get_fn_ptr(f: CodegenCFunctionSignature) -> *const c_void {
-    f as unsafe extern "C" fn(*mut u8, *mut u8, *mut u8) -> *mut u8 as *const c_void
-}
-
-pub struct CodeGen {
-    memory_management: RefCell<MemoryManagement>,
-    backends: Vec<Box<dyn Generator>>
-}
-
-#[allow(dead_code)]
 impl CodeGen {
 
-    fn new(arg_types: &[DataType], backends: Vec<Box<dyn Generator>>) -> Self {
-        let memory_management = MemoryManagement::new(arg_types);
+    fn new(ctx: &'ctx CodeGenContext, arg_types: &[DataType]) -> Self {
+        let memory_management = MemoryManagement::new(&ctx.cp_backend, arg_types);
         Self {
+            ctx,
             memory_management: RefCell::new(memory_management),
-            backends
+            llvm_state: RefCell::new(LLVMState::new(&ctx.llvm_ctx, arg_types))
         }
     }
 
-    pub fn get_arg(&self, n: usize) -> CGValueRef<'_> {
+    pub fn get_arg(&self, n: usize) -> CGValueRef<'_, 'ctx> {
         // We immediately copy the arg to a new position so that we can handle it like any other value
         // The lazy approach is great but it doesn't work fctxor stuff like loops
 
@@ -227,24 +218,24 @@ impl CodeGen {
         //I64Ref(CGValueRef::new_readonly(n, self, DataType::I64))
     }
 
-    fn new_var(&self, data_type: DataType) -> CGValueRef<'_> {
+    fn new_var(&self, data_type: DataType) -> CGValueRef<'_, 'ctx> {
         let mut memory_management = self.memory_management.borrow_mut();
         let i = memory_management.allocate_stack(data_type);
         CGValueRef::new(i, self, data_type)
     }
 
-    fn new_const(&self, c: ConstValue) -> CGValueRef<'_> {
+    fn new_const(&self, c: ConstValue) -> CGValueRef<'_, 'ctx> {
         CGValueRef::new_const(c, self)
     }
 
     /// Create a new i64 constant. Note that `set` cannot be called on constants!
-    pub fn new_i64_const(&self, n: i64) -> I64Ref<'_>{
+    pub fn new_i64_const(&self, n: i64) -> I64Ref<'_, 'ctx>{
         let c = self.new_const(ConstValue::I64(n));
         I64Ref(c)
     }
 
     /// Create a new i64 variable. If you don't need to change the value, use a constant instead.
-    pub fn new_i64_var(&self, init: i64) -> I64Ref<'_>{
+    pub fn new_i64_var(&self, init: i64) -> I64Ref<'_, 'ctx>{
         let var = self.new_var(DataType::I64);
         let init_val = self.new_i64_const(init);
         self.copy_value(&init_val, &var);
@@ -253,12 +244,12 @@ impl CodeGen {
     }
 
     /// Create a new bool constant. Note that `set` cannot be called on constants!
-    pub fn new_bool_const(&self, b: bool) -> BoolRef<'_>{
+    pub fn new_bool_const(&self, b: bool) -> BoolRef<'_, 'ctx>{
         BoolRef(self.new_const(ConstValue::Bool(b)))
     }
 
     /// Create a new bool variable. If you don't need to change the value, use a constant instead.
-    pub fn new_bool_var(&self, init: bool) -> BoolRef<'_>{
+    pub fn new_bool_var(&self, init: bool) -> BoolRef<'_, 'ctx>{
         let var = self.new_var(DataType::Bool);
         let init_val = self.new_bool_const(init);
         self.copy_value(&init_val, &var);
@@ -283,7 +274,7 @@ impl CodeGen {
         }
     }
 
-    fn clone_value(&self, v: &CGValueRef<'_>) -> CGValueRef<'_>{
+    fn clone_value(&self, v: &CGValueRef<'_, 'ctx>) -> CGValueRef<'_, 'ctx>{
         match v.inner {
             CGValueRefInner::Const(c) => {
                 CGValueRef::new_const(c, self)
@@ -605,7 +596,7 @@ impl CodeGen {
     /// Generate a while loop. You cannot assign to variables declared outside the closure passed as
     /// condition. This is by design because it prevents you from accidentially generating nonsensical code.
     /// Use the `set` function instead.
-    pub fn gen_while<'cg, E>(&self, condition: impl Fn() -> Result<BoolRef<'cg>, E>, body: impl Fn() -> Result<(), E>) -> Result<(), E> where 'ctx: 'cg {
+    pub fn gen_while<'cg, E>(&self, condition: impl Fn() -> Result<BoolRef<'cg, 'ctx>, E>, body: impl Fn() -> Result<(), E>) -> Result<(), E> where 'ctx: 'cg {
         self.memory_management.borrow_mut().flush_regs();
         let mut llvm_state = self.llvm_state.borrow_mut();
         let previous_bb = llvm_state.current_block;
@@ -684,7 +675,7 @@ impl CodeGen {
         llvm_state.set_value(target_i, llvm_value);
     }
 
-    fn get_ptr(&self, value_i: usize) -> UntypedPtrRef<'_>{
+    fn get_ptr(&self, value_i: usize) -> UntypedPtrRef<'_, 'ctx>{
         let mut memory_management = self.memory_management.borrow_mut();
         let stack_pos = match &memory_management.values[value_i] {
             CGValue::Variable{stack_pos,..} => *stack_pos,
@@ -740,7 +731,7 @@ impl CodeGen {
         self.llvm_state.borrow_mut().builder.build_return(Some(&llvm_return_val)).unwrap();
     }
 
-    pub fn call_c_function(&self, func: CodegenCFunctionSignature, args_ptr: UntypedPtrRef) -> UntypedPtrRef<'_> {
+    pub fn call_c_function(&self, func: CodegenCFunctionSignature, args_ptr: UntypedPtrRef) -> UntypedPtrRef<'_, 'ctx> {
         // Put args ptr into first register
         let mut memory_management = self.memory_management.borrow_mut();
         memory_management.put_in_reg(0, args_ptr.inner.into_value_i());

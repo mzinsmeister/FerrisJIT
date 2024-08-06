@@ -1,8 +1,9 @@
-pub mod stencils;
+pub mod generator;
 
 use inkwell::{builder::Builder, values::IntValue};
 
-use super::ir::DataType;
+use crate::codegen::ir::DataType;
+
 
 pub fn int_add<'ctx>(builder: &Builder<'ctx>, _d_type: DataType, x: IntValue<'ctx>, y: IntValue<'ctx>) -> IntValue<'ctx> {
     builder.build_int_add(x, y, "add").unwrap()

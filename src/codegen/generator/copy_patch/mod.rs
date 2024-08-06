@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::BTreeMap};
 #[cfg(feature = "print-asm")]
 use super::disassemble;
 
-use super::{ir::{ConstValue, DataType}, llvm::stencils::{StencilOperation, StencilType, compile_all_stencils, Stencil, RelocType}, GeneratedCode};
+use crate::codegen::{ir::{ConstValue, DataType}, llvm::stencils::{StencilOperation, StencilType, compile_all_stencils, Stencil, RelocType}, GeneratedCode};
 use lazy_static::lazy_static;
 use libc::c_void;
 

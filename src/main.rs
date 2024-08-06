@@ -261,8 +261,7 @@ mod test {
                 r.borrow_mut().push(result);
             });
             ptr::null_mut()
-        }    
-
+        }
     }
 
     #[test]
