@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use inkwell::{context::Context, values::BasicValueEnum, AddressSpace};
+use inkwell::{context::Context, llvm_sys::LLVMCallConv, values::BasicValueEnum, AddressSpace};
 
 use crate::codegen::{generator::Generator, get_data_type_size, ir::{ConstValue, DataType}};
 
@@ -159,18 +159,13 @@ struct LLVMGenerator<'ctx> {
 }
 
 impl<'ctx> Generator for LLVMGenerator<'ctx> {
-    fn init(&mut self) {
-    }
-    
     fn map_arg(&mut self, arg_n: usize, n: usize) {
         self.state.map_arg(arg_n, n);
     }
     
-    fn new_var(&mut self, n: usize) {
-    }
-    
-    fn new_const(&mut self, c: ConstValue, n: usize) {
-        self.state.init_value(n, c);
+    fn new_var(&mut self, n: usize, data_type: DataType) {
+        // We don't and also cannot declare variables in LLVM IR
+        // We simply create a new value once we initialize it
     }
     
     fn init_var(&mut self, c: ConstValue, n: usize) {
@@ -181,8 +176,8 @@ impl<'ctx> Generator for LLVMGenerator<'ctx> {
         self.state.free_value(n);
     }
     
-    fn copy_value(&mut self, n: usize, m: usize) {
-        self.state.copy_value(n, m);
+    fn copy_value(&mut self, src: usize, dest: usize) {
+        self.state.copy_value(src, dest);
     }
     
     fn add(&mut self, n: usize, m: usize) {
@@ -323,7 +318,14 @@ impl<'ctx> Generator for LLVMGenerator<'ctx> {
         let result = unsafe { self.state.builder.build_gep(pointee_type.get_llvm_ptr_type(&self.state.context), ptr_val.into_pointer_value(), &[idx_val.into_int_value()], "gep").unwrap() };
         self.state.set_value(ptr, result.into());
     }
-    
+
+    fn gep_const(&mut self, pointee_type: DataType, ptr: usize, idx_const: isize) {
+        let ptr_val = self.state.get_current_llvm_value(ptr);
+        let idx_val = self.state.context.i64_type().const_int(idx_const as u64, false);
+        let result = unsafe { self.state.builder.build_gep(pointee_type.get_llvm_ptr_type(&self.state.context), ptr_val.into_pointer_value(), &[idx_val.into()], "gep").unwrap() };
+        self.state.set_value(ptr, result.into());
+    }
+
     fn deref_ptr(&mut self, pointee_type: DataType, ptr_i: usize, target_i: usize) {
         let llvm_ptr = self.state.get_current_llvm_value(ptr_i).into_pointer_value();
         let llvm_value = self.state.builder.build_load(pointee_type.get_llvm_type(&self.state.context), llvm_ptr, "load").unwrap();
@@ -344,27 +346,27 @@ impl<'ctx> Generator for LLVMGenerator<'ctx> {
         self.state.builder.build_return(Some(&llvm_return_val)).unwrap();
     }
     
-    fn c_call(&mut self, func: *const std::os::raw::c_void, args_ptr: usize) {
+    fn c_call(&mut self, func: *const std::os::raw::c_void, args_ptr: usize, result: usize) {
         let llvm_i8_ptr_type = self.state.context.i8_type().ptr_type(inkwell::AddressSpace::default());
         let func_type = llvm_i8_ptr_type.fn_type(&[llvm_i8_ptr_type.into(), llvm_i8_ptr_type.into(), llvm_i8_ptr_type.into()], false);
 
-        let const_fn_ptr_int = self.ctx.llvm_ctx.i64_type().const_int(get_fn_ptr(func) as u64, false);
-        let const_fn_ptr = self.llvm_state.borrow().builder.build_int_to_ptr(const_fn_ptr_int, func_type.ptr_type(AddressSpace::default()), "const_fn_ptr").unwrap();
+        let const_fn_ptr_int = self.state.context.i64_type().const_int(func as u64, false);
+        let const_fn_ptr = self.state.builder.build_int_to_ptr(const_fn_ptr_int, func_type.ptr_type(AddressSpace::default()), "const_fn_ptr").unwrap();
 
         let undef_value = llvm_i8_ptr_type.get_undef();
 
         // TODO: Handle constant arguments
         // Bitcast everything into a pointer value
-        let arg_llvm_value = self.llvm_state.borrow().get_current_llvm_value(args_ptr.inner.into_value_i());
+        let arg_llvm_value = self.state.get_current_llvm_value(args_ptr.inner.into_value_i());
         let arg_llvm_value_as_ptr = match arg_llvm_value {
             BasicValueEnum::PointerValue(p) => p,
-            BasicValueEnum::IntValue(i) => self.llvm_state.borrow_mut().builder.build_int_to_ptr(i, llvm_i8_ptr_type, "arg_llvm_value_as_ptr").unwrap(),
+            BasicValueEnum::IntValue(i) => self.state.builder.build_int_to_ptr(i, llvm_i8_ptr_type, "arg_llvm_value_as_ptr").unwrap(),
             _ => panic!("Unsupported arg type")
         };
         
-        let call = self.llvm_state.borrow().builder.build_indirect_call(func_type, const_fn_ptr, &[undef_value.into(), arg_llvm_value_as_ptr.into(), undef_value.into()], "c_call").unwrap();
+        let call = self.state.builder.build_indirect_call(func_type, const_fn_ptr, &[undef_value.into(), arg_llvm_value_as_ptr.into(), undef_value.into()], "c_call").unwrap();
         call.set_call_convention(LLVMCallConv::LLVMCCallConv as u32);
-        self.llvm_state.borrow_mut().set_value(new_var.inner.into_value_i(), call.try_as_basic_value().unwrap_left().into());
+        self.state.set_value(result, call.try_as_basic_value().unwrap_left().into());
     }
     
     fn pre_if_then(&mut self, condition: usize) {

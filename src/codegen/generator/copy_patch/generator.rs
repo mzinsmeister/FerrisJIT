@@ -1,467 +1,225 @@
-struct RegisterManagement<'ctx> {
-    // We save whether a register is potentially dirty
-    // one value can only be in one register at a time unless it's a readonly/const value
-    // as soon as a readonly/const value is dirtied it becomes a different mutable variable
-    pub reg_state: [Option<(usize, bool)>; 2], 
-    stack_ptr: usize, // TODO: Use actual byte sizes. For now we just use 8 bytes for everything
-    pub stack_size: usize,
-    cp_backend: &'ctx CopyPatchBackend,
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+
+use crate::codegen::{generator::Generator, get_data_type_size, ir::{ConstValue, DataType}};
+
+use super::{memory_management::{CGValue, MemoryManagement}, CopyPatchBackend};
+
+
+struct CopyPatchGenerator {
+    cp_backend: Rc<CopyPatchBackend>,
+    memory_management: MemoryManagement,
+    id_value_mapping: BTreeMap<usize, usize>
 }
 
-impl<'ctx> RegisterManagement<'ctx> {
-    /// Frees a register, saving its content to the stack if necessary
-    pub fn free_reg(&mut self, reg: usize) {
-        if let Some((i, dirty)) = &mut self.reg_state[reg] {
-            if *dirty {
-                let cur_value = &self.values[*i];
-                match cur_value {
-                    CGValue::Variable{readonly, stack_pos,..} => {
-                        if *readonly {
-                            panic!("We should have allocated a stack slot before dirtying a readonly value");
-                        }
-                        // Save it to its designated stack location
-                        match reg {
-                            0 => self.cp_backend.emit_put_1_stack(*stack_pos),
-                            1 => self.cp_backend.emit_put_2_stack(*stack_pos),
-                            _ => unreachable!(),
-                        }
-                        self.reg_state[reg].as_mut().unwrap().1 = false;
-                    },
-                    CGValue::Free => { /* User doesn't need this anymore so we can just throw it away without writing it back. */},
-                }
-            }
-        }
+impl Generator for CopyPatchGenerator {
+    fn map_arg(&mut self, arg_n: usize, n: usize) {
+        let i = self.memory_management.clone_value(n);
+        self.id_value_mapping.insert(arg_n, i);
     }
 
-    pub fn flush_regs(&mut self) {
-        for reg in 0..2 {
-            self.lose_reg(reg);
-        }
+    fn new_var(&mut self, n: usize, data_type: DataType) {
+        let i = self.memory_management.allocate_stack(data_type);
+        self.id_value_mapping.insert(n, i);
     }
 
-    /// Put a single value into a single register. Use "put_in_regs" if you want to set both registers
-    /// This might change the state of the other register!
-    pub fn put_in_reg(&mut self, reg: usize, v: usize) {
-                // Do we already have the correct value?
-        if let Some((i, _)) = &self.reg_state[reg] {
-            if *i == v {
-                return;
-            }
-        }
-        let value = &self.values[v];
-        // Is our value in the other register? if so we can just swap the registers
-        let other_reg_n = (reg + 1) % 2;
-        let other_reg_state = self.reg_state[other_reg_n].clone();
-        if let Some((i, _)) = other_reg_state {
-            if i == v {
-                if let CGValue::Variable{readonly, ..} = &value {
-                    if *readonly {
-                        // We can just duplicate the value
-                        self.free_reg(reg);
-                        match other_reg_n {
-                            0 => self.cp_backend.emit_duplex1(),
-                            1 => self.cp_backend.emit_duplex2(),
-                            _ => unreachable!(),
-                        }
-                        self.reg_state[reg] = self.reg_state[other_reg_n].clone();
-                        return;
-                    }
-                }
-                // We just swap the registers so that we don't have to move anything
-                self.cp_backend.emit_swap12();
-                self.reg_state.swap(0, 1);
-                return;
-            }
-        }
-        // We have to go to memory, therefore spill the current value if necessary
-        self.free_reg(reg);
-        let value: &CGValue = &self.values[v];
-        // Load the value to the register
-        match value {
-            CGValue::Variable{stack_pos, ..} => {
-                // TODO: do take stack with datatype
-                match reg {
-                    0 => self.cp_backend.emit_take_1_stack(*stack_pos),
-                    1 => self.cp_backend.emit_take_2_stack(*stack_pos),
-                    _ => unreachable!(),
-                }
-            },
-            CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
-        }
-        self.reg_state[reg] = Some((v, false));
+    fn init_var(&mut self, c: crate::codegen::ir::ConstValue, n: usize) {
+        let i = self.id_value_mapping.get(&n).unwrap();
+        self.memory_management.init(i, c);
     }
 
-    // Get two values into registers in the most efficient way possible
-    pub fn put_in_regs(&mut self, reg0_v: usize, reg1_v: usize) {
-        let v0_reg_n = self.reg_state.iter()
-            .enumerate()
-            .find(|(_, r)| r.as_ref().map(|r| r.0 == reg0_v).unwrap_or(false))
-            .map(|(i, _)| i);
-        let v1_reg_n = self.reg_state.iter()
-            .enumerate()
-            .find(|(_, r)| r.as_ref().map(|r| r.0 == reg1_v).unwrap_or(false))
-            .map(|(i, _)| i);
-
-        // Depending on the different constellations we might have here we can do different things
-        // Both values are already in the correct (!) registers
-        if v0_reg_n == Some(0) && v1_reg_n == Some(1) {
-            return;
-        }
-        // Both want the same value and it already is in a register
-        if v0_reg_n.is_some() && v0_reg_n == v1_reg_n {
-            // just duplicate the value
-            if let Some(0) = v0_reg_n {
-                self.free_reg(1);
-                self.cp_backend.emit_duplex1();
-                self.reg_state[1] = self.reg_state[0].clone();
-            } else {
-                self.free_reg(0);
-                self.cp_backend.emit_duplex2();
-                self.reg_state[0] = self.reg_state[1].clone();
-            }
-            return;
-        }
-
-        // registers are swapped
-        if matches!(v0_reg_n, Some(1)) && matches!(v1_reg_n, Some(0)) {
-            self.cp_backend.emit_swap12();
-            self.reg_state.swap(0, 1);
-            return;
-        }
-
-        if let Some(0) = v1_reg_n {
-            // v2 is in register 0
-            // Make sure to get that value into register 1 first
-            self.put_in_reg(1, reg1_v);
-            self.put_in_reg(0, reg0_v);
-        } else {
-            // In any other case this will be the most efficient way
-            // Either v1 is in register 1 or we have to go to memory for both anyway
-            self.put_in_reg(0, reg0_v);
-            self.put_in_reg(1, reg1_v);
-        }
+    fn free_value(&mut self, n: usize) {
+        let i = self.id_value_mapping.get(&n).unwrap();
+        self.memory_management.free_value(*i);
     }
 
-    pub fn dirty_reg(&mut self, reg: usize) {
-        let reg_state = self.reg_state[reg].clone();
-        if let Some((i, _)) = reg_state {
-            // Check whether the value is readonly and if it is we allocate a new value
-            self.reg_state[reg].as_mut().unwrap().1 = true;
-            match &self.values[i] {
-                CGValue::Variable{readonly,..} => {
-                    if *readonly {
-                        panic!("tried to dirty a readonly value");
-                    }
-                },
-                _ => unreachable!(),
-            }
-        } else {
-            panic!("tried to dirty a register that is not in use");
-        }
-    }
-
-    pub fn lose_reg(&mut self, reg: usize) {
-        self.free_reg(reg);
-        self.reg_state[reg] = None;
-    }
-
-    pub fn init(&mut self, i: usize, c: ConstValue) {
-        self.free_reg(0);
-        self.cp_backend.emit_take_1_const(c);
-        self.reg_state[0] = Some((i, true));
-    }
-
-    pub fn free_value(&mut self, v: usize) {
-        let value = &self.values[v];
-        match value {
-            CGValue::Variable{readonly, stack_pos, data_type} => {
-                if *readonly {
-                    return;
-                }
-                self.free_slots.push(v);
-                self.free_stack(*stack_pos, get_data_type_size(data_type));
-                self.values[v] = CGValue::Free;
-                // Check reg slots and free them if necessary
-                for reg in self.reg_state.iter_mut() {
-                    if let Some((i, _)) = reg {
-                        if *i == v {
-                            *reg = None;
-                        }
-                    }
-                }
-            }
-            CGValue::Free => {/* TODO: Make sure double frees cannot happen, even internally */},
-        }
-    }
-}
-
-impl CodeGen {
-
-    fn new(ctx: &'ctx CodeGenContext, arg_types: &[DataType]) -> Self {
-        let memory_management = MemoryManagement::new(&ctx.cp_backend, arg_types);
-        Self {
-            ctx,
-            memory_management: RefCell::new(memory_management),
-            llvm_state: RefCell::new(LLVMState::new(&ctx.llvm_ctx, arg_types))
-        }
-    }
-
-    pub fn get_arg(&self, n: usize) -> CGValueRef<'_, 'ctx> {
-        // We immediately copy the arg to a new position so that we can handle it like any other value
-        // The lazy approach is great but it doesn't work fctxor stuff like loops
-
-        let mut memory_management = self.memory_management.borrow_mut();
-        let i = memory_management.clone_value(n);
-        self.llvm_state.borrow_mut().map_arg(n, i);
-        CGValueRef::new(i, self, memory_management.values[n].get_type())
-
-        //I64Ref(CGValueRef::new_readonly(n, self, DataType::I64))
-    }
-
-    fn new_var(&self, data_type: DataType) -> CGValueRef<'_, 'ctx> {
-        let mut memory_management = self.memory_management.borrow_mut();
-        let i = memory_management.allocate_stack(data_type);
-        CGValueRef::new(i, self, data_type)
-    }
-
-    fn new_const(&self, c: ConstValue) -> CGValueRef<'_, 'ctx> {
-        CGValueRef::new_const(c, self)
-    }
-
-    /// Create a new i64 constant. Note that `set` cannot be called on constants!
-    pub fn new_i64_const(&self, n: i64) -> I64Ref<'_, 'ctx>{
-        let c = self.new_const(ConstValue::I64(n));
-        I64Ref(c)
-    }
-
-    /// Create a new i64 variable. If you don't need to change the value, use a constant instead.
-    pub fn new_i64_var(&self, init: i64) -> I64Ref<'_, 'ctx>{
-        let var = self.new_var(DataType::I64);
-        let init_val = self.new_i64_const(init);
-        self.copy_value(&init_val, &var);
-        self.llvm_state.borrow_mut().init_value(var.inner.into_value_i(), ConstValue::I64(init));
-        I64Ref(var)
-    }
-
-    /// Create a new bool constant. Note that `set` cannot be called on constants!
-    pub fn new_bool_const(&self, b: bool) -> BoolRef<'_, 'ctx>{
-        BoolRef(self.new_const(ConstValue::Bool(b)))
-    }
-
-    /// Create a new bool variable. If you don't need to change the value, use a constant instead.
-    pub fn new_bool_var(&self, init: bool) -> BoolRef<'_, 'ctx>{
-        let var = self.new_var(DataType::Bool);
-        let init_val = self.new_bool_const(init);
-        self.copy_value(&init_val, &var);
-        self.llvm_state.borrow_mut().init_value(var.inner.into_value_i(), ConstValue::Bool(init));
-        BoolRef(var)
-    }
-
-
-    fn load_const(&self, v: usize, c: ConstValue) {
-        let mut memory_management = self.memory_management.borrow_mut();
-        memory_management.init(v, c);
-        self.llvm_state.borrow_mut().init_value(v, c);
-    }
-
-    fn free_value(&self, v: &CGValueRef) {
-        match v.inner {
-            CGValueRefInner::Value(i) => {
-                self.memory_management.borrow_mut().free_value(i);
-                self.llvm_state.borrow_mut().free_value(i);
-            },
-            CGValueRefInner::Const(_) => {/* We don't have to do anything here */}
-        }
-    }
-
-    fn clone_value(&self, v: &CGValueRef<'_, 'ctx>) -> CGValueRef<'_, 'ctx>{
-        match v.inner {
-            CGValueRefInner::Const(c) => {
-                CGValueRef::new_const(c, self)
-            },
-            CGValueRefInner::Value(i) => {
-                let mut memory_management = self.memory_management.borrow_mut();
-                let new = memory_management.clone_value(i);
-                self.llvm_state.borrow_mut().copy_value(i, new);
-                CGValueRef::new(new, self, v.data_type.clone())
-            }
-        }
-    }
-
-
-    fn copy_value(&self, src: &CGValueRef, dest: &CGValueRef) {
-        let (dest_i, dest_ptr) = match dest.inner {
-            CGValueRefInner::Value(i) => {
-                let memory_management = self.memory_management.borrow();
-                let dest_ptr = match &memory_management.values[i] {
-                    CGValue::Variable{stack_pos,..} => *stack_pos,
-                    _ => unreachable!(),
-                };
-                (i, dest_ptr)
-            },
-            CGValueRefInner::Const(_) => {
-                // TODO: Can we encode this in the type system so that stuff like this is not possible?
-                panic!("Cannot copy to a constant");
-            }
+    fn copy_value(&mut self, src: usize, dest: usize) {
+        let src_i = self.id_value_mapping[&src];
+        let dest_i = self.id_value_mapping[&dest];
+        let dest_ptr = match &self.memory_management.values[dest_i] {
+            CGValue::Variable{stack_pos,..} => *stack_pos,
+            _ => unreachable!(),
         };
-        match src.inner {
-            CGValueRefInner::Value(i) => {
-                let mut memory_management = self.memory_management.borrow_mut();
-                memory_management.put_in_reg(0, i);
-                self.ctx.cp_backend.emit_put_1_stack(dest_ptr);
-                memory_management.put_in_reg(1, dest_i);
-                self.llvm_state.borrow_mut().copy_value(i, dest_i);
-            },
-            CGValueRefInner::Const(c) => {
-               self.memory_management.borrow_mut().init(dest_i, c);
-                self.llvm_state.borrow_mut().init_value(dest_i, c);
-            }
+        self.memory_management.put_in_reg(0, src_i);
+        self.cp_backend.emit_put_1_stack(dest_ptr);
+        self.memory_management.put_in_reg(1, dest_i);
+    }
 
+    fn add(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_add, n, m);
+    }
+
+    fn add_const(&mut self, n: usize, c: crate::codegen::ir::ConstValue) {
+        self.gen_arith_const(CopyPatchBackend::emit_add_const, n, c);
+    }
+
+    fn sub(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_sub, n, m);
+    }
+
+    fn sub_const(&mut self, n: usize, c: crate::codegen::ir::ConstValue) {
+        self.gen_arith_const(CopyPatchBackend::emit_sub_const, n, c);
+    }
+
+    fn mul(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_mul, n, m);
+    }
+
+    fn mul_const(&mut self, n: usize, c: crate::codegen::ir::ConstValue) {
+        self.gen_arith_const(CopyPatchBackend::emit_mul_const, n, c);
+    }
+
+    fn div(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_div, n, m);
+    }
+
+    fn div_const(&mut self, n: usize, c: crate::codegen::ir::ConstValue) {
+        self.gen_arith_const(CopyPatchBackend::emit_div_const, n, c);
+    }
+
+    fn rem(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_rem, n, m);
+    }
+
+    fn rem_const(&mut self, n: usize, c: crate::codegen::ir::ConstValue) {
+        self.gen_arith_const(CopyPatchBackend::emit_rem_const, n, c);
+    }
+
+    fn eq(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_eq, n, m);
+    }
+
+    fn neq(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_neq, n, m);
+    }
+
+    fn lt(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_lt, n, m);
+    }
+
+    fn lte(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_lte, n, m);
+    }
+
+    fn gt(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_gt, n, m);
+    }
+
+    fn gte(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_gte, n, m);
+    }
+
+    fn and(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_and, n, m);
+    }
+
+    fn or(&mut self, n: usize, m: usize) {
+        self.gen_arith(CopyPatchBackend::emit_or, n, m);
+    }
+
+    fn not(&mut self, n: usize) {
+        self.memory_management.put_in_reg(0, n);
+        match &self.memory_management.values[n] {
+            CGValue::Variable{data_type,..} => {
+                self.cp_backend.emit_not(data_type.clone());
+            },
+            _ => unreachable!(),
         }
-    
+        self.memory_management.dirty_reg(0);
     }
 
-    //--------------------------------------------------------------------------------
-    // Arithmetic operations
-    fn gen_arith<const COMMUTATIVE: bool, const RETURNS_BOOL: bool, LLVMF>(&self,  gen_op: fn(&CopyPatchBackend, DataType), gen_op_const: fn(&CopyPatchBackend, ConstValue), gen_llvm: LLVMF, l: &mut CGValueRef, r: &CGValueRef) 
-            where LLVMF: Fn(&LLVMState<'ctx>, DataType, BasicValueEnum<'ctx>, BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+    fn gep(&mut self, pointee_type: DataType, ptr: usize, idx: usize) {
+        // Create intermediate value for idx to not overwrite it
+        let idx_i = self.memory_management.clone_value(idx);
+        self.memory_management.put_in_reg(0, idx_i);
+        self.cp_backend.emit_mul_const(ConstValue::U64(get_data_type_size(&pointee_type) as u64));
+        self.memory_management.dirty_reg(0);
+        self.memory_management.put_in_regs(ptr, idx_i);
+        self.cp_backend.emit_add(DataType::U64);
+        self.memory_management.dirty_reg(0);
+        self.free_value(idx_i);
+    }
 
-        let mut memory_management = self.memory_management.borrow_mut();
-        match (l.inner, r.inner) {
-            (CGValueRefInner::Value(li), CGValueRefInner::Value(ri)) => {
-                memory_management.put_in_regs(li, ri);
-                gen_op(&self.ctx.cp_backend, l.data_type.clone());
-                let llvm_l = self.llvm_state.borrow().get_current_llvm_value(li);
-                let llvm_r = self.llvm_state.borrow().get_current_llvm_value(ri);
-                let new_llvm_l = gen_llvm(&self.llvm_state.borrow(), l.data_type, llvm_l, llvm_r);
-                self.llvm_state.borrow_mut().set_value(li, new_llvm_l);
+    fn gep_const(&mut self, pointee_type: DataType, ptr: usize, idx_const: isize) {
+        self.memory_management.put_in_reg(0, ptr);
+        self.cp_backend.emit_add_const(ConstValue::U64(idx_const as u64 * get_data_type_size(&pointee_type) as u64));
+        self.memory_management.dirty_reg(0);
+    }
+
+    fn deref_ptr(&mut self, pointee_type: DataType, ptr_i: usize, target_i: usize) {
+    }
+
+    fn write_to_ptr(&mut self, ptr_i: usize, value_i: usize) {
+        todo!()
+    }
+
+    fn ret(&mut self, n: Option<usize>) {
+        todo!()
+    }
+
+    fn c_call(&mut self, func: *const std::os::raw::c_void, args_ptr: usize, result: usize) {
+        todo!()
+    }
+
+    fn pre_if_then(&mut self, condition: usize) {
+        todo!()
+    }
+
+    fn post_if_then(&mut self) {
+        todo!()
+    }
+
+    fn pre_if(&mut self, condition: usize) {
+        todo!()
+    }
+
+    fn pre_then(&mut self) {
+        todo!()
+    }
+
+    fn post_then(&mut self) {
+        todo!()
+    }
+
+    fn pre_else(&mut self) {
+        todo!()
+    }
+
+    fn post_else(&mut self) {
+        todo!()
+    }
+
+    fn post_if(&mut self) {
+        todo!()
+    }
+
+    fn pre_loop_cond(&mut self) {
+        todo!()
+    }
+
+    fn pre_loop_body(&mut self, condition: usize) {
+        todo!()
+    }
+
+    fn post_loop_body(&mut self) {
+        todo!()
+    }
+}
+
+impl CopyPatchGenerator {
+
+    fn gen_arith(&mut self, gen_op: fn(&CopyPatchBackend, DataType), l: usize, r: usize) {
+        self.memory_management.put_in_regs(l, r);
+        match &self.memory_management.values[l] {
+            CGValue::Variable{data_type,..} => {
+                gen_op(&self.cp_backend, data_type.clone());
             },
-            (CGValueRefInner::Value(li), CGValueRefInner::Const(c)) => {
-                let vl = memory_management.values[li].clone();
-                match vl {
-                    CGValue::Variable{..} => {
-                        memory_management.put_in_reg(0, li);
-                        gen_op_const(&self.ctx.cp_backend, c);
-                        let llvm_l = self.llvm_state.borrow().get_current_llvm_value(li);
-                        let llvm_r = self.llvm_state.borrow().get_llvm_const(c);
-                        let new_llvm_l = gen_llvm(&self.llvm_state.borrow(), l.data_type, llvm_l, llvm_r);
-                        self.llvm_state.borrow_mut().set_value(li, new_llvm_l);
-                    },
-                    CGValue::Free => unreachable!("We shouldn't even be able to have a reference to a free value"),
-                }
-            },
-            (CGValueRefInner::Const(c), CGValueRefInner::Value(ri)) => {
-                let new_li = memory_management.allocate_stack(c.get_type());
-                if COMMUTATIVE {
-                    memory_management.put_in_reg(0, ri);
-                    gen_op_const(&self.ctx.cp_backend, c);
-                    memory_management.reg_state[0] = Some((new_li, true));
-                } else {
-                    memory_management.init(new_li, c);
-                    memory_management.put_in_regs(new_li, ri);
-                    gen_op(&self.ctx.cp_backend, c.get_type());
-                    l.inner = CGValueRefInner::Value(new_li);
-                }
-                let llvm_l = self.llvm_state.borrow().get_llvm_const(c);
-                let llvm_r = self.llvm_state.borrow().get_current_llvm_value(ri);
-                let new_llvm_l = gen_llvm(&self.llvm_state.borrow(), l.data_type, llvm_l, llvm_r);
-                self.llvm_state.borrow_mut().set_value(new_li, new_llvm_l);
-            },
-            (CGValueRefInner::Const(c1), CGValueRefInner::Const(c2)) => {
-                let new_l = memory_management.allocate_stack(c1.get_type());
-                memory_management.init(new_l, c1);
-                memory_management.put_in_reg(0, new_l);
-                gen_op_const(&self.ctx.cp_backend, c2);
-                l.inner = CGValueRefInner::Value(new_l);
-                let llvm_l = self.llvm_state.borrow().get_llvm_const(c1);
-                let llvm_r = self.llvm_state.borrow().get_llvm_const(c2);
-                let new_llvm_l = gen_llvm(&self.llvm_state.borrow(), l.data_type, llvm_l, llvm_r);
-                self.llvm_state.borrow_mut().set_value(new_l, new_llvm_l);
-            }
+            _ => unreachable!(),
         }
-        memory_management.dirty_reg(0);
-        if RETURNS_BOOL {
-            l.data_type = DataType::Bool;
-        }
     }
 
-    fn add(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, false, _>(CopyPatchBackend::emit_add,CopyPatchBackend::emit_add_const, |ls, t, l, r| llvm::int_add(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn sub(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, false, _>(CopyPatchBackend::emit_sub,CopyPatchBackend::emit_sub_const,  |ls, t, l, r| llvm::int_sub(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l , r)
-    }
-
-    fn mul(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, false, _>(CopyPatchBackend::emit_mul,CopyPatchBackend::emit_mul_const,  |ls, t, l, r| llvm::int_mul(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn div(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, false, _>(CopyPatchBackend::emit_div,CopyPatchBackend::emit_div_const,  |ls, t, l, r| llvm::int_div(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn rem(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, false, _>(CopyPatchBackend::emit_rem,CopyPatchBackend::emit_rem_const,  |ls, t, l, r| llvm::int_rem(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn eq(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, true, _>(CopyPatchBackend::emit_eq,CopyPatchBackend::emit_eq_const,  |ls, t, l, r| llvm::int_eq(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn neq(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, true, _>(CopyPatchBackend::emit_neq,CopyPatchBackend::emit_neq_const,  |ls, t, l, r| llvm::int_ne(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    // TODO: exchange lt/gte and lte/gt here if the first one is a const
-    fn lt(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, true, _>(CopyPatchBackend::emit_lt,CopyPatchBackend::emit_lt_const,  |ls, t, l, r| llvm::int_lt(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn lte(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, true, _>(CopyPatchBackend::emit_lte,CopyPatchBackend::emit_lte_const,  |ls, t, l, r| llvm::int_lte(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn gt(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, true, _>(CopyPatchBackend::emit_gt,CopyPatchBackend::emit_gt_const,  |ls, t, l, r| llvm::int_gt(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn gte(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<false, true, _>(CopyPatchBackend::emit_gte,CopyPatchBackend::emit_gte_const, |ls, t, l, r| llvm::int_gte(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn and(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, true, _>(CopyPatchBackend::emit_and,CopyPatchBackend::emit_and_const, |ls, t, l, r| llvm::int_and(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn or(&self, l: &mut CGValueRef, r: &CGValueRef) {
-        self.gen_arith::<true, true, _>(CopyPatchBackend::emit_or,CopyPatchBackend::emit_or_const, |ls, t, l, r| llvm::int_or(&ls.builder, t, l.into_int_value(), r.into_int_value()).into(), l, r)
-    }
-
-    fn gep(&self, pointee_type: DataType, ptr: &mut CGValueRef, index: &CGValueRef) {
-        self.gen_arith::<true,true, _>(CopyPatchBackend::emit_add, CopyPatchBackend::emit_add_const, |ls, _, l, r| {
-            let l = l.into_pointer_value();
-            let r = r.into_int_value();
-            let gep = unsafe { ls.builder.build_gep(pointee_type.get_llvm_type(ls.context), l, &[r], "gep") }.unwrap();
-            gep.into()
-        }, ptr, index)
-    }
-
-    fn not(&self, l: &mut CGValueRef) {
-        let mut memory_management = self.memory_management.borrow_mut();
-        match l.inner {
-            CGValueRefInner::Value(i) => {
-                memory_management.put_in_reg(0, i);
-                self.ctx.cp_backend.emit_not(l.data_type.clone());
-                memory_management.dirty_reg(0);
-            },
-            CGValueRefInner::Const(c) => {
-                l.inner = CGValueRefInner::Const(c.bit_not());
-            }
-        }
-        let llvm_val = self.llvm_state.borrow().get_current_llvm_value(l.inner.into_value_i()).into_int_value();
-        let new_llvm_val = llvm::int_not(&self.llvm_state.borrow().builder, llvm_val);
-        self.llvm_state.borrow_mut().set_value(l.inner.into_value_i(), new_llvm_val.into());
+    fn gen_arith_const(&mut self, gen_op: fn(&CopyPatchBackend, ConstValue), l: usize, r: ConstValue) {
+        self.memory_management.put_in_reg(0, l);
+        gen_op(&self.cp_backend, r);
     }
 
     //--------------------------------------------------------------------------------

@@ -6,7 +6,7 @@ pub mod types;
 pub mod generator;
 
 use core::panic;
-use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, hint::black_box, mem, ops::Deref, ptr};
+use std::{cell::{Cell, RefCell}, collections::{BTreeMap, BTreeSet}, hint::black_box, mem, ops::Deref, ptr};
 
 
 use self::{generator::copy_patch::CopyPatchBackend, ir::ConstValue, memory_management::{CGValue, MemoryManagement}, types::{BoolRef, I64Ref, UntypedPtrRef}};
@@ -200,7 +200,7 @@ fn get_fn_ptr(f: CodegenCFunctionSignature) -> *const c_void {
 }
 
 pub struct CodeGen {
-    memory_management: RefCell<MemoryManagement>,
+    id_counter: Cell<usize>,
     backends: Vec<Box<dyn Generator>>
 }
 
@@ -208,9 +208,8 @@ pub struct CodeGen {
 impl CodeGen {
 
     fn new(arg_types: &[DataType], backends: Vec<Box<dyn Generator>>) -> Self {
-        let memory_management = MemoryManagement::new(arg_types);
         Self {
-            memory_management: RefCell::new(memory_management),
+            id_counter: Cell::new(0),
             backends
         }
     }

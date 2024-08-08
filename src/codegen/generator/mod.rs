@@ -8,13 +8,11 @@ pub mod llvm;
 // A generator is the abstraction of a backend for code generation
 
 pub trait Generator {
-    fn init(&mut self);
     fn map_arg(&mut self, arg_n: usize, n: usize);
-    fn new_var(&mut self, n: usize);
-    fn new_const(&mut self, c: ConstValue, n: usize);
+    fn new_var(&mut self, n: usize, data_type: DataType);
     fn init_var(&mut self, c: ConstValue, n: usize);
     fn free_value(&mut self, n: usize);
-    fn copy_value(&mut self, n: usize, m: usize);
+    fn copy_value(&mut self, src: usize, dest: usize);
     fn add(&mut self, n: usize, m: usize);
     fn add_const(&mut self, n: usize, c: ConstValue);
     fn sub(&mut self, n: usize, m: usize);
@@ -35,11 +33,12 @@ pub trait Generator {
     fn or(&mut self, n: usize, m: usize);
     fn not(&mut self, n: usize);
     fn gep(&mut self, pointee_type: DataType, ptr: usize, idx: usize);
+    fn gep_const(&mut self, pointee_type: DataType, ptr: usize, idx_const: isize);
     fn deref_ptr(&mut self, pointee_type: DataType, ptr_i: usize, target_i: usize);
     //fn get_ptr(&mut self, n: usize);
     fn write_to_ptr(&mut self, ptr_i: usize, value_i: usize);
     fn ret(&mut self, n: Option<usize>);
-    fn c_call(&mut self, func: *const c_void, args_ptr: usize);
+    fn c_call(&mut self, func: *const c_void, args_ptr: usize, result: usize);
 
     // If
     fn pre_if_then(&mut self, condition: usize);
