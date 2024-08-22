@@ -237,7 +237,7 @@ impl<'ctx> LLVMState<'ctx> {
             let offset_llvm_value = context.i64_type().const_int(offset as u64, false);
             let arg_ptr = unsafe { builder.build_in_bounds_gep(i8_type, args_ptr, &[offset_llvm_value.into()], "arg_ptr") }.unwrap();
             let value = builder.build_load(arg_type.get_llvm_type(context), arg_ptr, &format!("val{}", i)).unwrap();
-            let casted_value = builder.build_bitcast(value, llvm_arg_type, &format!("casted_val{}", i)).unwrap();
+            let casted_value = builder.build_bit_cast(value, llvm_arg_type, &format!("casted_val{}", i)).unwrap();
             inner_args.push(casted_value.into());
             offset += get_data_type_size(arg_type) as u32;
         }

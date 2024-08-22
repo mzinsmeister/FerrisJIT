@@ -634,7 +634,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
             let x = self.init_placeholder(same_width_int);
             let y = args[1].into_pointer_value();
             if data_type.is_float() {
-                vec![self.builder.build_bitcast(x, data_type.get_llvm_type(self.context), "cast").unwrap().into(), y.into()]
+                vec![self.builder.build_bit_cast(x, data_type.get_llvm_type(self.context), "cast").unwrap().into(), y.into()]
             } else {
                 vec![x.into(), y.into()]
             }
@@ -649,7 +649,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
             let x = args[0].into_pointer_value();
             let y = self.init_placeholder(same_width_int);
             if data_type.is_float() {
-                vec![x.into(), self.builder.build_bitcast(y, data_type.get_llvm_type(self.context), "cast").unwrap().into()]
+                vec![x.into(), self.builder.build_bit_cast(y, data_type.get_llvm_type(self.context), "cast").unwrap().into()]
             } else {
                 vec![x.into(), y.into()]
             }
