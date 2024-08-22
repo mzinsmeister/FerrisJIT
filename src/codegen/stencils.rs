@@ -456,8 +456,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     fn compile_ghc_wrapper(&self) -> Stencil {
         let s_type = StencilType::new(StencilOperation::GhcWrapper, None);
         self.module.set_name(&format!("{}", s_type));
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
+        let i8_ptr_type = self.context.ptr_type(AddressSpace::default());
         let fn_type = i8_ptr_type.fn_type(&[i8_ptr_type.into()], false);
         let function = self.module.add_function("__GHC_CC-CONVERTER__", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");
@@ -491,7 +490,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     // We can also generate stencil variants that take 0-6 64 bit arguments for example
     fn compile_call_c_function(&self) -> Stencil {
-        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8_ptr = self.context.ptr_type(AddressSpace::default());
         self.module.set_name(&format!("{}", StencilType::new(StencilOperation::CallCFunction, None)));
         let void_type = self.context.void_type();
         let fn_type = void_type.fn_type(&[uint8_ptr.into(), uint8_ptr.into(), uint8_ptr.into()], false);
@@ -538,8 +537,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_stencil<F: Fn(&[BasicValueEnum<'ctx>], PointerValue<'ctx>) -> Vec<BasicValueEnum<'ctx>>>(&self, s_type: StencilType, args: &[BasicMetadataTypeEnum<'ctx>], operation: F) -> Stencil {
         self.module.set_name(&format!("{}", s_type));
-        let i8_type = self.context.i8_type();
-        let i8_ptr_type = i8_type.ptr_type(AddressSpace::default());
+        let i8_ptr_type = self.context.ptr_type(AddressSpace::default());
 
         let void_type = self.context.void_type();
 
@@ -623,13 +621,13 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_take_1_const(&self, data_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Take1Const, Some(data_type.clone()));
-        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8_ptr = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type.clone(), &[uint8_ptr.into(), uint8_ptr.into()], |args, _| {
             let same_width_int = data_type.get_same_width_uint().get_llvm_type(self.context).into_int_type();
             let x = self.init_placeholder(same_width_int);
             let y = args[1].into_pointer_value();
             if data_type.is_float() {
-                vec![self.builder.build_bitcast(x, data_type.get_llvm_type(self.context), "cast").unwrap().into(), y.into()]
+                vec![self.builder.build_bit_cast(x, data_type.get_llvm_type(self.context), "cast").unwrap().into(), y.into()]
             } else {
                 vec![x.into(), y.into()]
             }
@@ -638,13 +636,13 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_take_2_const(&self, data_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Take1Const, Some(data_type.clone()));
-        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8_ptr = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type.clone(), &[uint8_ptr.into(), uint8_ptr.into()], |args, _| {
             let same_width_int = data_type.get_same_width_uint().get_llvm_type(self.context).into_int_type();
             let x = args[0].into_pointer_value();
             let y = self.init_placeholder(same_width_int);
             if data_type.is_float() {
-                vec![x.into(), self.builder.build_bitcast(y, data_type.get_llvm_type(self.context), "cast").unwrap().into()]
+                vec![x.into(), self.builder.build_bit_cast(y, data_type.get_llvm_type(self.context), "cast").unwrap().into()]
             } else {
                 vec![x.into(), y.into()]
             }
@@ -657,7 +655,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     // with an undefined first value but this is more flexible and performance should be the same
     fn compile_duplex1(&self) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Duplex1, None);
-        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8_ptr = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type, &[uint8_ptr.into()], |args, _| {
             let x = args[0];
             vec![x, x]
@@ -666,7 +664,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_duplex2(&self) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Duplex2, None);
-        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8_ptr = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type, &[uint8_ptr.into(), uint8_ptr.into()], |args, _| {
             let y = args[1];
             vec![y, y]
@@ -675,7 +673,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_swap12(&self) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Swap12, None);
-        let uint8_ptr = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8_ptr = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type, &[uint8_ptr.into(), uint8_ptr.into()], |args, _| {
             vec![args[1], args[0]]
         })
@@ -702,7 +700,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         self.module.set_name(&format!("{}", s_type));
         let void_type = self.context.void_type();
         let bool_type = self.context.bool_type();
-        let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        let i8_ptr_type = self.context.ptr_type(AddressSpace::default());
         let fn_type = void_type.fn_type(&[i8_ptr_type.into(), bool_type.into(), i8_ptr_type.into()], false);
         let function_head = self.module.add_function("cond", fn_type, None);
         let basic_block = self.context.append_basic_block(function_head, "entry");
@@ -768,7 +766,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_load(&self, d_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Load, Some(d_type.clone()));
-        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8ptr_type = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, _| {
             let valueptr = args[0].into_pointer_value();
             let x = self.builder.build_load(d_type.get_llvm_type(self.context), valueptr, "x").unwrap();
@@ -778,7 +776,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_load_ofs(&self, d_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::LoadOfs, Some(d_type.clone()));
-        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8ptr_type = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type, &[uint8ptr_type.into()], |args, _| {
             let offset = self.init_placeholder(self.context.i32_type());
             let base_valueptr = args[0].into_pointer_value();
@@ -790,7 +788,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_store(&self, d_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Store, Some(d_type.clone()));
-        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8ptr_type = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, _| {
             let x = args[0];
             let valueptr = args[1].into_pointer_value();
@@ -801,7 +799,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
 
     fn compile_store_ofs(&self, d_type: DataType) -> Stencil {
         let s_type = StencilType::new(StencilOperation::StoreOfs, Some(d_type.clone()));
-        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8ptr_type = self.context.ptr_type(AddressSpace::default());
         self.compile_stencil(s_type, &[d_type.get_llvm_type(self.context).into(), uint8ptr_type.into()], |args, _| {
             let x = args[0];
             let offset = self.init_placeholder(self.context.i32_type());
@@ -860,7 +858,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
         let s_type = StencilType::new(StencilOperation::UncondBr, None);
         self.module.set_name(&format!("{}", s_type));
         let void_type = self.context.void_type();
-        let uint8ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        let uint8ptr_type = self.context.ptr_type(AddressSpace::default());
         // We pass through our stack and two argument/scratch registers to be safe
         let fn_type = void_type.fn_type(&[uint8ptr_type.into(), uint8ptr_type.into(), uint8ptr_type.into()], false);
         let function = self.module.add_function("ret", fn_type, None);
@@ -885,7 +883,7 @@ impl<'ctx> StencilCodeGen<'ctx> {
     pub fn compile_ret_stencil(&self) -> Stencil {
         let s_type = StencilType::new(StencilOperation::Ret, None);
         self.module.set_name(&format!("{}", s_type));
-        let i8_ptr_type = self.context.i8_type().ptr_type(AddressSpace::default());
+        let i8_ptr_type = self.context.ptr_type(AddressSpace::default());
         let fn_type = i8_ptr_type.fn_type(&[i8_ptr_type.into()], false);
         let function = self.module.add_function("ret", fn_type, None);
         let basic_block = self.context.append_basic_block(function, "entry");

@@ -6,7 +6,7 @@
 
 use std::fmt::{self, Display, Formatter};
 
-use inkwell::types::IntType;
+use inkwell::{types::IntType, AddressSpace};
 
 #[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -58,13 +58,7 @@ impl DataType {
             DataType::F32 => context.f32_type().into(),
             DataType::F64 => context.f64_type().into(),
             DataType::Bool => context.bool_type().into(),
-            DataType::Ptr => {
-                // TODO: This is essentially a hack. But should work for now. We should probably
-                //       not use this method for pointer types anyway. And for generic pointer op stencils and
-                //       stuff like that it should be fine.
-                let inner_type = context.i8_type();  
-                inner_type.ptr_type(inkwell::AddressSpace::default()).into()
-            }
+            DataType::Ptr => context.ptr_type(AddressSpace::default()).into()
         }
     }
 
