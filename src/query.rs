@@ -29,6 +29,7 @@ pub enum BuiltIn {
   Minus,
   Times,
   Divide,
+  Rem,
   Equal,
   NotEqual,
   LessThan,
@@ -124,6 +125,8 @@ fn parse_builtin_op<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'
     tag("-"),
     tag("*"),
     tag("/"),
+    tag("%"),
+    tag("="),
     tag("!="),
     tag("<"),
     tag(">"),
@@ -143,6 +146,7 @@ fn parse_builtin_op<'a>(i: &'a str) -> IResult<&'a str, BuiltIn, VerboseError<&'
       "-" => BuiltIn::Minus,
       "*" => BuiltIn::Times,
       "/" => BuiltIn::Divide,
+      "%" => BuiltIn::Rem,
       "=" => BuiltIn::Equal,
       "!=" => BuiltIn::NotEqual,
       "<" => BuiltIn::LessThan,
@@ -377,7 +381,7 @@ pub fn eval_expression(e: &Expr, vars: &[i64]) -> Option<Atom> {
         .map(|expr| eval_expression(expr, vars))
         .collect::<Option<Vec<Atom>>>()?;
       match op {
-        BuiltIn::Plus | BuiltIn::Times | BuiltIn::Divide | BuiltIn::Minus 
+        BuiltIn::Plus | BuiltIn::Times | BuiltIn::Divide | BuiltIn::Rem | BuiltIn::Minus 
         | BuiltIn::LessThan | BuiltIn::GreaterThan | BuiltIn::LessThanOrEqual 
         | BuiltIn::GreaterThanOrEqual => {
           // Check that all the tail expressions are numbers
@@ -387,6 +391,7 @@ pub fn eval_expression(e: &Expr, vars: &[i64]) -> Option<Atom> {
             BuiltIn::Times => Some(Atom::Num(nums.iter().product())),
             BuiltIn::Minus => Some(Atom::Num(nums.iter().skip(1).fold(nums[0], |a, f| a - f))),
             BuiltIn::Divide => Some(Atom::Num(nums.iter().skip(1).fold(nums[0], |a, f| a / f))),
+            BuiltIn::Rem => Some(Atom::Num(nums.iter().skip(1).fold(nums[0], |a, f| a % f))),
             BuiltIn::LessThan => Some(Atom::Boolean(nums.iter().skip(1).all(|&x| nums[0] < x))),
             BuiltIn::GreaterThan => Some(Atom::Boolean(nums.iter().skip(1).all(|&x| nums[0] > x))),
             BuiltIn::LessThanOrEqual => Some(Atom::Boolean(nums.iter().skip(1).all(|&x| nums[0] <= x))),

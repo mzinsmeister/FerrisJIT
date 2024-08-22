@@ -33,7 +33,7 @@ pub fn get_type(expr: &Expr) -> DataType {
         Expr::Variable(_) => DataType::I64,
         Expr::Application(fun, args) => {
             match fun {
-                BuiltIn::Plus | BuiltIn::Minus | BuiltIn::Times | BuiltIn::Divide => {
+                BuiltIn::Plus | BuiltIn::Minus | BuiltIn::Times | BuiltIn::Divide |  BuiltIn::Rem => {
                     DataType::I64
                 },
                 BuiltIn::Equal | BuiltIn::NotEqual | BuiltIn::GreaterThan | BuiltIn::GreaterThanOrEqual 
@@ -194,6 +194,9 @@ fn generate_int_op<'cg>(_cg: &'cg CodeGen, fun: &BuiltIn, left: I64Ref<'cg>, rig
         },
         BuiltIn::Divide => {
             (left / &right).into()
+        },
+        BuiltIn::Rem => {
+            (left % &right).into()
         },
         BuiltIn::Equal => {
             left.cg_eq(&right).into()
